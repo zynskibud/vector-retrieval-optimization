@@ -71,7 +71,7 @@ One file per `bench` invocation. Keys and types are exact. Extra keys are allowe
 ```json
 {
   "contract_version": 1,
-  "language": "rust",                  // python | go | cpp | rust
+  "language": "rust",                  // python | go | cpp | rust | faiss (the reference, tools/bench/faiss_ref.py)
   "index": "hnsw",
   "data_dir": "data/processed",
   "n": 1211690,                        // corpus rows used (after --limit)
@@ -336,7 +336,7 @@ Each language has tests that run on `data/processed/dev/` with `--limit 20000` w
 1. **npy:** reading `queries.npy` gives shape (1000, 384), and row 0's first three values match a hard-coded reference printed by `uv run python -c "import numpy as np; print(np.load('data/processed/dev/queries.npy')[0,:3].tolist())"`.
 2. **splitmix:** seed 42 gives first `next_u64()` = `13679457532755275413`; seed 0 gives `16294208416658607535`.
 3. **flat:** on the dev set, recall@10 against `ground_truth.npy` = 1.0 (tests may read ground truth).
-4. **Each other index:** recall@10 ≥ a floor stated in the module's docstring at default params on the dev set (ivf nprobe=8 ≥ 0.80, pq ≥ 0.50, ivf_pq ≥ 0.45, hnsw ef=64 ≥ 0.95, diskann l=100 ≥ 0.90). Also: the top result of the flat index equals the top result of ground truth for every query.
+4. **Each other index:** recall@10 ≥ a floor stated in the module's docstring at default params on the dev set (ivf nprobe=8 ≥ 0.75, pq ≥ 0.50, ivf_pq ≥ 0.45, hnsw ef=64 ≥ 0.95, diskann l=100 ≥ 0.90; FAISS on dev gives ivf nprobe=8 = 0.80 and hnsw ef=64 = 0.97, so these floors leave room for the different k-means and HNSW RNG). Also: the top result of the flat index equals the top result of ground truth for every query.
 5. **Metric dimension (pq, ivf_pq, diskann):** both `metric=ip` and `metric=l2` meet the recall floor. Both produce a full run without error.
 6. **I/O dimension (diskann):** `io=mmap` and `io=nocache` return identical `ids`; `io=nocache` reports `disk_reads > 0` and a higher p50 latency than `io=mmap` (6.7.1).
 7. **Output JSON** validates against section 3: all keys present, shapes right.
