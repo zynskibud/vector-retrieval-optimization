@@ -23,10 +23,14 @@ def top_k(s: np.ndarray, k: int, ids: np.ndarray | None = None) -> tuple[np.ndar
     if kk == 0:
         pos = np.empty(0, dtype=np.int64)
     elif kk < n:
-        pos = np.argpartition(-s, kk - 1)[:kk]
+        # Take everything at or above the k-th best score, so ties at the boundary are
+        # broken by ID below and not by argpartition's arbitrary choice.
+        threshold = s[np.argpartition(-s, kk - 1)[kk - 1]]
+        pos = np.flatnonzero(s >= threshold)
     else:
         pos = np.arange(n)
-    pos = pos[np.argsort(-s[pos], kind="stable")]
+    row_ids = pos if ids is None else ids[pos]
+    pos = pos[np.lexsort((row_ids, -s[pos]))][:kk]  # best score first, lower ID first on ties
     out_ids = np.full(k, -1, dtype=np.int64)
     out_scores = np.full(k, -np.inf, dtype=np.float32)
     out_ids[:kk] = pos if ids is None else ids[pos]

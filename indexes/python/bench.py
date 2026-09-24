@@ -71,12 +71,17 @@ def machine() -> dict:
 
 
 def run_search(mod, index, queries: np.ndarray, k: int, params: dict) -> dict:
-    """Timed loop: one query at a time, in order, on one thread."""
+    """Timed loop: one query at a time, in order, on one thread.
+
+    Index modules set index["distance_computations"] and, optionally, index["search_extra"]
+    (a dict of per-query counters) inside search(); bench averages them over the queries.
+    """
     q = len(queries)
     ids = np.empty((q, k), dtype=np.int64)
     scores = np.empty((q, k), dtype=np.float32)
     latency = []
     dist = []
+    counters: dict[str, list[float]] = {}
     t_start = time.perf_counter()
     for i in range(q):
         t0 = time.perf_counter()
@@ -84,6 +89,8 @@ def run_search(mod, index, queries: np.ndarray, k: int, params: dict) -> dict:
         latency.append((time.perf_counter() - t0) * 1000.0)
         ids[i], scores[i] = row_ids, row_scores
         dist.append(index.get("distance_computations"))
+        for key, value in index.get("search_extra", {}).items():  # per-query counters, e.g. disk_reads
+            counters.setdefault(key, []).append(value)
     total = time.perf_counter() - t_start
     return {
         "search_params": params,
@@ -93,6 +100,7 @@ def run_search(mod, index, queries: np.ndarray, k: int, params: dict) -> dict:
         "total_s": total,
         "qps": q / total,
         "distance_computations": None if None in dist else float(np.mean(dist)),
+        "extra": {key: float(np.mean(values)) for key, values in counters.items()},
     }
 
 
