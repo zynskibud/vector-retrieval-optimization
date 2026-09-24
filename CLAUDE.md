@@ -31,7 +31,8 @@ The user is learning these topics. The user directs the work and reads every des
 ├── data/                          # gitignored
 │   ├── raw/                       #   downloaded Parquet shards
 │   └── processed/                 #   vectors.npy, queries.npy, metadata.parquet, query_meta.parquet,
-│                                  #   ground_truth.npy, ground_truth_scores.npy
+│       │                          #   ground_truth.npy, ground_truth_scores.npy
+│       └── dev/                   #   same files for a 100k-row sample, plus dev_ids.npy
 ├── tools/                         # Python package: everything that is not an index
 │   ├── data/                      #   Phase 0: prepare.py, ground_truth.py
 │   ├── bench/                     #   runner, recall and latency metrics, plots
@@ -63,6 +64,7 @@ These hold everywhere. Do not change them without approval from the user.
 - **Data type:** float32 for vectors. int64 for IDs in files.
 - **Recall is computed only by the tools**, never inside an index program. This keeps the measurement the same for all languages.
 - **Random seeds are fixed** and passed in, so every run is reproducible.
+- **Develop and test on `data/processed/dev/`** (100k vectors, same 1,000 queries, own ground truth). Use the full data only for the benchmark runs that the tools runner starts.
 
 ## Rules for the hand-built indexes
 
@@ -83,6 +85,8 @@ uv sync                                   # install the Python environment
 uv run python -m tools.data.prepare     # Phase 0: download and prepare data
 uv run python -m tools.data.ground_truth
 uv run python -m tools.data.verify       # Phase 0 checks; must print 10 PASS lines
+uv run python -m tools.data.subset       # 100k-row dev dataset in data/processed/dev/
+uv run python -m tools.data.verify --data data/processed/dev
 ```
 
 Add each new command here when it is created.

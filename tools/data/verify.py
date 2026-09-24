@@ -1,18 +1,20 @@
 """Check the Phase 0 outputs. Prints one line per check and exits non-zero on a failure.
 
-Run: uv run python -m tools.data.verify
+Run: uv run python -m tools.data.verify [--data data/processed]
 """
 
+import argparse
 import sys
 from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
 
-DATA = Path("data/processed")
-
 
 def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", type=Path, default=Path("data/processed"))
+    DATA = ap.parse_args().data
     vectors = np.load(DATA / "vectors.npy", mmap_mode="r")
     queries = np.load(DATA / "queries.npy")
     gt = np.load(DATA / "ground_truth.npy")
@@ -21,7 +23,7 @@ def main() -> None:
     qmeta_rows = pq.read_metadata(DATA / "query_meta.parquet").num_rows
     n, dim = vectors.shape
     rng = np.random.default_rng(0)
-    sample = np.asarray(vectors[rng.choice(n, 10_000, replace=False)])
+    sample = np.asarray(vectors[rng.choice(n, min(n, 10_000), replace=False)])
 
     # Recompute 20 queries with a full sort, independent of the chunked method.
     check_q = rng.choice(len(queries), 20, replace=False)

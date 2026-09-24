@@ -59,6 +59,7 @@ uv sync
 uv run python -m tools.data.prepare
 uv run python -m tools.data.ground_truth
 uv run python -m tools.data.verify      # 10 checks on the outputs
+uv run python -m tools.data.subset      # 100k-row dev dataset for fast tests
 ```
 
 The download is about 2.8 GB. Prepared files: `vectors.npy` (1.7 GB), `metadata.parquet` with the paragraph text (378 MB), `queries.npy`, `query_meta.parquet`, `ground_truth.npy`, and `ground_truth_scores.npy`.
