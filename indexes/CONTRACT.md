@@ -323,7 +323,7 @@ search(index, query, k, params) -> (ids, scores)    // one query
 index_bytes(index) -> int
 ```
 
-`bench` dispatches on `--index` to the module. In the skeleton (Wave 1), each index module exists and raises "not implemented" (exit code 1). Wave 2 agents replace the module body and must not edit `bench`, the shared modules, or the build files, except to add a dependency listed in section 7.
+`bench` dispatches on `--index` to the module. In the skeleton (Wave 1), `flat` is implemented, so the whole path from `.npy` to output JSON is tested end to end. The other five index modules exist and exit with code 1 and the message "not implemented". Wave 2 agents replace one module body each and must not edit `bench`, the shared modules, or the build files, except to add a dependency listed in section 7.
 
 ## 9. Tests
 

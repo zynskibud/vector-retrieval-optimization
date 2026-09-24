@@ -3,8 +3,16 @@ name = "vector-retrieval-optimization"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
+    "faiss-cpu>=1.15.1",
+    "matplotlib>=3.11.2",
     "numpy>=2.5.3",
+    "pandas>=3.0.6",
     "pyarrow>=25.0.1",
     "requests>=2.34.2",
     "tqdm>=4.70.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
 ]
