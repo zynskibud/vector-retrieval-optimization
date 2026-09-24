@@ -183,21 +183,41 @@ kmeans(points, k, iters, seed) -> centers (k, d)
 |---|---|---|---|
 | `m` | build | 48 | sub-vectors per vector; 384 / m must be an integer |
 | `nbits` | build | 8 | bits per code; only 8 is supported (256 centroids) |
+| `metric` | build | `ip` | `ip` (dot product) or `l2` (squared Euclidean distance). See 6.4.1. |
 | `train_size` | build | 100000 | training rows |
 | `iters` | build | 20 | k-means iterations per codebook |
 | `rerank` | search | 0 | candidates re-scored with full vectors; 0 = off |
 
-**Build:** split each training vector into m sub-vectors of d/m dimensions. For sub-vector j, run k-means (6.2, with `next_below` from a PRNG seeded `seed + j`) with k = 256 on the training sub-vectors, **without the normalization step 3** (sub-vectors are not unit length). Codebook j is (256, d/m). Encode every corpus row: code[j] = index of the centroid with the highest dot product with sub-vector j (on this data, dot product and Euclidean selection rank the same because we chose to define it so; use dot product). Store codes as a contiguous (N, m) uint8 array.
+**Build:** split each training vector into m sub-vectors of d/m dimensions. For sub-vector j, run k-means (6.2, with `next_below` from a PRNG seeded `seed + j`) with k = 256 on the training sub-vectors, **without the normalization step 3** (sub-vectors are not unit length), with assignment by the `metric` (6.4.1). Codebook j is (256, d/m). Encode every corpus row: code[j] = index of the best centroid for sub-vector j under the `metric`. Store codes as a contiguous (N, m) uint8 array.
 
-**Search:** build a table T (m, 256): `T[j][c] = q_j · codebook[j][c]`. The score of row i is `sum_j T[j][code[i][j]]`. Scan all N rows, keep the top k (or the top `rerank` if rerank > 0, then re-score those with the full vectors and return the top k). `distance_computations` = N (table-based scores count as 1 each).
+**Search:** build a table T (m, 256) from the query and the codebooks (6.4.1). The score of row i is `sum_j T[j][code[i][j]]`. Scan all N rows, keep the top k (or the top `rerank` if rerank > 0, then re-score those with the full vectors and return the top k). `distance_computations` = N (table-based scores count as 1 each).
+
+#### 6.4.1 The metric dimension
+
+For exact scores on unit vectors, `q · x` and `−‖q − x‖²` give the same ranking, because `‖q − x‖² = 2 − 2 q · x`. For PQ they differ: the codebooks are trained and the codes are chosen on sub-vectors, which are not unit length, so `ip` and `l2` give different codebooks, different codes, and different recall. **Both are measured.** The runner runs every PQ-based index (pq, ivf_pq, diskann) with `metric=ip` and `metric=l2`, and the report shows both. The FAISS reference uses `METRIC_INNER_PRODUCT` for `ip` and `METRIC_L2` for `l2`.
+
+| | `metric=ip` | `metric=l2` |
+|---|---|---|
+| k-means assignment (codebooks only) | highest `p · c` | lowest `‖p − c‖²` |
+| code choice | highest `x_j · codebook[j][c]` | lowest `‖x_j − codebook[j][c]‖²` |
+| table entry `T[j][c]` | `q_j · codebook[j][c]` | `−‖q_j − codebook[j][c]‖²` |
+| reported `scores` | approximate dot product | negative approximate squared distance |
+| rerank score | `q · x` | `−‖q − x‖²` |
+
+In both modes, a higher score is better, so the top-k logic is the same. The IVF coarse centers (6.2) always use the shared k-means with dot-product assignment, in both modes, so only the PQ part changes.
 
 ### 6.5 ivf_pq
 
-Params: all of ivf (`nlist`, `nprobe`, `iters`) and pq (`m`, `nbits`, `rerank`), plus `train_size` (default 100000).
+Params: all of ivf (`nlist`, `nprobe`, `iters`) and pq (`m`, `nbits`, `metric`, `rerank`), plus `train_size` (default 100000).
 
-**Build:** train ivf centers (6.2, normalized). Compute the residual `r = x − c` for each training row, with c its assigned center, and train the codebooks on residuals (6.4). Encode each corpus row's residual. Store per list: IDs and codes, CSR layout.
+**Build:** train ivf centers (6.2, normalized). Compute the residual `r = x − c` for each training row, with c its assigned center, and train the codebooks on residuals (6.4, under the `metric`). Encode each corpus row's residual. Store per list: IDs and codes, CSR layout.
 
-**Search:** choose `nprobe` lists as in ivf. For each chosen list with center c, the score of row i is `q · c + sum_j T[j][code[i][j]]` with T built from q against the residual codebooks (T is the same for every list). Return the top k, with optional rerank.
+**Search:** choose `nprobe` lists as in ivf.
+
+- `metric=ip`: the score of row i in a list with center c is `q · c + sum_j T[j][code[i][j]]`, with T built from q against the residual codebooks. T is the same for every list.
+- `metric=l2`: for each chosen list, set `q' = q − c` and build `T_c[j][k] = −‖q'_j − codebook[j][k]‖²`. The score of row i is `sum_j T_c[j][code[i][j]]`. One table per probed list, so `nprobe` tables per query.
+
+Return the top k, with optional rerank.
 
 ### 6.6 hnsw
 
@@ -226,9 +246,11 @@ Params: all of ivf (`nlist`, `nprobe`, `iters`) and pq (`m`, `nbits`, `rerank`),
 | `l_build` | build | 100 | candidate list size during build |
 | `alpha` | build | 1.2 | pruning slack |
 | `pq_m` | build | 48 | PQ sub-vectors for the in-RAM codes |
+| `metric` | build | `ip` | metric for the PQ codes and tables (6.4.1); the graph build and rerank always use the dot product |
 | `l` | search | 100 | candidate list size during search |
 | `beam` | search | 4 | nodes expanded per step |
 | `rerank` | search | 100 | candidates re-scored with full vectors from disk |
+| `io` | search | `mmap` | `mmap` (memory-mapped file, OS cache allowed) or `nocache` (uncached reads, see 6.7.1) |
 
 **Build (Vamana, Subramanya et al. 2019):**
 1. Entry point = the corpus row with the highest dot product with the mean of all rows (the medoid).
@@ -237,9 +259,25 @@ Params: all of ivf (`nlist`, `nprobe`, `iters`) and pq (`m`, `nbits`, `rerank`),
 4. Train PQ codes (6.4, `m = pq_m`) on all rows; encode all rows.
 5. Write `<out>.diskann` next to the output JSON: for each node, its full vector then its out-edges (fixed `r` slots, int32, −1 for empty), so a node is one contiguous record. Report the file size in `extra.disk_bytes`.
 
-**Search:** the corpus array is **released** after the file is written; search must not hold the full vectors in RAM. Hold PQ codes and codebooks in RAM. Memory-map the file (`mmap`; Go and Python via their standard `mmap`). Beam search: a candidate list of size `l`; each step expands the `beam` best unexpanded candidates, reads their records from the map, scores their out-neighbors with the PQ table; stop when the list holds no unexpanded node. Re-score the top `rerank` candidates with their full vectors from the map, return the top k. Report `extra.disk_reads` = mean records read per query.
+**Search:** the corpus array is **released** after the file is written; search must not hold the full vectors in RAM. Hold PQ codes and codebooks in RAM. Beam search: a candidate list of size `l`; each step expands the `beam` best unexpanded candidates, reads their records from the file (6.7.1), scores their out-neighbors with the PQ table; stop when the list holds no unexpanded node. Re-score the top `rerank` candidates with their full vectors from the file, return the top k. Report `extra.disk_reads` = mean records read per query, and `extra.disk_bytes_read` = mean bytes read per query.
 
-Note: macOS caches the file in RAM after the first pass, so the timings show the architecture, not real SSD latency. That is acceptable for Phase 1.
+#### 6.7.1 The I/O dimension: warm cache and real disk reads
+
+macOS and Linux keep recently read file pages in RAM (the page cache). After one pass, a memory-mapped file is served from RAM, and the timings no longer include the SSD. **Both cases are measured**, through the `io` search parameter:
+
+| `io` | How records are read | What the timing shows |
+|---|---|---|
+| `mmap` | Memory-map the whole file; read records through the map. | Warm cache: the algorithm and the RAM cost of the graph walk. |
+| `nocache` | Open the file with caching disabled and read each record with `pread`. macOS: `fcntl(fd, F_NOCACHE, 1)`. Linux: `O_DIRECT`, with the read buffer and the offset aligned to 4096 bytes (pad each record to a multiple of 4096 in the file layout, so this holds on both systems). | Real SSD latency per record. |
+
+Rules:
+
+1. The runner runs DiskANN with `io=mmap` and `io=nocache` at every search setting. Before an `io=nocache` run, the `bench` program itself must not have touched the file through a map in the same process (the file is written, closed, and then opened with caching disabled), so the OS has no warm pages from this process.
+2. The two modes must return **identical `ids`** for every query. A test asserts this.
+3. A test asserts that `io=nocache` reports `disk_reads > 0` and a **higher p50 latency** than `io=mmap` at the same setting. If the two are equal, the reads are cached and the test fails.
+4. The report shows both latencies side by side, and the ratio, so the SSD cost is visible.
+
+Record layout on disk: each node record is `dim × 4` bytes of vector, then `r` int32 out-edges, padded to a multiple of 4096 bytes. With dim = 384 and r = 64, a record is 1,536 + 256 = 1,792 bytes, padded to 4,096, so the file is N × 4 KB (4.9 GB for the full corpus, 0.4 GB for dev). `extra.disk_bytes` reports the file size.
 
 ## 7. Language rules
 
@@ -250,7 +288,7 @@ From `CLAUDE.md`: no vector search libraries; write the `.npy` reader, k-means, 
 | Python 3.12 | NumPy (arrays, matrix products, argpartition). NumPy may do the inner loops; the algorithm structure must be explicit Python. | `multiprocessing` or `threading`; NumPy releases the GIL |
 | Go 1.22+ | none | goroutines |
 | C++17 | `nlohmann/json` (single header, vendored in `indexes/cpp/third_party/`) | `std::thread` |
-| Rust 2021 | `rayon`, `serde`, `serde_json`, `memmap2` | `rayon` |
+| Rust 2021 | `rayon`, `serde`, `serde_json`, `memmap2`, `libc` (for `fcntl`, `pread`, `getrusage`) | `rayon` |
 
 Compiler settings: C++ `-O3 -march=native`; Rust release profile with `opt-level=3`, `codegen-units=1`, `target-cpu=native` in `.cargo/config.toml`; Go default with `GOAMD64`/`GOARM64` defaults.
 
@@ -295,7 +333,9 @@ Each language has tests that run on `data/processed/dev/` with `--limit 20000` w
 2. **splitmix:** seed 42 gives first `next_u64()` = `13679457532755275413`; seed 0 gives `16294208416658607535`.
 3. **flat:** on the dev set, recall@10 against `ground_truth.npy` = 1.0 (tests may read ground truth).
 4. **Each other index:** recall@10 ≥ a floor stated in the module's docstring at default params on the dev set (ivf nprobe=8 ≥ 0.80, pq ≥ 0.50, ivf_pq ≥ 0.45, hnsw ef=64 ≥ 0.95, diskann l=100 ≥ 0.90). Also: the top result of the flat index equals the top result of ground truth for every query.
-5. **Output JSON** validates against section 3: all keys present, shapes right.
+5. **Metric dimension (pq, ivf_pq, diskann):** both `metric=ip` and `metric=l2` meet the recall floor. Both produce a full run without error.
+6. **I/O dimension (diskann):** `io=mmap` and `io=nocache` return identical `ids`; `io=nocache` reports `disk_reads > 0` and a higher p50 latency than `io=mmap` (6.7.1).
+7. **Output JSON** validates against section 3: all keys present, shapes right.
 
 Recall for reporting is computed only by `tools/bench/`. Tests use it only as an assertion.
 

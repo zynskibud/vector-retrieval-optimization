@@ -157,6 +157,10 @@ footer{color:var(--muted);font-size:.92rem}
       <li>Run the same index in FAISS with the same settings on the same data. FAISS has no DiskANN, so compare DiskANN with Milvus in Phase 2.</li>
       <li>If recall differs between languages, one version has a bug: the algorithm is the same. If latency differs, find out why.</li>
     </ol></div>
+    <div><h3>Two extra dimensions</h3><ul>
+      <li><b>Metric, for PQ-based indexes (pq, ivf_pq, diskann):</b> dot product and squared Euclidean distance give the same ranking for exact scores on unit vectors, but different codebooks and codes after quantization. Every PQ-based run is done with both <code>metric=ip</code> and <code>metric=l2</code>, and the report shows both.</li>
+      <li><b>I/O, for DiskANN:</b> after one pass, the OS serves the on-disk file from RAM. Every DiskANN run is done with <code>io=mmap</code> (warm cache) and <code>io=nocache</code> (uncached reads through <code>F_NOCACHE</code> or <code>O_DIRECT</code>). A test asserts that both modes return the same IDs and that the uncached mode is slower. The report shows the ratio.</li>
+    </ul></div>
     <div class="done"><h3>Done when</h3><p>All four versions of each index are within a few points of recall of FAISS at the same settings. For each index, you have one recall-versus-latency plot with five curves: Python, Go, C++, Rust, and FAISS. You can explain every gap, for example garbage collector pauses in p99 latency.</p></div>
   </div>
 </details>
