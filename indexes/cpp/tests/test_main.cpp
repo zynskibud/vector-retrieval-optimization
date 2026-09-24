@@ -158,15 +158,15 @@ void test_json() {
         CHECK(s["distance_computations"] == 20000.0);
     }
 
-    // Unknown index and unknown parameter exit 2. A stub index exits 1.
+    // Unknown index and unknown parameter exit 2. No stub index remains.
     std::string base = "\"" + g_bench + "\" --data \"" + g_root + "/data/processed/dev\" --out " +
                        out + " --limit 2000 2>/dev/null";
     rc = std::system((base + " --index nope").c_str());
     CHECK(WIFEXITED(rc) && WEXITSTATUS(rc) == 2);
     rc = std::system((base + " --index hnsw --build bogus=1").c_str());
     CHECK(WIFEXITED(rc) && WEXITSTATUS(rc) == 2);
-    rc = std::system((base + " --index diskann").c_str());
-    CHECK(WIFEXITED(rc) && WEXITSTATUS(rc) == 1);
+    rc = std::system((base + " --index nope").c_str());
+    CHECK(WIFEXITED(rc) && WEXITSTATUS(rc) == 2);
 }
 
 }  // namespace
