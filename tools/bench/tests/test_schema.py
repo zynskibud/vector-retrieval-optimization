@@ -12,7 +12,7 @@ def make_doc() -> dict:
         "searches": [{
             "search_params": {}, "ids": [[0, 1], [2, 3], [4, -1]],
             "scores": [[0.9, 0.8], [0.7, 0.6], [0.5, None]],
-            "latency_ms": [0.1, 0.2, 0.3], "total_s": 0.001, "qps": 3000.0, "distance_computations": 10,
+            "latency_ms": [0.1, 0.2, 0.3], "total_s": 0.001, "qps": 3000.0, "distance_computations": 10, "extra": {},
         }],
         "machine": {"os": "darwin", "arch": "arm64", "cpu": "Apple M4", "cores": 10}, "extra": {},
     }

@@ -241,6 +241,7 @@ def main() -> None:
             "search_params": sp, "ids": ids.tolist(), "scores": [score_list(r) for r in scores],
             "latency_ms": lat, "total_s": total_s, "qps": len(queries) / total_s,
             "distance_computations": distance_count(name, index, n, len(queries), sp, rerank),
+            "extra": {},
         })
         print(f"search {sp}: p50 {np.median(lat):.3f} ms", file=sys.stderr)
 

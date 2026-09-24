@@ -16,7 +16,7 @@ TOP_KEYS = {
     "searches": list, "machine": dict, "extra": dict,
 }
 BUILD_KEYS = {"train_s": float, "add_s": float, "total_s": float, "peak_rss_mb": float, "index_bytes": int}
-SEARCH_KEYS = {"search_params": dict, "ids": list, "scores": list, "latency_ms": list, "total_s": float, "qps": float}
+SEARCH_KEYS = {"search_params": dict, "ids": list, "scores": list, "latency_ms": list, "total_s": float, "qps": float, "extra": dict}
 MACHINE_KEYS = {"os": str, "arch": str, "cpu": str, "cores": int}
 
 
