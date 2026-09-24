@@ -143,6 +143,8 @@ return z ^ (z >> 31)                       // uint64, wrapping arithmetic throug
 
 Where the contract says "random", use this generator with the run's seed, in the stated order. Then Python, Go, C++, and Rust produce the same random choices. With `--threads 1`, all four must produce the same index and the same results. With more threads, insertion order may differ, and small differences are acceptable.
 
+**Floating point.** Dot products may be summed in any order (a SIMD loop keeps 4 or more partial sums), so scores can differ between languages in the last bits, about 1e-7 for unit vectors. That is allowed. Two results count as equal when the ID lists match, or when a differing ID pair has scores within 1e-6 of each other. The cross-language comparison in `tools/bench/` uses that tolerance. Observed on flat, dev, 20k rows: Python, Go, and C++ return identical IDs for all 1,000 queries with a maximum score difference of 2.1e-7.
+
 ## 6. The indexes
 
 Score is always the dot product `q · x`. Each index returns the k highest-scoring IDs, best first. **Ties:** on equal scores, the lower ID comes first. If the index finds fewer than k candidates, pad with `-1` and score `-inf` (write `null` for the score in JSON).
