@@ -119,6 +119,18 @@ def run_case(case: dict, timeout: float | None, repeat: int) -> None:
         print(f"  schema: {e}")
 
 
+def wait_for_idle(max_load: float, patience_s: float = 180.0) -> float:
+    """Wait until the 1-minute load average is below max_load. Our own multi-threaded
+    builds raise it too, so after `patience_s` the run continues and the load is recorded."""
+    t0 = time.perf_counter()
+    while (load1 := os.getloadavg()[0]) > max_load:
+        if time.perf_counter() - t0 > patience_s:
+            print(f"  warning: load average still {load1:.1f} > {max_load} after {patience_s:.0f}s; running anyway", flush=True)
+            break
+        time.sleep(10)
+    return round(load1, 2)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", type=Path, default=Path("data/processed/dev"))
@@ -128,7 +140,7 @@ def main() -> None:
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--timeout", type=float, default=None)
     ap.add_argument("--repeat", type=int, default=3, help="runs per case; the median-p50 run is kept")
-    ap.add_argument("--max-load", type=float, default=2.0, help="refuse to run while the 1-minute load average is above this")
+    ap.add_argument("--max-load", type=float, default=2.0, help="wait (up to 3 min) while the 1-minute load average is above this")
     args = ap.parse_args()
     languages, indexes = args.languages.split(","), args.indexes.split(",")
     for bad in [l for l in languages if l not in PROGRAMS] + [i for i in indexes if i not in SWEEPS]:
@@ -144,10 +156,7 @@ def main() -> None:
         elif case["out"].exists() and not args.force:
             print(f"{case['out'].name}: exists, skipped (use --force)")
         else:
-            load1 = os.getloadavg()[0]
-            if load1 > args.max_load:
-                sys.exit(f"load average is {load1:.1f} > {args.max_load}; the machine is busy, so latencies would be wrong (use --max-load to override)")
-            case["load1"] = round(load1, 2)
+            case["load1"] = wait_for_idle(args.max_load)
             run_case(case, args.timeout, args.repeat)
 
 
