@@ -2,7 +2,7 @@
 
 Open problems in how the benchmarks are measured, with the data that showed them and the planned fix. Update this file when a problem is closed.
 
-## 1. Run-to-run variance on macOS (open)
+## 1. Run-to-run variance on macOS (fix in place, effect not yet measured)
 
 **Observed.** Rust flat on the dev set (100k rows, one thread): the Wave 1 agent measured p50 = 2.48 ms. Three runs by the main session on an idle machine gave 4.80, 4.41, and 4.59 ms. The runner's run gave 5.09 ms. Same binary, same data, same code path. That is a 2× spread.
 
@@ -10,12 +10,11 @@ Open problems in how the benchmarks are measured, with the data that showed them
 
 **Effect.** A single run cannot separate a 20% code difference from scheduler noise.
 
-**Planned fix.**
-1. The runner gets `--repeat N` (default 3). Each case runs N times as separate processes. The report keeps the run with the median p50 and shows the spread (min and max p50) next to it.
-2. The runner refuses to start when the 1-minute load average is above 2, so runs never overlap with builds or agents.
-3. Each result JSON records the load average at start in `machine.load1`.
+**Fix (runner.py).**
+1. `--repeat N` (default 3). Each case runs N times as separate processes. The runner keeps the run with the median p50 and stores every run's p50 in `extra.runner.p50_ms_runs`, so the spread is visible.
+2. `--max-load` (default 2.0). The runner refuses to run a case while the 1-minute load average is above it, so runs never overlap with builds or agents. The load at start is stored in `extra.runner.load1_at_start`.
 
-Until this is in, all latency numbers are from one run and carry about ±30%.
+Still to do: the report should print the spread next to the p50, and the full-corpus runs should confirm that 3 repeats are enough.
 
 ## 2. Go's dot product is not vectorized (open)
 

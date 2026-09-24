@@ -90,7 +90,7 @@ uv run python -m tools.data.verify --data data/processed/dev
 
 uv run python -m tools.bench.schema FILE.json           # validate a bench output against CONTRACT section 3
 uv run python -m tools.bench.faiss_ref --index hnsw --data data/processed/dev --out r.json --search ef=64   # FAISS reference, same CLI as bench
-uv run python -m tools.bench.runner --data data/processed/dev --languages faiss,python --indexes flat,ivf [--dry-run]   # sequential runs -> results/raw/<data>/
+uv run python -m tools.bench.runner --data data/processed/dev --languages faiss,python --indexes flat,ivf [--repeat 3] [--dry-run]   # sequential runs, median of 3, refuses when load > 2 -> results/raw/<data>/
 uv run python -m tools.bench.report --data data/processed/dev   # results/summary/<data>/: results.csv, results.md, <index>.png
 uv run pytest indexes/python/tests tools/bench/tests -q
 
