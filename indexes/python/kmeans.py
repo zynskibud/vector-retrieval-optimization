@@ -58,9 +58,9 @@ def fix_empty(train: np.ndarray, centers: np.ndarray, labels: np.ndarray, fit: n
 
 
 def update_centers(train: np.ndarray, labels: np.ndarray, k: int, normalize: bool) -> np.ndarray:
-    counts = np.bincount(labels, minlength=k).astype(np.float32)
-    sums = np.zeros((k, train.shape[1]), dtype=np.float64)
-    np.add.at(sums, labels, train)
+    """Mean of each cluster, summed in float64 with one bincount per dimension (np.add.at is ~50x slower)."""
+    counts = np.bincount(labels, minlength=k).astype(np.float64)
+    sums = np.stack([np.bincount(labels, weights=train[:, d], minlength=k) for d in range(train.shape[1])], axis=1)
     centers = (sums / counts[:, None]).astype(np.float32)
     if normalize:
         centers /= np.linalg.norm(centers, axis=1, keepdims=True)
@@ -87,6 +87,7 @@ def kmeans(
         if prev is not None and np.array_equal(labels, prev):
             break
         prev = labels.copy()
-        fix_empty(train, centers, labels, fit)
+        if np.bincount(labels, minlength=k).min() == 0:
+            fix_empty(train, centers, labels, fit)
         centers = update_centers(train, labels, k, normalize)
     return centers
