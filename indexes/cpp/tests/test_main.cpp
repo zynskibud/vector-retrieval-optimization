@@ -165,7 +165,7 @@ void test_json() {
     CHECK(WIFEXITED(rc) && WEXITSTATUS(rc) == 2);
     rc = std::system((base + " --index hnsw --build bogus=1").c_str());
     CHECK(WIFEXITED(rc) && WEXITSTATUS(rc) == 2);
-    rc = std::system((base + " --index hnsw").c_str());
+    rc = std::system((base + " --index diskann").c_str());
     CHECK(WIFEXITED(rc) && WEXITSTATUS(rc) == 1);
 }
 
