@@ -3,11 +3,17 @@
 Run: uv run python -m indexes.python.bench --index flat --data data/processed/dev --out r.json
 """
 
+import os
+
+# CONTRACT 4: search runs on one thread. NumPy's BLAS (Accelerate on macOS, OpenBLAS
+# elsewhere) reads these before it loads, so they must be set before `import numpy`.
+for _var in ("VECLIB_MAXIMUM_THREADS", "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
+
 import argparse
 import importlib
 import json
 import math
-import os
 import platform
 import resource
 import subprocess

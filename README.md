@@ -7,7 +7,7 @@ Six vector search indexes built by hand in Python, Go, C++, and Rust, checked ag
 | Phase | Topic | Status |
 |---|---|---|
 | 0 | Setup and data | Done |
-| 1 | Indexes by hand, checked against FAISS | Not started |
+| 1 | Indexes by hand, checked against FAISS | In progress: skeletons and flat done in all four languages; runner and FAISS reference done |
 | 2 | Three databases | Not started |
 | 3 | Metadata filtering | Not started |
 | 4 | Concurrency | Not started |
