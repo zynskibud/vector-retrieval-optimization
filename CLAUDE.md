@@ -76,7 +76,7 @@ These hold everywhere. Do not change them without approval from the user.
   - Go: the standard library only.
 - **Write the .npy reader by hand** in each language. The format is a short header followed by raw little-endian float32 data.
 - **The same algorithm and the same settings** in all four languages. If one language needs a different approach, write down why in `docs/`.
-- **Follow `indexes/CONTRACT.md`** for the command-line arguments, the output JSON, and the index file format.
+- **Follow `indexes/CONTRACT.md`.** It fixes the command line, the output JSON, the `.npy` reader, the PRNG, every index algorithm and its parameter names, the measurement rules, the directory layout, and the required tests. Read it in full before you write index code.
 
 ## Commands
 
