@@ -97,4 +97,30 @@ Add each new command here when it is created.
 
 - The repository is public: github.com/zynskibud/vector-retrieval-optimization
 - Never commit `data/` or `results/raw/`.
-- Commit only when the user asks.
+
+### Commit after every change
+
+When a change is complete, commit it and push it at once. Do not wait for the user to ask. A change is one logical unit of work, for example one index in one language, one script, one fix, or one doc update.
+
+Before each commit:
+
+1. Run the checks for the code that changed: build, tests, and `tools.data.verify` when data code changed. If a check fails, fix it first. Never commit broken code.
+2. Run `git status` and `git diff --staged`. Stage only the files of this change. Never use `git add -A` without reading the list.
+3. Confirm that no data, build output, secrets, or large files are staged.
+
+Commit message format:
+
+```
+<area>: <what changed, imperative, max 72 characters>
+
+<why, and anything a reviewer must know>
+```
+
+`<area>` is one of: `tools`, `indexes/python`, `indexes/go`, `indexes/cpp`, `indexes/rust`, `db`, `docs`, `repo`. Example: `indexes/rust: add IVF build and search`.
+
+Rules:
+
+- One logical change per commit. Do not mix a fix with a new feature.
+- Update `README.md` status and `CLAUDE.md` commands in the same commit as the change that makes them true.
+- Never rewrite pushed history: no `--amend`, rebase, or force push after a push, unless the user asks.
+- Subagents do not commit and do not push. Each subagent reports its changed files to the main session. The main session reviews, runs the checks, and commits each change separately.
