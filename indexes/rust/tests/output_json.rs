@@ -163,7 +163,7 @@ fn stub_index_exits_1() {
     let out = bench()
         .args([
             "--index",
-            "ivf",
+            "diskann", // still a stub until Wave 2b; that agent removes this test
             "--data",
             "data/processed/dev",
             "--limit",
