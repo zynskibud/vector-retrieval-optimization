@@ -239,12 +239,18 @@ Return the top k, with optional rerank.
 
 **Insert row i** (rows in order, as in the paper, Malkov and Yashunin 2018, Algorithm 1):
 1. From the entry point, on each layer above level(i), greedy descent with ef = 1.
-2. On each layer from min(level(i), top) down to 0: search-layer (Algorithm 2) with `ef_construct` candidates, select neighbors with the **heuristic** (Algorithm 4, `extendCandidates = false`, `keepPrunedConnections = false`), limit `m` (or 2m on layer 0), and add bidirectional edges. If a neighbor now exceeds its limit, shrink its list with the same heuristic over its current neighbors.
+2. On each layer from min(level(i), top) down to 0: search-layer (Algorithm 2) with `ef_construct` candidates, select **`m` neighbors on every layer** with the **heuristic** (Algorithm 4, `extendCandidates = false`, `keepPrunedConnections = false`), and add bidirectional edges. Each node's list has a **cap**: `m` on layers ≥ 1 and `2m` on layer 0. If a neighbor's list now exceeds its cap, shrink it to the cap with the same heuristic over its current neighbors. (This is the paper's M and M_max0, and what hnswlib and FAISS do. The new node selects m, never 2m.)
 3. If level(i) > top, the node becomes the entry point.
 
 **Search:** greedy descent from the entry point to layer 1 with ef = 1, then search-layer on layer 0 with `max(ef, k)` candidates, return the top k. `distance_computations` = number of dot products in the whole search.
 
-**Storage:** node IDs are the row IDs. Each layer's adjacency is a flat int32 array with fixed slots per node (2m on layer 0, m above), with a per-node count, so no per-node heap allocation during search. Build may use threads (insert in parallel with a lock per node's neighbor list). With `--threads 1`, insertion is strictly in row order.
+**Storage:** node IDs are the row IDs. Each layer's adjacency is a flat int32 array with fixed slots per node (2m on layer 0, m above), with a per-node count, so no per-node heap allocation during search. One flat array for all upper layers, with a per-node offset, is also acceptable. With `--threads 1`, insertion is strictly in row order and the build is deterministic.
+
+**Parallel build.** Build may insert rows in parallel with a lock per node's neighbor list. Parallel insertion has a known defect on this data: near-duplicate paragraphs sit in consecutive rows, two threads insert them at the same time without seeing each other, both link to the same neighbors, and the heuristic then prunes one of them from every list. That node ends with no incoming edge on layer 0 and can never be found. Observed in Go with 10 threads: 1,193 of 100,000 nodes unreachable; with 1 thread, 0. Therefore:
+
+1. After a parallel build, run a **repair pass**: find every node with zero incoming edges on layer 0. For each such node v, take u = the nearest node in v's own layer-0 list (or, if v has no out-edges, the nearest node from a fresh search-layer with `ef_construct`), add the edge u → v, and if u's list exceeds its cap, shrink it with the heuristic but with v kept (v is not a candidate for pruning). Repeat until no node has zero in-degree on layer 0 (one pass is normally enough; cap at 3 passes and report the count in `extra.repair_added`).
+2. Tests must show that a build with all cores reaches **every** node from the entry point on layer 0 by BFS (100%, not 99%), and that its recall@10 at ef=64 is within 0.01 of the `--threads 1` build on the same 20,000 rows.
+3. `extra` reports `top_layer`, `entry_point`, `nodes_per_layer`, `unreachable_before_repair`, and `repair_added`.
 
 ### 6.7 diskann
 
