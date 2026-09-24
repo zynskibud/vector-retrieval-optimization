@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+/data/
+/results/raw/
+.DS_Store
+.env
+
+# Go, C++, Rust build output
+indexes/go/bin/
+indexes/cpp/build/
+indexes/rust/target/

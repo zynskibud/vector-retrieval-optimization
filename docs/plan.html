@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vector Retrieval Plan</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+:root{
+  color-scheme:light;
+  --bg:#f4f6f8; --panel:#ffffff; --ink:#17202a; --muted:#5a6877; --line:#d6dee6; --accent:#2f6fd6; --soft:#eaf1fc;
+  --sans:"Atkinson Hyperlegible",system-ui,-apple-system,sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,Menlo,monospace;
+}
+@media (prefers-color-scheme:dark){:root{
+  color-scheme:dark; --bg:#12171d; --panel:#1a2129; --ink:#e6ebf0; --muted:#98a5b3; --line:#2c3643; --accent:#6a9cf0; --soft:#1e2a3a;}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:16px;line-height:1.55;padding-inline:16px;padding-block:40px 64px}
+main{max-width:860px;margin:0 auto;display:grid;gap:28px}
+h1{font-size:2.1rem;line-height:1.15;margin:0 0 10px;text-wrap:balance}
+h3{font-size:1rem;margin:0 0 6px}
+p{margin:0;max-width:68ch}
+ul,ol{margin:0;padding-left:1.3em;display:grid;gap:4px}
+code{font-family:var(--mono);font-size:.9em;background:var(--soft);padding:1px 5px;border-radius:4px}
+.lede{color:var(--muted);font-size:1.05rem}
+.facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}
+.fact{border-top:2px solid var(--line);padding-top:6px}
+.fact b{display:block;font-family:var(--mono);font-size:1.05rem}
+.fact small{color:var(--muted)}
+.phases{display:grid;gap:12px}
+details{background:var(--panel);border:1px solid var(--line);border-radius:10px}
+details[open]{border-color:var(--accent)}
+summary{list-style:none;cursor:pointer;padding:16px 18px;display:grid;grid-template-columns:auto 1fr auto;gap:14px;align-items:baseline}
+summary::-webkit-details-marker{display:none}
+summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:10px}
+.num{font-family:var(--mono);font-weight:600;color:var(--accent)}
+.ttl{font-weight:700;font-size:1.1rem}
+.ttl small{display:block;font-weight:400;color:var(--muted);font-size:.92rem}
+.chev{font-family:var(--mono);color:var(--muted);transition:transform .15s}
+details[open] .chev{transform:rotate(90deg)}
+@media (prefers-reduced-motion:reduce){.chev{transition:none}}
+.body{padding:0 18px 18px;display:grid;gap:18px;border-top:1px solid var(--line);padding-top:16px}
+.scroll{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:.94rem}
+th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-size:.78rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+.done{background:var(--soft);border-radius:8px;padding:12px 14px}
+.done h3{color:var(--accent)}
+footer{color:var(--muted);font-size:.92rem}
+</style>
+</head>
+<body>
+<main>
+
+<header>
+  <h1>Vector Retrieval Optimization</h1>
+  <p class="lede">Build the main vector indexes by hand in Python, Go, C++, and Rust, and check them against FAISS. Then run them in three self-hosted databases on 1.2 million Wikipedia vectors. Test filters, concurrency, updates and deletes, an embedding cache, and backup and restore. You write the code. Claude answers questions and reviews.</p>
+</header>
+
+<section class="facts">
+  <div class="fact"><b>1.2M × 384</b><small>Wikipedia paragraphs, MiniLM embeddings</small></div>
+  <div class="fact"><b>6 indexes</b><small>Flat, IVF, PQ, IVF_PQ, HNSW, DiskANN</small></div>
+  <div class="fact"><b>4 languages</b><small>Every index in Python, Go, C++, and Rust</small></div>
+  <div class="fact"><b>3 databases</b><small>Qdrant, pgvector, Milvus</small></div>
+  <div class="fact"><b>24 GB RAM · 44 GB disk</b><small>Run one database at a time</small></div>
+</section>
+
+<section class="phases">
+
+<details>
+  <summary><span class="num">·</span><span class="ttl">Repository layout<small>Where each part of the project lives</small></span><span class="chev">›</span></summary>
+  <div class="body">
+<pre style="margin:0;overflow-x:auto;font-family:var(--mono);font-size:.85rem;line-height:1.5">.
+├── CLAUDE.md, README.md
+├── pyproject.toml, uv.lock        # Python project (uv)
+├── docker-compose.yml             # Phase 2: one service per database
+├── data/                          # not in git
+│   ├── raw/                       #   downloaded Parquet shards
+│   └── processed/                 #   vectors.npy, queries.npy, metadata.parquet, ground_truth.npy
+├── tools/                         # Python: everything that is not an index
+│   ├── data/                      #   Phase 0: prepare, ground truth
+│   ├── bench/                     #   runner, metrics, plots
+│   ├── db/                        #   Phase 2: one client per database
+│   ├── load/                      #   Phase 4: load generator
+│   ├── cache/                     #   Phase 6: embedding cache
+│   └── backup/                    #   Phase 7: backup and restore tests
+├── indexes/                       # hand-built indexes
+│   ├── CONTRACT.md                #   CLI, output JSON, index file format
+│   ├── python/
+│   ├── go/
+│   ├── cpp/
+│   └── rust/
+├── results/
+│   ├── raw/                       #   not in git: one JSON per run
+│   └── summary/                   #   tables and plots
+└── docs/                          # plan.html, notes on algorithms and results</pre>
+    <div><h3>Rules</h3><ul>
+      <li>Each language folder has the same module names: <code>flat</code>, <code>ivf</code>, <code>pq</code>, <code>ivf_pq</code>, <code>hnsw</code>, <code>diskann</code>, plus shared <code>npy</code>, <code>distance</code>, and <code>kmeans</code>.</li>
+      <li>Each language has one <code>bench</code> program. It follows <code>indexes/CONTRACT.md</code>.</li>
+      <li>Only the tools computes recall, so all languages are measured the same way.</li>
+      <li><code>CLAUDE.md</code> holds the fixed conventions for Claude and subagents.</li>
+    </ul></div>
+  </div>
+</details>
+
+
+<details>
+  <summary><span class="num">0</span><span class="ttl">Setup and data<small>Get the vectors and the exact answers to measure against</small></span><span class="chev">›</span></summary>
+  <div class="body">
+    <div><h3>Learn first</h3><ul>
+      <li>Embedding: a vector that represents the meaning of a text.</li>
+      <li>Cosine similarity and dot product. Why they are equal for normalized vectors.</li>
+      <li>Ground truth: the exact top-k neighbors, found by brute force. It tests the index, not the embedding model.</li>
+      <li>Recall@k: the fraction of the true top-k that a search returns.</li>
+    </ul></div>
+    <div><h3>Build</h3><ol>
+      <li>Set up a Python project with <code>uv</code>.</li>
+      <li>Download 5 of the 145 files of <code>maloyan/wikipedia-22-12-en-embeddings-all-MiniLM-L6-v2</code> from Hugging Face (about 2.9 GB).</li>
+      <li>Normalize the vectors. Save them as a NumPy array, and save the metadata and text as Parquet.</li>
+      <li>Remove 1,000 random vectors from the corpus. Use them as queries.</li>
+      <li>Compute the exact top-100 neighbors of each query with NumPy, in chunks.</li>
+    </ol></div>
+    <div class="done"><h3>Done when</h3><p>You have <code>vectors.npy</code>, <code>queries.npy</code>, <code>metadata.parquet</code>, and <code>ground_truth.npy</code>. You can explain recall@10 without notes.</p></div>
+  </div>
+</details>
+
+<details>
+  <summary><span class="num">1</span><span class="ttl">Indexes by hand, checked against FAISS<small>Write each index in Python, Go, C++, and Rust. Compare all four to FAISS.</small></span><span class="chev">›</span></summary>
+  <div class="body">
+    <div><h3>Learn first</h3><ul>
+      <li>Compiled and interpreted languages. Stack and heap memory.</li>
+      <li>Four memory models: Python (reference counting and garbage collector), Go (garbage collector), C++ (manual and RAII), Rust (ownership checked by the compiler).</li>
+      <li>Contiguous memory layout and SIMD for distance computations.</li>
+      <li>Threads in each language for parallel build and batch search: Python <code>multiprocessing</code>, Go goroutines, C++ <code>std::thread</code> or OpenMP, Rust <code>rayon</code>.</li>
+      <li>FAISS: a C++ library from Meta with a Python API. Each index class has the same methods: <code>train</code>, <code>add</code>, <code>search</code>.</li>
+    </ul></div>
+    <div class="scroll"><table>
+      <thead><tr><th>Index</th><th>How it works</th><th>Settings to tune</th><th>Train</th><th>Difficulty</th></tr></thead>
+      <tbody>
+        <tr><td>Flat</td><td>Compare the query to every vector. Exact.</td><td>None</td><td>No</td><td>Easy</td></tr>
+        <tr><td>IVF</td><td>k-means clusters. Search only the nearest clusters.</td><td><code>nlist</code>, <code>nprobe</code></td><td>Yes</td><td>Easy</td></tr>
+        <tr><td>PQ</td><td>Compress each vector into 1-byte codes. Scan all codes with lookup tables.</td><td>Sub-vectors, bits per code</td><td>Yes</td><td>Medium</td></tr>
+        <tr><td>IVF_PQ</td><td>Your IVF plus your PQ.</td><td><code>nlist</code>, <code>nprobe</code>, sub-vectors, bits</td><td>Yes</td><td>Medium</td></tr>
+        <tr><td>HNSW</td><td>Layered nearest-neighbor graph. Greedy search along edges.</td><td><code>m</code>, <code>ef_construct</code>, <code>ef</code></td><td>No</td><td>Hard</td></tr>
+        <tr><td>DiskANN</td><td>One graph (Vamana) on SSD, PQ codes in RAM.</td><td><code>R</code>, build list size, <code>L</code></td><td>No</td><td>Hard</td></tr>
+      </tbody>
+    </table></div>
+    <div><h3>Structure</h3><ul>
+      <li>6 indexes × 4 languages = 24 implementations, plus FAISS as the reference.</li>
+      <li>Each language has one command-line benchmark program. It reads <code>vectors.npy</code>, <code>queries.npy</code>, and the settings, builds the index, runs the queries, and writes the result IDs, timings, and memory to a JSON file.</li>
+      <li>One Python script runs all programs, computes recall against the ground truth, and draws the plots. So all languages are measured the same way.</li>
+      <li>Pure Python loops are slow. If a Python build takes too long on 1.2M vectors, for example HNSW or DiskANN, run it on a 100k subset, and run the other languages on the same subset for that comparison.</li>
+    </ul></div>
+    <div><h3>Loop for each index</h3><ol>
+      <li>Write the build and search in Python, Go, C++, and Rust, with the same algorithm and settings.</li>
+      <li>Measure recall@10, latency p50 and p99, queries per second, build time, and peak memory.</li>
+      <li>Run the same index in FAISS with the same settings on the same data. FAISS has no DiskANN, so compare DiskANN with Milvus in Phase 2.</li>
+      <li>If recall differs between languages, one version has a bug: the algorithm is the same. If latency differs, find out why.</li>
+    </ol></div>
+    <div class="done"><h3>Done when</h3><p>All four versions of each index are within a few points of recall of FAISS at the same settings. For each index, you have one recall-versus-latency plot with five curves: Python, Go, C++, Rust, and FAISS. You can explain every gap, for example garbage collector pauses in p99 latency.</p></div>
+  </div>
+</details>
+
+<details>
+  <summary><span class="num">2</span><span class="ttl">Three databases<small>Run the same indexes inside real servers</small></span><span class="chev">›</span></summary>
+  <div class="body">
+    <div><h3>Learn first</h3><ul>
+      <li>Docker and Docker Compose: start and stop a database server.</li>
+      <li>Client-server model: your code sends requests over the network to the database.</li>
+      <li>Batch inserts, and index builds that run in the background.</li>
+    </ul></div>
+    <div class="scroll"><table>
+      <thead><tr><th>Database</th><th>Design</th><th>Indexes to test</th></tr></thead>
+      <tbody>
+        <tr><td>Qdrant</td><td>Dedicated vector database, Rust</td><td>HNSW, with scalar, product, and binary quantization</td></tr>
+        <tr><td>pgvector</td><td>Postgres extension, SQL</td><td>HNSW, IVFFlat</td></tr>
+        <tr><td>Milvus</td><td>Distributed vector database</td><td>HNSW, IVF_FLAT, IVF_PQ, DiskANN</td></tr>
+      </tbody>
+    </table></div>
+    <div><h3>Build</h3><ol>
+      <li>One Docker Compose file. Run one database at a time.</li>
+      <li>One loader and one benchmark client for each database, with the same queries and ground truth as Phase 1.</li>
+      <li>Record load time, disk use, and container memory, in addition to the Phase 1 metrics.</li>
+    </ol></div>
+    <div class="done"><h3>Done when</h3><p>You have one results table for your indexes, FAISS, and all databases. You can explain where each database differs from your index and from FAISS, and why.</p></div>
+  </div>
+</details>
+
+<details>
+  <summary><span class="num">3</span><span class="ttl">Metadata filtering<small>Vector search restricted to a subset of rows</small></span><span class="chev">›</span></summary>
+  <div class="body">
+    <div><h3>Learn first</h3><ul>
+      <li>Pre-filtering and post-filtering, and where each one fails.</li>
+      <li>Selectivity: the fraction of rows that pass a filter.</li>
+      <li>How each database combines a filter with its index.</li>
+    </ul></div>
+    <div><h3>Build</h3><ol>
+      <li>Filters on <code>views</code> that keep 50%, 10%, 1%, and 0.1% of the rows.</li>
+      <li>Exact ground truth for each filter, by brute force on the filtered rows.</li>
+      <li>Filter support in your HNSW and IVF, in all four languages: skip nodes or list entries that fail the filter.</li>
+      <li>The same filtered queries in each database.</li>
+    </ol></div>
+    <div class="done"><h3>Done when</h3><p>You have a plot of recall and latency against selectivity for your indexes and each database. You can explain why very selective filters are hard for graph indexes.</p></div>
+  </div>
+</details>
+
+<details>
+  <summary><span class="num">4</span><span class="ttl">Concurrency<small>Many clients at once: throughput and tail latency</small></span><span class="chev">›</span></summary>
+  <div class="body">
+    <div><h3>Learn first</h3><ul>
+      <li>Throughput (queries per second) and latency, and why p99 rises when load rises.</li>
+      <li>Threads, async I/O, and connection pools.</li>
+      <li>Locks and read-write locks. How a search can run while an insert changes the same graph.</li>
+      <li>Closed-loop load (fixed number of clients) and open-loop load (fixed arrival rate).</li>
+    </ul></div>
+    <div><h3>Build</h3><ol>
+      <li>A load generator that runs 1, 2, 4, 8, 16, 32, and 64 concurrent clients.</li>
+      <li>Make your HNSW safe for parallel searches, and for searches during inserts, in all four languages. Compare the locking tools of each language.</li>
+      <li>Run the load against your index and each database. Record QPS, p50, p99, CPU, and errors.</li>
+      <li>Repeat with a steady stream of inserts during the searches. Record the effect on search latency and recall.</li>
+    </ol></div>
+    <div class="done"><h3>Done when</h3><p>You have a plot of QPS against p99 latency for each system as clients increase. You can name the point where each system saturates, and why.</p></div>
+  </div>
+</details>
+
+<details>
+  <summary><span class="num">5</span><span class="ttl">Updates and deletes<small>Change the data after the index is built</small></span><span class="chev">›</span></summary>
+  <div class="body">
+    <div><h3>Learn first</h3><ul>
+      <li>Tombstones: mark a node as deleted without removing it from the graph.</li>
+      <li>Why a delete leaves the graph with fewer paths, and how recall can drop.</li>
+      <li>Graph repair, compaction, and rebuild. Postgres <code>VACUUM</code> and <code>REINDEX</code>.</li>
+      <li>Upsert: replace the vector of an existing ID.</li>
+      <li>IVF drift: clusters trained on old data fit new data less well.</li>
+    </ul></div>
+    <div><h3>Build</h3><ol>
+      <li>Delete and update support in your HNSW and IVF, in all four languages.</li>
+      <li>Delete 10%, 30%, and 50% of the vectors in each system. Recompute the ground truth on the remaining rows. Measure recall and latency.</li>
+      <li>Update 10% of the vectors with new vectors. Check that searches return the new version only.</li>
+      <li>Run compaction or rebuild. Measure recall, time, and disk use before and after.</li>
+    </ol></div>
+    <div class="done"><h3>Done when</h3><p>You have a plot of recall against the fraction deleted for each system, before and after repair. No search returns a deleted or outdated vector.</p></div>
+  </div>
+</details>
+
+<details>
+  <summary><span class="num">6</span><span class="ttl">Embedding cache<small>Skip the embedding model for queries that were seen before</small></span><span class="chev">›</span></summary>
+  <div class="body">
+    <div><h3>Learn first</h3><ul>
+      <li>The query path: text → embedding model → vector → index search. Embedding is often the slowest step.</li>
+      <li>Cache key: a hash of the normalized text plus the model name and version.</li>
+      <li>Eviction policies (LRU, LFU) and TTL.</li>
+      <li>Hit rate, and why it depends on how often queries repeat.</li>
+      <li>Invalidation: a new model version must not use vectors from the old model.</li>
+    </ul></div>
+    <div><h3>Build</h3><ol>
+      <li>Run <code>all-MiniLM-L6-v2</code> locally, the same model that made the corpus vectors.</li>
+      <li>A text query workload with repeats, for example a Zipf distribution over a pool of query texts from the Wikipedia titles.</li>
+      <li>An in-process LRU cache first, then Redis as a shared cache for many clients.</li>
+      <li>Measure hit rate, end-to-end latency with and without the cache, and memory for each cache size.</li>
+    </ol></div>
+    <div class="done"><h3>Done when</h3><p>You have a plot of hit rate and p50 latency against cache size. A model version change makes the old entries miss.</p></div>
+  </div>
+</details>
+
+<details>
+  <summary><span class="num">7</span><span class="ttl">Backup and restore<small>Save a copy, delete the data, load it back, prove it matches</small></span><span class="chev">›</span></summary>
+  <div class="body">
+    <div class="scroll"><table>
+      <thead><tr><th>System</th><th>Method</th></tr></thead>
+      <tbody>
+        <tr><td>Your indexes, all four languages</td><td>Your own save and load to a file, in one shared file format</td></tr>
+        <tr><td>Qdrant</td><td>Snapshot API</td></tr>
+        <tr><td>pgvector</td><td><code>pg_dump</code> and <code>pg_restore</code></td></tr>
+        <tr><td>Milvus</td><td><code>milvus-backup</code></td></tr>
+      </tbody>
+    </table></div>
+    <div><h3>Test procedure</h3><ol>
+      <li>Run the 1,000 queries. Save the result IDs.</li>
+      <li>Back up. Record the time and the file size.</li>
+      <li>Delete the collection, table, or index.</li>
+      <li>Restore. Record the time. Note whether the index must be rebuilt.</li>
+      <li>Run the same queries. Compare the IDs and the row count.</li>
+    </ol></div>
+    <div class="done"><h3>Done when</h3><p>Every query returns the same IDs after the restore, in each system. You have a table of backup time, size, and restore time.</p></div>
+  </div>
+</details>
+
+<details>
+  <summary><span class="num">8</span><span class="ttl">Write-up<small>Publish what you found</small></span><span class="chev">›</span></summary>
+  <div class="body">
+    <ul>
+      <li>README with the method, the plots, and the tables.</li>
+      <li>What building each index by hand taught you. How each language's memory model affected speed, memory, and p99 latency, and where FAISS was faster and why.</li>
+      <li>One recommendation for each case: best recall, lowest memory, best filtered search, best under load, and best with frequent deletes.</li>
+      <li>What surprised you, and what you would test next.</li>
+    </ul>
+    <div class="done"><h3>Done when</h3><p>Someone can read the README and choose an index and a database for their own data and workload.</p></div>
+  </div>
+</details>
+
+</section>
+
+<footer>Source: project 4, "Vector database at scale," in <code>AI-ENGINEER-PROJECTS-UNIQUE.md</code>, extended with hand-built indexes in four languages, concurrency, updates and deletes, and an embedding cache.</footer>
+</main>
+</body>
+</html>
