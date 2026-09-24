@@ -96,7 +96,8 @@ One file per `bench` invocation. Keys and types are exact. Extra keys are allowe
       "latency_ms": [0.412, 0.398, ...],   // Q values, one per query, in query order
       "total_s": 0.41,                 // wall time of the timed loop
       "qps": 2439.0,                   // q / total_s
-      "distance_computations": 3120    // mean per query, if the index counts them; else null
+      "distance_computations": 3120,   // mean per query, if the index counts them; else null
+      "extra": {}                      // per-search-run counters, mean per query, e.g. diskann disk_reads, disk_bytes_read
     }
   ],
   "machine": {"os": "darwin", "arch": "arm64", "cpu": "Apple M4", "cores": 10},
@@ -144,7 +145,7 @@ Where the contract says "random", use this generator with the run's seed, in the
 
 ## 6. The indexes
 
-Score is always the dot product `q · x`. Each index returns the k highest-scoring IDs, best first. If the index finds fewer than k candidates, pad with `-1` and score `-inf` (write `null` for the score in JSON).
+Score is always the dot product `q · x`. Each index returns the k highest-scoring IDs, best first. **Ties:** on equal scores, the lower ID comes first. If the index finds fewer than k candidates, pad with `-1` and score `-inf` (write `null` for the score in JSON).
 
 ### 6.1 flat
 
@@ -263,7 +264,7 @@ Return the top k, with optional rerank.
 4. Train PQ codes (6.4, `m = pq_m`) on all rows; encode all rows.
 5. Write `<out>.diskann` next to the output JSON: for each node, its full vector then its out-edges (fixed `r` slots, int32, −1 for empty), so a node is one contiguous record. Report the file size in `extra.disk_bytes`.
 
-**Search:** the corpus array is **released** after the file is written; search must not hold the full vectors in RAM. Hold PQ codes and codebooks in RAM. Beam search: a candidate list of size `l`; each step expands the `beam` best unexpanded candidates, reads their records from the file (6.7.1), scores their out-neighbors with the PQ table; stop when the list holds no unexpanded node. Re-score the top `rerank` candidates with their full vectors from the file, return the top k. Report `extra.disk_reads` = mean records read per query, and `extra.disk_bytes_read` = mean bytes read per query.
+**Search:** the corpus array is **released** after the file is written; search must not hold the full vectors in RAM. Hold PQ codes and codebooks in RAM. Beam search: a candidate list of size `l`; each step expands the `beam` best unexpanded candidates, reads their records from the file (6.7.1), scores their out-neighbors with the PQ table; stop when the list holds no unexpanded node. Re-score the top `rerank` candidates with their full vectors from the file, return the top k. Report, in that search run's `extra` object, `disk_reads` = mean records read per query and `disk_bytes_read` = mean bytes read per query.
 
 #### 6.7.1 The I/O dimension: warm cache and real disk reads
 
@@ -278,7 +279,7 @@ Rules:
 
 1. The runner runs DiskANN with `io=mmap` and `io=nocache` at every search setting. Before an `io=nocache` run, the `bench` program itself must not have touched the file through a map in the same process (the file is written, closed, and then opened with caching disabled), so the OS has no warm pages from this process.
 2. The two modes must return **identical `ids`** for every query. A test asserts this.
-3. A test asserts that `io=nocache` reports `disk_reads > 0` and a **higher p50 latency** than `io=mmap` at the same setting. If the two are equal, the reads are cached and the test fails.
+3. A test asserts that `io=nocache` reports `extra.disk_reads > 0` in its search entry and a **higher p50 latency** than `io=mmap` at the same setting. If the two are equal, the reads are cached and the test fails.
 4. The report shows both latencies side by side, and the ratio, so the SSD cost is visible.
 
 Record layout on disk: each node record is `dim × 4` bytes of vector, then `r` int32 out-edges, padded to a multiple of 4096 bytes. With dim = 384 and r = 64, a record is 1,536 + 256 = 1,792 bytes, padded to 4,096, so the file is N × 4 KB (4.9 GB for the full corpus, 0.4 GB for dev). `extra.disk_bytes` reports the file size.
@@ -319,7 +320,7 @@ indexes/rust/             build: cargo build --release --manifest-path indexes/r
 
 The runner calls: `uv run python -m indexes.python.bench`, `indexes/go/bin/bench`, `indexes/cpp/build/bench`, `indexes/rust/target/release/bench`.
 
-Each index module exposes the same interface (adapted to the language):
+A language may keep its shared types (matrix, params, build context with threads, seed, and the output path, result structs) in one extra module, for example `common`. Each index module exposes the same interface (adapted to the language):
 
 ```
 build(vectors, params, threads, seed) -> index      // runs train + add, records train_s and add_s
