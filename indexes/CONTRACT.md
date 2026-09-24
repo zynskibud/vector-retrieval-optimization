@@ -315,9 +315,9 @@ indexes/go/               module vro/indexes/go; build: cd indexes/go && go buil
 indexes/cpp/              build: cmake -S indexes/cpp -B indexes/cpp/build -DCMAKE_BUILD_TYPE=Release && cmake --build indexes/cpp/build
   CMakeLists.txt  src/bench.cpp  src/{npy,distance,kmeans,splitmix,flat,ivf,pq,ivf_pq,hnsw,diskann}.{hpp,cpp}
   tests/                  ctest
-indexes/rust/             build: cargo build --release --manifest-path indexes/rust/Cargo.toml
+indexes/rust/             build: (cd indexes/rust && cargo build --release)   # run inside the folder: cargo reads .cargo/config.toml (target-cpu=native) from the current directory, not from --manifest-path
   Cargo.toml  src/main.rs  src/{npy,distance,kmeans,splitmix,flat,ivf,pq,ivf_pq,hnsw,diskann}.rs
-  tests/                  cargo test --release
+  tests/                  (cd indexes/rust && cargo test --release)
 ```
 
 The runner calls: `uv run python -m indexes.python.bench`, `indexes/go/bin/bench`, `indexes/cpp/build/bench`, `indexes/rust/target/release/bench`.

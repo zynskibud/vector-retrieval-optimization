@@ -93,6 +93,10 @@ uv run python -m tools.bench.faiss_ref --index hnsw --data data/processed/dev --
 uv run python -m tools.bench.runner --data data/processed/dev --languages faiss,python --indexes flat,ivf [--dry-run]   # sequential runs -> results/raw/<data>/
 uv run python -m tools.bench.report --data data/processed/dev   # results/summary/<data>/: results.csv, results.md, <index>.png
 uv run pytest indexes/python/tests tools/bench/tests -q
+
+(cd indexes/go && go vet ./... && go test ./... && go build -o bin/bench ./cmd/bench)
+cmake -S indexes/cpp -B indexes/cpp/build -DCMAKE_BUILD_TYPE=Release && cmake --build indexes/cpp/build -j && ctest --test-dir indexes/cpp/build
+(cd indexes/rust && cargo build --release && cargo test --release)   # inside the folder, so .cargo/config.toml applies
 ```
 
 Add each new command here when it is created.
