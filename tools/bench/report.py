@@ -82,8 +82,8 @@ def main() -> None:
     if df.empty:
         raise SystemExit(f"no JSON files in {raw}")
     out.mkdir(parents=True, exist_ok=True)
-    cols = ["index", "language", "build_params", "search_params", "recall@10", "p50_ms", "p90_ms", "p99_ms",
-            "qps", "build_s", "peak_rss_mb", "index_bytes", "distance_computations"]
+    cols = ["index", "language", "build_params", "search_params", "recall@10", "p50_ms", "p50_spread", "p90_ms",
+            "p99_ms", "qps", "build_s", "peak_rss_mb", "index_bytes", "distance_computations"]
     df = df.sort_values(["index", "recall@10", "p50_ms"], ascending=[True, False, True])
     df[cols + ["n", "file"]].to_csv(out / "results.csv", index=False)
 

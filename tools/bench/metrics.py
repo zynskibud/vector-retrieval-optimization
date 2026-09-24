@@ -41,5 +41,14 @@ def summarize(doc: dict, ground_truth, k: int = 10) -> list[dict]:
             "mean_ms": lat["mean_ms"], "qps": run["qps"], "build_s": doc["build"]["total_s"],
             "peak_rss_mb": doc["build"]["peak_rss_mb"], "index_bytes": doc["build"]["index_bytes"],
             "distance_computations": run["distance_computations"],
+            # Spread of the runner's repeat runs (mean p50 over the search settings per run).
+            "p50_spread": _spread(doc.get("extra", {}).get("runner", {}).get("p50_ms_runs")),
         })
     return rows
+
+
+def _spread(p50_runs) -> str:
+    """'min-max' of the repeat runs' p50, or '' when the runner did not repeat."""
+    if not p50_runs or len(p50_runs) < 2:
+        return ""
+    return f"{min(p50_runs):.3g}-{max(p50_runs):.3g}"

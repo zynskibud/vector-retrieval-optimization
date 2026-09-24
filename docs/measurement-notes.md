@@ -14,7 +14,7 @@ Open problems in how the benchmarks are measured, with the data that showed them
 1. `--repeat N` (default 3). Each case runs N times as separate processes. The runner keeps the run with the median p50 and stores every run's p50 in `extra.runner.p50_ms_runs`, so the spread is visible.
 2. `--max-load` (default 2.0). The runner refuses to run a case while the 1-minute load average is above it, so runs never overlap with builds or agents. The load at start is stored in `extra.runner.load1_at_start`.
 
-Still to do: the report should print the spread next to the p50, and the full-corpus runs should confirm that 3 repeats are enough.
+The report prints the spread of the repeat runs (`p50_spread`, min-max of each run's mean p50) next to the p50. Still to do: the full-corpus runs should confirm that 3 repeats are enough.
 
 ## 2. Go's dot product is not vectorized (open)
 
