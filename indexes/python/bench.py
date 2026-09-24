@@ -143,6 +143,8 @@ def run(args) -> dict:
     if build_params.get("train_size", 0) is None:  # ivf: 6.2 default depends on nlist and N
         build_params["train_size"] = kmeans.default_train_size(n, build_params["nlist"])
 
+    if hasattr(mod, "OUT_PATH"):  # diskann writes <out>.diskann next to the output JSON (CONTRACT 6.7)
+        mod.OUT_PATH = args.out
     index = mod.build(vectors, build_params, args.threads, args.seed)
     build = {
         "train_s": index["train_s"],

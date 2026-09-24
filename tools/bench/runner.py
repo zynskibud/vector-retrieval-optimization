@@ -38,7 +38,7 @@ SWEEPS = {
     "ivf_pq": {"build": {"nlist": [1024], "m": [48], "metric": ["ip", "l2"]},
                "search": {"nprobe": [4, 8, 16, 32], "rerank": [0, 100]}},
     "hnsw": {"build": {"m": [16], "ef_construct": [100]}, "search": {"ef": [16, 32, 64, 128, 256]}},
-    "diskann": {"build": {"r": [64], "l_build": [100]},
+    "diskann": {"build": {"r": [64], "l_build": [100], "metric": ["ip", "l2"]},
                 "search": {"l": [50, 100, 200], "io": ["mmap", "nocache"]}},
 }
 
