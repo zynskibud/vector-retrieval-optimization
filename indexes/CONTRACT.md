@@ -160,9 +160,13 @@ kmeans(points, k, iters, seed) -> centers (k, d)
 
 1. **Training set:** the first `train_size` rows of the corpus. Not random. Default `train_size` = min(N, 256 × k), but never below k.
 2. **Init:** pick k distinct training rows by `next_below(train_n)` with the PRNG seeded by `seed`; on a repeat, draw again.
-3. **Iterate `iters` times** (default 20): assign each training point to the center with the highest dot product; set each center to the mean of its points, then **L2-normalize the center** (all data is normalized, and normalized centers keep dot-product ranking consistent).
-4. **Empty cluster:** move its center to the training point with the lowest score to its own assigned center (the worst-fit point), then remove that point from its old cluster for this iteration.
-5. Stop early if no assignment changed.
+3. **Iterate at most `iters` times** (default 20). Each iteration, in this order:
+   1. Assign each training point to the center with the highest dot product (lowest squared distance in `l2` mode, 6.4.1).
+   2. If no label changed compared with the previous iteration, stop. Compare the labels from step 1, before the empty-cluster fix.
+   3. Fix empty clusters (step 4 below).
+   4. Set each center to the mean of its points, then **L2-normalize the center** (all data is normalized, and normalized centers keep dot-product ranking consistent). PQ codebooks skip the normalization (6.4).
+   The centers after the last iteration's step 4 are the result.
+4. **Empty cluster:** for each empty cluster in index order, take the worst-fit training point: the point with the lowest score to its own assigned center (highest squared distance in `l2` mode), among points whose current cluster has at least 2 members, so no cluster becomes empty by donating. Move that point to the empty cluster (update its label and the member counts) before handling the next empty cluster.
 
 ### 6.3 ivf
 
