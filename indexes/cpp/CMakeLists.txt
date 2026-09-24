@@ -41,3 +41,12 @@ get_filename_component(VRO_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUT
 foreach(t npy splitmix flat kmeans json)
   add_test(NAME ${t} COMMAND tests ${t} ${VRO_REPO_ROOT} $<TARGET_FILE:bench>)
 endforeach()
+
+# One test executable per index, so Wave 2 agents edit only their own file.
+# A placeholder returns 77, which ctest reports as "skipped".
+foreach(t ivf pq hnsw ivf_pq diskann)
+  add_executable(test_${t} tests/test_${t}.cpp)
+  target_link_libraries(test_${t} PRIVATE vro_core)
+  add_test(NAME ${t} COMMAND test_${t} ${VRO_REPO_ROOT} $<TARGET_FILE:bench>)
+  set_tests_properties(${t} PROPERTIES SKIP_RETURN_CODE 77)
+endforeach()
