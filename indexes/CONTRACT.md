@@ -291,7 +291,7 @@ macOS and Linux keep recently read file pages in RAM (the page cache). After one
 
 Rules:
 
-1. The runner runs DiskANN with `io=mmap` and `io=nocache` at every search setting. Before an `io=nocache` run, the `bench` program itself must not have touched the file through a map in the same process (the file is written, closed, and then opened with caching disabled), so the OS has no warm pages from this process.
+1. The runner runs DiskANN with `io=mmap` and `io=nocache` at every search setting, in one process, so the page cache must be handled explicitly. Write the file with caching disabled (`F_NOCACHE` on macOS) and close it. When a search run switches from `io=mmap` to `io=nocache`: call `msync(MS_INVALIDATE)` on the map, unmap it, and on Linux also `posix_fadvise(POSIX_FADV_DONTNEED)`; only then open the file with caching disabled. Without this, macOS serves `F_NOCACHE` reads from the pages the map left behind, and the two modes measure the same (observed in Rust: 1.18 ms vs 1.16 ms at l=100; with the invalidation, C++ measured 8.3 ms vs 0.57 ms). All searches of one run use the same mode. Reopen the map lazily when a later run switches back to `io=mmap`.
 2. The two modes must return **identical `ids`** for every query. A test asserts this.
 3. A test asserts that `io=nocache` reports `extra.disk_reads > 0` in its search entry and a **higher p50 latency** than `io=mmap` at the same setting. If the two are equal, the reads are cached and the test fails.
 4. The report shows both latencies side by side, and the ratio, so the SSD cost is visible.
