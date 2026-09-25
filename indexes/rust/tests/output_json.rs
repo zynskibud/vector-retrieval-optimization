@@ -157,21 +157,3 @@ fn unknown_param_exits_2() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("bogus"));
 }
-
-#[test]
-fn stub_index_exits_1() {
-    let out = bench()
-        .args([
-            "--index",
-            "diskann", // still a stub until Wave 2b; that agent removes this test
-            "--data",
-            "data/processed/dev",
-            "--limit",
-            "1000",
-        ])
-        .args(["--out", "/dev/null"])
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("not implemented"));
-}
