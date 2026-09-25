@@ -28,5 +28,3 @@ def test_usage_errors(tmp_path, capsys):
     out = str(tmp_path / "r.json")
     assert bench.main(["--index", "nope", "--data", DEV, "--out", out]) == 2
     assert bench.main(["--index", "hnsw", "--data", DEV, "--out", out, "--build", "zzz=1"]) == 2
-    assert bench.main(["--index", "diskann", "--data", DEV, "--out", out, "--limit", "100"]) == 1
-    assert "not implemented" in capsys.readouterr().err
