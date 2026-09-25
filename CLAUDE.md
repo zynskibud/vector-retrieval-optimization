@@ -76,6 +76,7 @@ These hold everywhere. Do not change them without approval from the user.
   - Go: the standard library only.
 - **Write the .npy reader by hand** in each language. The format is a short header followed by raw little-endian float32 data.
 - **The same algorithm and the same settings** in all four languages. If one language needs a different approach, write down why in `docs/`.
+- **All six indexes exist in all four languages.** No stub remains; `bench --index <name>` runs every index. DiskANN writes `<out>.diskann` (4 KB per row: 0.4 GB on dev, 4.9 GB on the full corpus) next to the output JSON; delete it after a run.
 - **Follow `indexes/CONTRACT.md`.** It fixes the command line, the output JSON, the `.npy` reader, the PRNG, every index algorithm and its parameter names, the measurement rules, the directory layout, and the required tests. Read it in full before you write index code.
 
 ## Commands

@@ -7,7 +7,7 @@ Six vector search indexes built by hand in Python, Go, C++, and Rust, checked ag
 | Phase | Topic | Status |
 |---|---|---|
 | 0 | Setup and data | Done |
-| 1 | Indexes by hand, checked against FAISS | In progress: flat, IVF, PQ, HNSW done in all four languages and checked against FAISS on the dev set; IVF_PQ and DiskANN next |
+| 1 | Indexes by hand, checked against FAISS | In progress: all 24 implementations (6 indexes × 4 languages) done and tested; dev-set sweeps for IVF_PQ and DiskANN running; full-corpus runs next |
 | 2 | Three databases | Not started |
 | 3 | Metadata filtering | Not started |
 | 4 | Concurrency | Not started |
