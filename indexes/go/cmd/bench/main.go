@@ -32,6 +32,9 @@ type options struct {
 	k, threads, warmup, limit int
 	seed                      uint64
 	builds, searches          multiFlag
+	clients                   int     // section 12: concurrent search goroutines
+	duration                  float64 // seconds of the load loop; 0 = not given
+	insertRate                float64 // rows per second inserted during the loop
 }
 
 func main() {
@@ -58,6 +61,9 @@ func parseFlags(args []string) (options, error) {
 	fs.Uint64Var(&o.seed, "seed", 42, "seed for every random choice")
 	fs.IntVar(&o.warmup, "warmup", 100, "untimed warm-up queries")
 	fs.IntVar(&o.limit, "limit", 0, "use only the first INT corpus rows (0 = all)")
+	fs.IntVar(&o.clients, "clients", 1, "concurrent search goroutines (section 12)")
+	fs.Float64Var(&o.duration, "duration", 0, "seconds of the load loop (0 = one pass; 20 in a load run)")
+	fs.Float64Var(&o.insertRate, "insert-rate", 0, "rows per second inserted during the loop (hnsw)")
 	if err := fs.Parse(args); err != nil {
 		return o, usageError{err.Error()}
 	}
@@ -69,6 +75,15 @@ func parseFlags(args []string) (options, error) {
 	}
 	if o.k < 1 || o.threads < 1 || o.warmup < 0 || o.limit < 0 {
 		return o, usagef("--k and --threads must be >= 1, --warmup and --limit >= 0")
+	}
+	if o.clients < 1 || o.duration < 0 || o.insertRate < 0 {
+		return o, usagef("--clients must be >= 1, --duration and --insert-rate >= 0")
+	}
+	if _, ok := loadIndexes[o.index]; !ok && (o.clients > 1 || o.insertRate > 0) {
+		return o, usagef("--clients > 1 and --insert-rate need a concurrent index (hnsw), not %q", o.index)
+	}
+	if o.loadMode() && o.duration == 0 {
+		o.duration = defaultLoadDuration
 	}
 	return o, nil
 }

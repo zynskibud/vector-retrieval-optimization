@@ -10,6 +10,13 @@
 // layer 1..L, starting at upperOff[node]. Each block has its own count. No
 // per-node slice is allocated after the build.
 //
+// Concurrency (CONTRACT.md section 12). Search takes no lock. Every slot and
+// every count is read and written with sync/atomic, and a writer stores the
+// slots before the count. The entry point and top layer are one atomic word,
+// changed only under the entry lock. Each Search takes its scratch buffers
+// from a sync.Pool. Insert adds rows after the build (BuildCap reserves the
+// room) while searches run.
+//
 // Threads. With threads == 1, rows are inserted strictly in row order. With
 // threads > 1, workers take rows in row order from an atomic counter and insert
 // in parallel. Each node's neighbor lists are guarded by one sync.Mutex per
@@ -48,14 +55,19 @@ var DataDir string
 // Index is the HNSW index.
 type Index struct {
 	trainS, addS float64
-	dists        int64
-	filterRows   int64           // corpus rows passing the filter, summed over searches
-	passCache    map[*bool]int64 // pass count per mask
-	visitedSum   int64           // layer-0 nodes expanded by Search, summed over searches
-	passedSum    int64           // layer-0 nodes scored by Search that passed the filter
+	// Search counters are atomic: several goroutines may call Search at once.
+	dists      atomic.Int64
+	filterRows atomic.Int64 // corpus rows passing the filter, summed over searches
+	passCache  sync.Map     // *bool (first element of a mask) -> int64 pass count
+	visitedSum atomic.Int64 // layer-0 nodes expanded by Search, summed over searches
+	passedSum  atomic.Int64 // layer-0 nodes scored by Search that passed the filter
 
+	// vectors holds capN rows. Rows 0..count-1 are in the graph. Rows at and
+	// above count are never read until Insert links them.
 	vectors []float32
-	n, dim  int
+	capN    int          // rows allocated: levels, slots and counts exist for capN rows
+	count   atomic.Int64 // rows in the graph, published after each insert
+	dim     int
 	m, m0   int // max edges on layers >= 1, and on layer 0 (2m)
 	efC     int
 
@@ -68,10 +80,13 @@ type Index struct {
 	linksUpper []int32 // blocks of m slots
 	cntUpper   []int32 // one count per block
 
-	entry int32
-	top   int
+	// epTop packs the entry point (high 32 bits) and the top layer (low 32
+	// bits), so Search reads both with one atomic load. It changes only under
+	// epLock (write mode).
+	epTop  atomic.Uint64
+	epLock sync.RWMutex
 
-	locks []sync.Mutex // one per node; used only by the parallel build
+	locks []sync.Mutex // one per node; used by the parallel build and by Insert
 
 	unreachableBefore  int             // layer-0 BFS misses after a parallel build, before repair
 	repairAdded        int             // edges added by the repair pass
@@ -79,8 +94,25 @@ type Index struct {
 	protected          map[uint64]bool // repair edges u->v (u<<32|v); never pruned
 	buildThreads       int
 
-	sc *scratch // search scratch (search runs on one goroutine)
+	scPool sync.Pool // *scratch, one per concurrent Search
+
+	insUnreach, insAdded, insAddedUnreach int // repair counts of the last Repair call
 }
+
+// entryTop returns the entry point and the top layer (one atomic load).
+func (ix *Index) entryTop() (int32, int) {
+	v := ix.epTop.Load()
+	return int32(uint32(v >> 32)), int(uint32(v))
+}
+
+// setEntryTop publishes a new entry point and top layer. Callers hold epLock
+// in write mode, or run with no other goroutine.
+func (ix *Index) setEntryTop(e int32, top int) {
+	ix.epTop.Store(uint64(uint32(e))<<32 | uint64(uint32(top)))
+}
+
+// Len returns the number of rows in the graph.
+func (ix *Index) Len() int { return int(ix.count.Load()) }
 
 // ---------- parameters ----------
 
@@ -241,7 +273,15 @@ func (ix *Index) neighbors(i int32, l int, buf []int32, locked bool) []int32 {
 		ix.locks[i].Lock()
 	}
 	sl, c := ix.slots(i, l)
-	buf = append(buf[:0], sl[:*c]...)
+	// Lock-free readers (Search) may run while an insert changes this list.
+	// Each slot and the count are loaded atomically. The writer stores the
+	// slots before the count, so the list read here can be shorter or longer
+	// than the current one, but every ID in it is a valid node.
+	n := min(int(atomic.LoadInt32(c)), len(sl))
+	buf = buf[:0]
+	for j := 0; j < n; j++ {
+		buf = append(buf, atomic.LoadInt32(&sl[j]))
+	}
 	if locked {
 		ix.locks[i].Unlock()
 	}
@@ -381,24 +421,21 @@ func (ix *Index) insert(i int32, s *scratch, locked bool, epLock *sync.RWMutex) 
 	lvl := int(ix.levels[i])
 	q := ix.vec(i)
 
-	var entry int32
-	var top int
+	entry, top := ix.entryTop()
 	if locked {
 		epLock.RLock()
-		entry, top = ix.entry, ix.top
+		entry, top = ix.entryTop()
 		epLock.RUnlock()
 		if lvl > top {
 			// Rare: hold the entry lock for the whole insertion, so the
 			// entry point and top layer change atomically with it.
 			epLock.Lock()
 			defer epLock.Unlock()
-			entry, top = ix.entry, ix.top
+			entry, top = ix.entryTop()
 		}
-	} else {
-		entry, top = ix.entry, ix.top
 	}
 	if entry < 0 { // first node
-		ix.entry, ix.top = i, lvl
+		ix.setEntryTop(i, lvl)
 		return
 	}
 
@@ -406,7 +443,16 @@ func (ix *Index) insert(i int32, s *scratch, locked bool, epLock *sync.RWMutex) 
 	for l := top; l > lvl; l-- {
 		cur = ix.greedy(q, cur, l, s, locked)
 	}
-	for l := min(lvl, top); l >= 0; l-- {
+	// Select the neighbors top-down (each layer starts from the best result
+	// of the layer above), then write the edges bottom-up. A connect on layer
+	// l changes only layer-l lists, so the order of the writes does not change
+	// the graph of a one-thread build. Bottom-up matters for concurrent
+	// Search: once node i appears in a list on layer l, its own lists on
+	// layers l-1..0 are complete, so a search that descends through i never
+	// finds an empty layer-0 list.
+	lmax := min(lvl, top)
+	sels := make([][]item, lmax+1)
+	for l := lmax; l >= 0; l-- {
 		ix.searchLayer(q, cur, ix.efC, l, s, locked)
 		s.pool = append(s.pool[:0], s.res.a...)
 		// Next layer starts from the best result.
@@ -419,26 +465,28 @@ func (ix *Index) insert(i int32, s *scratch, locked bool, epLock *sync.RWMutex) 
 		// The new node selects m neighbors on every layer (paper M). The cap
 		// of a list (m, or 2m on layer 0; paper M_max0) applies in connect.
 		s.sel = ix.selectHeuristic(s.pool, ix.m, s.sel)
-		sel := append([]item(nil), s.sel...)
-
+		sels[l] = append([]item(nil), s.sel...)
+		cur = best
+	}
+	for l := 0; l <= lmax; l++ {
+		sel := sels[l]
 		if locked {
 			ix.locks[i].Lock()
 		}
 		sl, c := ix.slots(i, l)
 		for j, it := range sel {
-			sl[j] = it.id
+			atomic.StoreInt32(&sl[j], it.id)
 		}
-		*c = int32(len(sel))
+		atomic.StoreInt32(c, int32(len(sel))) // count after slots
 		if locked {
 			ix.locks[i].Unlock()
 		}
 		for _, it := range sel {
 			ix.connect(it.id, i, it.s, l, ix.capOf(l), s, locked)
 		}
-		cur = best
 	}
 	if lvl > top {
-		ix.entry, ix.top = i, lvl
+		ix.setEntryTop(i, lvl)
 	}
 }
 
@@ -459,8 +507,8 @@ func (ix *Index) connect(e, i int32, sim float32, l, limit int, s *scratch, lock
 	sl, c := ix.slots(e, l)
 	n := int(*c)
 	if n < limit {
-		sl[n] = i
-		*c++
+		atomic.StoreInt32(&sl[n], i)
+		atomic.StoreInt32(c, int32(n+1))
 		return
 	}
 	ve := ix.vec(e)
@@ -471,21 +519,23 @@ func (ix *Index) connect(e, i int32, sim float32, l, limit int, s *scratch, lock
 	pool = append(pool, item{sim, i})
 	out := ix.selectHeuristic(pool, limit, make([]item, 0, limit))
 	for j, it := range out {
-		sl[j] = it.id
+		atomic.StoreInt32(&sl[j], it.id)
 	}
-	*c = int32(len(out))
+	atomic.StoreInt32(c, int32(len(out)))
 }
 
 // ---------- repair pass (CONTRACT 6.6, parallel build) ----------
 
 // reach0Set marks the nodes reachable from the entry point on layer 0 by BFS.
 func (ix *Index) reach0Set() []bool {
-	seen := make([]bool, ix.n)
-	if ix.n == 0 {
+	n := ix.Len()
+	seen := make([]bool, n)
+	entry, _ := ix.entryTop()
+	if n == 0 {
 		return seen
 	}
-	queue := []int32{ix.entry}
-	seen[ix.entry] = true
+	queue := []int32{entry}
+	seen[entry] = true
 	for h := 0; h < len(queue); h++ {
 		sl, c := ix.slots(queue[h], 0)
 		for _, e := range sl[:*c] {
@@ -524,25 +574,30 @@ func (ix *Index) reachable0() int {
 // Every repair edge is protected: when u's list is over its cap, the
 // heuristic shrink never prunes v or any earlier repair edge (addKeep).
 // The pass repeats while step B found an unreachable node, at most 3 passes.
-func (ix *Index) repair(s *scratch) {
-	if ix.n <= 1 {
+//
+// It returns the BFS miss count before the repair, all edges added, and the
+// edges added by step B. No other goroutine may use the index meanwhile.
+func (ix *Index) repair(s *scratch) (unreachBefore, added, addedUnreach int) {
+	n := ix.Len()
+	if n <= 1 {
 		return
 	}
-	ix.unreachableBefore = ix.n - ix.reachable0()
+	entry, _ := ix.entryTop()
+	unreachBefore = n - ix.reachable0()
 	ix.protected = make(map[uint64]bool)
 	defer func() { ix.protected = nil }()
-	indeg := make([]int32, ix.n)
+	indeg := make([]int32, n)
 	for pass := 0; pass < 3; pass++ {
 		// Step A.
 		clear(indeg)
-		for i := 0; i < ix.n; i++ {
+		for i := 0; i < n; i++ {
 			sl, c := ix.slots(int32(i), 0)
 			for _, e := range sl[:*c] {
 				indeg[e]++
 			}
 		}
-		for v := int32(0); int(v) < ix.n; v++ {
-			if indeg[v] > 0 || v == ix.entry {
+		for v := int32(0); int(v) < n; v++ {
+			if indeg[v] > 0 || v == entry {
 				continue
 			}
 			var u int32
@@ -553,27 +608,28 @@ func (ix *Index) repair(s *scratch) {
 			}
 			if u >= 0 {
 				ix.addKeep(u, v)
-				ix.repairAdded++
+				added++
 			}
 		}
 		// Step B.
 		seen := ix.reach0Set()
 		foundB := false
-		for v := int32(0); int(v) < ix.n; v++ {
+		for v := int32(0); int(v) < n; v++ {
 			if seen[v] {
 				continue
 			}
 			foundB = true
 			if u := ix.searchFrom(v, s, true); u >= 0 {
 				ix.addKeep(u, v)
-				ix.repairAdded++
-				ix.repairAddedUnreach++
+				added++
+				addedUnreach++
 			}
 		}
 		if !foundB {
 			return
 		}
 	}
+	return
 }
 
 // nearestInList returns the best-scoring node in v's own layer-0 list.
@@ -596,8 +652,9 @@ func (ix *Index) nearestInList(v int32) int32 {
 // list has a free slot, and the nearest result only if none has one.
 func (ix *Index) searchFrom(v int32, s *scratch, preferFree bool) int32 {
 	q := ix.vec(v)
-	ep := item{distance.Dot(q, ix.vec(ix.entry)), ix.entry}
-	for l := ix.top; l >= 1; l-- {
+	entry, top := ix.entryTop()
+	ep := item{distance.Dot(q, ix.vec(entry)), entry}
+	for l := top; l >= 1; l-- {
 		ep = ix.greedy(q, ep, l, s, false)
 	}
 	ix.searchLayer(q, ep, ix.efC, 0, s, false)
@@ -632,8 +689,8 @@ func (ix *Index) addKeep(u, v int32) {
 	sl, c := ix.slots(u, 0)
 	n := int(*c)
 	if n < ix.m0 {
-		sl[n] = v
-		*c++
+		atomic.StoreInt32(&sl[n], v)
+		atomic.StoreInt32(c, int32(n+1))
 		return
 	}
 	vu := ix.vec(u)
@@ -649,16 +706,16 @@ func (ix *Index) addKeep(u, v int32) {
 	out := ix.selectHeuristic(pool, max(ix.m0-len(keep), 0), make([]item, 0, ix.m0))
 	j := 0
 	for _, it := range out {
-		sl[j] = it.id
+		atomic.StoreInt32(&sl[j], it.id)
 		j++
 	}
 	for _, id := range keep {
 		if j < ix.m0 {
-			sl[j] = id
+			atomic.StoreInt32(&sl[j], id)
 			j++
 		}
 	}
-	*c = int32(j)
+	atomic.StoreInt32(c, int32(j))
 }
 
 // parallelChunk is the number of consecutive rows a worker claims at once
@@ -673,6 +730,16 @@ const parallelChunk = 64
 
 // Build runs train and add. vectors is row-major (n, dim).
 func Build(vectors []float32, n, dim int, params map[string]any, threads int, seed uint64) (*Index, error) {
+	return BuildCap(vectors, n, n, dim, params, threads, seed)
+}
+
+// BuildCap builds the graph on the first n rows and allocates levels, slots
+// and counts for capN >= n rows, so that Insert can add rows n..capN-1 later
+// while searches run. vectors holds at least capN rows (row-major). The levels
+// of all capN rows are drawn at build time, in row order from one PRNG, so an
+// inserted row gets the same level as in a build on capN rows. The build of
+// the first n rows is the same as Build on n rows.
+func BuildCap(vectors []float32, n, capN, dim int, params map[string]any, threads int, seed uint64) (*Index, error) {
 	m, err := intParam(params, "m", 16)
 	if err != nil {
 		return nil, err
@@ -684,12 +751,17 @@ func Build(vectors []float32, n, dim int, params map[string]any, threads int, se
 	if m < 2 || efC < 1 {
 		return nil, fmt.Errorf("hnsw: need m >= 2 and ef_construct >= 1, got m=%d ef_construct=%d", m, efC)
 	}
+	if capN < n || len(vectors) < capN*dim {
+		return nil, fmt.Errorf("hnsw: capacity %d rows, build %d rows, vectors hold %d rows", capN, n, len(vectors)/max(dim, 1))
+	}
 	start := time.Now()
-	ix := &Index{vectors: vectors, n: n, dim: dim, m: m, m0: 2 * m, efC: efC, entry: -1}
-	ix.levels = Levels(n, m, seed)
-	ix.links0 = make([]int32, n*ix.m0)
-	ix.cnt0 = make([]int32, n)
-	ix.upperOff = make([]int32, n)
+	ix := &Index{vectors: vectors[:capN*dim], capN: capN, dim: dim, m: m, m0: 2 * m, efC: efC}
+	ix.setEntryTop(-1, 0)
+	ix.scPool.New = func() any { return newScratch(capN) }
+	ix.levels = Levels(capN, m, seed)
+	ix.links0 = make([]int32, capN*ix.m0)
+	ix.cnt0 = make([]int32, capN)
+	ix.upperOff = make([]int32, capN)
 	blocks := 0
 	for i, l := range ix.levels {
 		if l > 0 {
@@ -704,15 +776,14 @@ func Build(vectors []float32, n, dim int, params map[string]any, threads int, se
 
 	if n > 0 {
 		if threads <= 1 {
-			s := newScratch(n)
+			s := newScratch(capN)
 			for i := 0; i < n; i++ {
 				ix.insert(int32(i), s, false, nil)
 			}
 		} else {
-			ix.locks = make([]sync.Mutex, n)
-			var epLock sync.RWMutex
+			ix.locks = make([]sync.Mutex, capN)
 			// Row 0 first, so every other worker has an entry point.
-			s0 := newScratch(n)
+			s0 := newScratch(capN)
 			ix.insert(0, s0, false, nil)
 			// Workers claim chunks of consecutive rows; see parallelChunk.
 			chunk := int64(parallelChunk)
@@ -729,44 +800,93 @@ func Build(vectors []float32, n, dim int, params map[string]any, threads int, se
 							return
 						}
 						for i := max(lo, 1); i < min(lo+chunk, int64(n)); i++ {
-							ix.insert(int32(i), s, true, &epLock)
+							ix.insert(int32(i), s, true, &ix.epLock)
 						}
 					}
-				}(newScratch(n))
+				}(newScratch(capN))
 			}
 			wg.Wait()
 			ix.locks = nil
 		}
-		ix.repair(newScratch(n))
+		ix.count.Store(int64(n))
+		ix.unreachableBefore, ix.repairAdded, ix.repairAddedUnreach = ix.repair(newScratch(capN))
 	}
 	ix.addS = time.Since(start).Seconds() // includes the repair pass
 	ix.buildThreads = threads
-	ix.sc = newScratch(n)
+	if capN > n {
+		ix.locks = make([]sync.Mutex, capN) // for Insert
+	}
 	return ix, nil
 }
 
+// Insert adds rows to the graph while other goroutines call Search. ids must
+// be the next rows in order: ids[0] == Len(), ids[j] == ids[0]+j, and below
+// the capacity given to BuildCap. vectors holds len(ids) rows (row-major).
+// Each row is inserted as in the parallel build (Algorithm 1 with the per-node
+// locks and the entry lock) and then published: Len() grows by one.
+// Only one goroutine may call Insert at a time. Searches take no lock.
+func Insert(ix *Index, ids []int64, vectors []float32) error {
+	d := ix.dim
+	if len(vectors) < len(ids)*d {
+		return fmt.Errorf("hnsw: Insert got %d ids and %d floats", len(ids), len(vectors))
+	}
+	if ix.locks == nil && len(ids) > 0 {
+		return fmt.Errorf("hnsw: Insert needs an index built by BuildCap with capacity > rows")
+	}
+	s := ix.scPool.Get().(*scratch)
+	defer ix.scPool.Put(s)
+	for j, id := range ids {
+		if want := int64(ix.Len()); id != want || id >= int64(ix.capN) {
+			return fmt.Errorf("hnsw: Insert row %d, want row %d (capacity %d)", id, want, ix.capN)
+		}
+		dst := ix.vectors[int(id)*d : int(id)*d+d]
+		src := vectors[j*d : j*d+d]
+		if &dst[0] != &src[0] {
+			// Row id is not reachable yet, so no Search reads dst now. The
+			// atomic stores of the edges to id publish these writes.
+			copy(dst, src)
+		}
+		ix.insert(int32(id), s, true, &ix.epLock)
+		ix.count.Store(id + 1)
+	}
+	return nil
+}
+
+// Repair runs the repair pass (CONTRACT 6.6) on the current graph, for
+// example after Insert. No other goroutine may use the index meanwhile. It
+// returns the layer-0 BFS miss count before the repair and the edges added.
+func Repair(ix *Index) (unreachBefore, added int) {
+	u, a, b := ix.repair(newScratch(ix.capN))
+	ix.insUnreach, ix.insAdded, ix.insAddedUnreach = u, a, b
+	return u, a
+}
+
 // Search returns the k best ids and scores for one query, best first.
+// It takes no lock and is safe to call from many goroutines at once, also
+// while Insert runs.
 func Search(ix *Index, query []float32, k int, params map[string]any) ([]int64, []float32) {
 	ids := make([]int64, k)
 	scores := make([]float32, k)
 	for i := range ids {
 		ids[i], scores[i] = -1, float32(math.Inf(-1))
 	}
-	if ix.n == 0 || ix.entry < 0 {
+	entry, top := ix.entryTop()
+	if ix.Len() == 0 || entry < 0 {
 		return ids, scores
 	}
 	ef, _ := intParam(params, "ef", 64)
 	ef = max(ef, k)
-	s := ix.sc
+	s := ix.scPool.Get().(*scratch)
+	defer ix.scPool.Put(s)
 	s.dists, s.expand, s.passed = 0, 0, 0
-	cur := item{distance.Dot(query, ix.vec(ix.entry)), ix.entry}
+	cur := item{distance.Dot(query, ix.vec(entry)), entry}
 	s.dists++
 	// The upper-layer descent ignores the filter (section 11.3).
-	for l := ix.top; l >= 1; l-- {
+	for l := top; l >= 1; l-- {
 		cur = ix.greedy(query, cur, l, s, false)
 	}
 	mask := filterMask(params)
-	ix.filterRows += ix.passCount(mask)
+	ix.filterRows.Add(ix.passCount(mask))
 	if mask != nil {
 		ix.searchLayerFiltered(query, cur, ef, s, mask)
 	} else {
@@ -774,15 +894,15 @@ func Search(ix *Index, query []float32, k int, params map[string]any) ([]int64, 
 		ix.searchLayer(query, cur, ef, 0, s, false)
 		s.passed = s.dists - d0 + 1 // every layer-0 node scored passes (entry included)
 	}
-	ix.visitedSum += s.expand
-	ix.passedSum += s.passed
+	ix.visitedSum.Add(s.expand)
+	ix.passedSum.Add(s.passed)
 	res := append(s.pool[:0], s.res.a...)
 	s.pool = res
 	sort.Slice(res, func(a, b int) bool { return better(res[a], res[b]) })
 	for i := 0; i < k && i < len(res); i++ {
 		ids[i], scores[i] = int64(res[i].id), res[i].s
 	}
-	ix.dists += s.dists
+	ix.dists.Add(s.dists)
 	return ids, scores
 }
 
@@ -796,20 +916,21 @@ func IndexBytes(ix *Index) int64 {
 	for _, c := range ix.cntUpper {
 		edges += int64(c)
 	}
-	return edges*4 + int64(ix.n)
+	return edges*4 + int64(ix.Len())
 }
 
 // TopLayer returns the highest layer of the graph.
-func (ix *Index) TopLayer() int { return ix.top }
+func (ix *Index) TopLayer() int { _, t := ix.entryTop(); return t }
 
 // Entry returns the entry point node.
-func (ix *Index) Entry() int32 { return ix.entry }
+func (ix *Index) Entry() int32 { e, _ := ix.entryTop(); return e }
 
 // NodesPerLayer returns the number of nodes on each layer 0..top.
 func (ix *Index) NodesPerLayer() []int {
-	out := make([]int, ix.top+1)
-	for _, l := range ix.levels {
-		for j := 0; j <= int(l) && j <= ix.top; j++ {
+	top := ix.TopLayer()
+	out := make([]int, top+1)
+	for _, l := range ix.levels[:ix.Len()] {
+		for j := 0; j <= int(l) && j <= top; j++ {
 			out[j]++
 		}
 	}
@@ -823,26 +944,33 @@ func (ix *Index) TrainSeconds() float64 { return ix.trainS }
 func (ix *Index) AddSeconds() float64 { return ix.addS }
 
 // DistanceComputations returns the total dot products computed by Search so far.
-func (ix *Index) DistanceComputations() int64 { return ix.dists }
+func (ix *Index) DistanceComputations() int64 { return ix.dists.Load() }
 
 // Extra returns index-specific build-time output keys (top-level "extra").
 func (ix *Index) Extra() map[string]any {
-	return map[string]any{
-		"top_layer":                 ix.top,
-		"entry_point":               ix.entry,
+	out := map[string]any{
+		"top_layer":                 ix.TopLayer(),
+		"entry_point":               ix.Entry(),
 		"nodes_per_layer":           ix.NodesPerLayer(),
 		"unreachable_before_repair": ix.unreachableBefore,
 		"repair_added":              ix.repairAdded,
 		"repair_added_unreachable":  ix.repairAddedUnreach,
 		"build_threads":             ix.buildThreads,
 	}
+	if ix.locks != nil { // built with room for Insert
+		out["capacity_rows"] = ix.capN
+		out["repair_after_inserts_unreachable_before"] = ix.insUnreach
+		out["repair_after_inserts_added"] = ix.insAdded
+		out["repair_after_inserts_added_unreachable"] = ix.insAddedUnreach
+	}
+	return out
 }
 
 // SearchCounters returns cumulative per-search counters: visited = layer-0
 // nodes expanded, filter_rows = corpus rows that pass the filter (n for
 // none), passing_scored = layer-0 nodes scored that passed the filter.
 func (ix *Index) SearchCounters() map[string]float64 {
-	return map[string]float64{"visited": float64(ix.visitedSum), "passing_scored": float64(ix.passedSum), "filter_rows": float64(ix.filterRows)}
+	return map[string]float64{"visited": float64(ix.visitedSum.Load()), "passing_scored": float64(ix.passedSum.Load()), "filter_rows": float64(ix.filterRows.Load())}
 }
 
 // filterMask returns the mask for params["filter"], or nil for no filter.
@@ -856,25 +984,23 @@ func filterMask(params map[string]any) []bool {
 	return m
 }
 
-// passCount returns the number of rows among the first n that pass mask
-// (n for no mask). It is computed once per mask and cached on the index, so
-// the timed search does not scan the mask.
+// passCount returns the number of rows among the first Len() that pass mask
+// (Len() for no mask). It is computed once per mask and cached on the index,
+// so the timed search does not scan the mask. With a mask, the count is of
+// the rows present at the first search with it.
 func (ix *Index) passCount(mask []bool) int64 {
 	if mask == nil {
-		return int64(ix.n)
+		return int64(ix.Len())
 	}
-	if ix.passCache == nil {
-		ix.passCache = map[*bool]int64{}
-	}
-	if c, ok := ix.passCache[&mask[0]]; ok {
-		return c
+	if c, ok := ix.passCache.Load(&mask[0]); ok {
+		return c.(int64)
 	}
 	var c int64
-	for _, b := range mask[:ix.n] {
+	for _, b := range mask[:ix.Len()] {
 		if b {
 			c++
 		}
 	}
-	ix.passCache[&mask[0]] = c
+	ix.passCache.Store(&mask[0], c)
 	return c
 }

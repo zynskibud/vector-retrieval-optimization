@@ -121,7 +121,7 @@ func TestSlotLimits(t *testing.T) {
 		}
 	}
 	// Every edge on layer l points to a node that exists on layer l.
-	for i := 0; i < ix.n; i++ {
+	for i := 0; i < ix.Len(); i++ {
 		for l := 0; l <= int(ix.levels[i]); l++ {
 			sl, c := ix.slots(int32(i), l)
 			for _, e := range sl[:*c] {
@@ -135,9 +135,9 @@ func TestSlotLimits(t *testing.T) {
 
 // reachable0 counts the nodes reachable from the entry point on layer 0 by BFS.
 func reachable0(ix *Index) int {
-	seen := make([]bool, ix.n)
-	queue := []int32{ix.entry}
-	seen[ix.entry] = true
+	seen := make([]bool, ix.Len())
+	queue := []int32{ix.Entry()}
+	seen[ix.Entry()] = true
 	count := 1
 	for len(queue) > 0 {
 		v := queue[0]
@@ -238,8 +238,8 @@ func TestDistanceCount(t *testing.T) {
 		before := ix.DistanceComputations()
 		ids, scores := Search(ix, d.qs[i*d.dim:(i+1)*d.dim], 10, map[string]any{"ef": int64(64)})
 		got := ix.DistanceComputations() - before
-		if got <= 0 || got >= int64(ix.n) {
-			t.Fatalf("query %d: %d distance computations, want in (0, %d)", i, got, ix.n)
+		if got <= 0 || got >= int64(ix.Len()) {
+			t.Fatalf("query %d: %d distance computations, want in (0, %d)", i, got, ix.Len())
 		}
 		for j := 1; j < len(ids); j++ {
 			if scores[j] > scores[j-1] || (scores[j] == scores[j-1] && ids[j] < ids[j-1]) {
@@ -261,7 +261,7 @@ func TestSequentialDeterministic(t *testing.T) {
 	}
 	b, _ := Build(v, n, d.dim, nil, 1, 42)
 	if !slices.Equal(a.links0, b.links0) || !slices.Equal(a.cnt0, b.cnt0) ||
-		!slices.Equal(a.linksUpper, b.linksUpper) || a.entry != b.entry {
+		!slices.Equal(a.linksUpper, b.linksUpper) || a.Entry() != b.Entry() {
 		t.Fatal("threads=1 builds differ")
 	}
 	// The entry is the highest level, ties to the lowest row.
@@ -271,8 +271,8 @@ func TestSequentialDeterministic(t *testing.T) {
 			best = i
 		}
 	}
-	if int(a.entry) != best {
-		t.Errorf("entry %d, want %d", a.entry, best)
+	if int(a.Entry()) != best {
+		t.Errorf("entry %d, want %d", a.Entry(), best)
 	}
 	tiny, _ := Build(v[:3*d.dim], 3, d.dim, nil, 1, 42)
 	ids, scores := Search(tiny, d.qs[:d.dim], 10, nil)

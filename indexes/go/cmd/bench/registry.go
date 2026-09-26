@@ -24,6 +24,10 @@ type instance struct {
 	idx    built
 	search func(q []float32, k int, p map[string]any) ([]int64, []float32)
 	bytes  int64
+	// Load runs only (section 12), set by loadIndexes; nil otherwise.
+	insert func(ids []int64, vecs []float32) error
+	repair func()
+	rows   func() int // rows in the index now
 }
 
 // buildFunc runs the package Build and wraps the result.

@@ -19,8 +19,20 @@ func benchmark(o options, spec indexSpec, vectors []float32, n, dim int, queries
 	buildParams map[string]any, searchSets []map[string]any) (*result, error) {
 	diskann.OutPath = o.out
 	flat.DataDir, ivf.DataDir, hnsw.DataDir = o.data, o.data, o.data
-	fmt.Fprintf(os.Stderr, "bench: building %s on %d rows\n", o.index, n)
-	inst, err := spec.build(vectors, n, dim, buildParams, o.threads, o.seed)
+	// With inserts, the build takes the first 90% of the rows (section 12.2).
+	nBuild := n
+	if o.insertRate > 0 {
+		nBuild = n * 9 / 10
+	}
+	fmt.Fprintf(os.Stderr, "bench: building %s on %d rows\n", o.index, nBuild)
+	var inst instance
+	var err error
+	if bc, ok := loadIndexes[o.index]; ok && o.loadMode() {
+		inst, err = bc(vectors, nBuild, n, dim, buildParams, o.threads, o.seed)
+	} else {
+		inst, err = spec.build(vectors, n, dim, buildParams, o.threads, o.seed)
+		inst.rows = func() int { return n }
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -38,11 +50,49 @@ func benchmark(o options, spec indexSpec, vectors []float32, n, dim int, queries
 		Machine: machineInfo(),
 	}
 	warmup(inst, queries, dim, min(o.warmup, q), o.k, searchSets[0])
-	for _, sp := range searchSets {
-		fmt.Fprintf(os.Stderr, "bench: searching %v\n", sp)
-		res.Searches = append(res.Searches, timedRun(inst, queries, dim, q, o.k, sp))
+	if !o.loadMode() {
+		for _, sp := range searchSets {
+			fmt.Fprintf(os.Stderr, "bench: searching %v\n", sp)
+			res.Searches = append(res.Searches, timedRun(inst, queries, dim, q, o.k, sp))
+		}
+		res.Extra = inst.idx.Extra()
+		return res, nil
 	}
-	res.Extra = inst.idx.Extra()
+	var ins *inserter
+	if o.insertRate > 0 {
+		ins = &inserter{inst: inst, vectors: vectors, dim: dim, next: nBuild, end: n, rate: o.insertRate}
+	}
+	for _, sp := range searchSets {
+		fmt.Fprintf(os.Stderr, "bench: load run %v, %d clients, %.1f s\n", sp, o.clients, o.duration)
+		res.Searches = append(res.Searches, loadRun(inst, queries, dim, q, o.k, sp, o.clients, o.duration, ins))
+	}
+	res.Extra = map[string]any{}
+	if ins != nil {
+		// Repair once after the inserter finished, then one one-thread pass
+		// with the first search setting as searches[-1].
+		inst.repair()
+		sp := make(map[string]any, len(searchSets[0])+1)
+		for key, v := range searchSets[0] {
+			sp[key] = v
+		}
+		sp["phase"] = "after_inserts"
+		fmt.Fprintf(os.Stderr, "bench: searching %v\n", sp)
+		after := timedRun(inst, queries, dim, q, o.k, sp)
+		inserted := ins.next - nBuild
+		after.Extra["inserted_rows"] = inserted
+		after.Extra["insert_p50_ms"] = median(ins.batchMS)
+		after.Extra["insert_errors"] = ins.errors
+		res.Searches = append(res.Searches, after)
+		res.Extra["inserted_rows"] = inserted
+		res.Extra["insert_p50_ms"] = median(ins.batchMS)
+		res.Extra["insert_rate"] = o.insertRate
+		res.Extra["build_rows"] = nBuild
+	}
+	for key, v := range inst.idx.Extra() {
+		res.Extra[key] = v
+	}
+	res.Extra["clients"] = o.clients
+	res.Extra["duration_s"] = o.duration
 	return res, nil
 }
 
