@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"vro/indexes/go/distance"
+	"vro/indexes/go/npy"
 	"vro/indexes/go/splitmix"
 )
 
@@ -38,12 +39,20 @@ import (
 var BuildDefaults = map[string]any{"m": int64(16), "ef_construct": int64(100)}
 
 // SearchDefaults lists every search parameter with its default.
-var SearchDefaults = map[string]any{"ef": int64(64)}
+// filter names a mask filter_<name>.npy in DataDir (section 11); "none" = no filter.
+var SearchDefaults = map[string]any{"ef": int64(64), "filter": "none"}
+
+// DataDir is the data directory that holds filter_<name>.npy. bench sets it.
+var DataDir string
 
 // Index is the HNSW index.
 type Index struct {
 	trainS, addS float64
 	dists        int64
+	filterRows   int64           // corpus rows passing the filter, summed over searches
+	passCache    map[*bool]int64 // pass count per mask
+	visitedSum   int64           // layer-0 nodes expanded by Search, summed over searches
+	passedSum    int64           // layer-0 nodes scored by Search that passed the filter
 
 	vectors []float32
 	n, dim  int
@@ -186,6 +195,8 @@ type scratch struct {
 	sel     []item
 	pool    []item
 	dists   int64
+	expand  int64 // nodes expanded (popped and their neighbors read)
+	passed  int64 // scored nodes that passed the filter (filtered search only)
 }
 
 func newScratch(n int) *scratch {
@@ -269,6 +280,7 @@ func (ix *Index) searchLayer(q []float32, ep item, ef, l int, s *scratch, locked
 		if len(s.res.a) >= ef && better(s.res.a[0], c) {
 			break
 		}
+		s.expand++
 		s.nbuf = ix.neighbors(c.id, l, s.nbuf, locked)
 		for _, e := range s.nbuf {
 			if s.visited[e] == s.gen {
@@ -283,6 +295,52 @@ func (ix *Index) searchLayer(q []float32, ep item, ef, l int, s *scratch, locked
 				s.res.push(it)
 				if len(s.res.a) > ef {
 					s.res.pop()
+				}
+			}
+		}
+	}
+}
+
+// searchLayerFiltered is searchLayer on layer 0 with a filter mask
+// (CONTRACT.md section 11.3, the hnswlib / FAISS IDSelector behavior). A node
+// enters the result heap only if it passes the mask. Every visited node that
+// would have entered the result heap without the filter still enters the
+// candidate heap and is expanded, so the walk crosses failing regions. The
+// stop rule is unchanged: stop when the best candidate is worse than the worst
+// result and the result heap holds ef items. Used only by Search, never by
+// the build.
+func (ix *Index) searchLayerFiltered(q []float32, ep item, ef int, s *scratch, mask []bool) {
+	s.nextGen()
+	s.cand.a, s.res.a = s.cand.a[:0], s.res.a[:0]
+	s.visited[ep.id] = s.gen
+	s.cand.push(ep)
+	if mask[ep.id] {
+		s.res.push(ep)
+		s.passed++
+	}
+	for len(s.cand.a) > 0 {
+		c := s.cand.pop()
+		if len(s.res.a) >= ef && better(s.res.a[0], c) {
+			break
+		}
+		s.expand++
+		s.nbuf = ix.neighbors(c.id, 0, s.nbuf, false)
+		for _, e := range s.nbuf {
+			if s.visited[e] == s.gen {
+				continue
+			}
+			s.visited[e] = s.gen
+			sc := distance.Dot(q, ix.vec(e))
+			s.dists++
+			it := item{sc, e}
+			if len(s.res.a) < ef || better(it, s.res.a[0]) {
+				s.cand.push(it)
+				if mask[e] {
+					s.passed++
+					s.res.push(it)
+					if len(s.res.a) > ef {
+						s.res.pop()
+					}
 				}
 			}
 		}
@@ -700,13 +758,24 @@ func Search(ix *Index, query []float32, k int, params map[string]any) ([]int64, 
 	ef, _ := intParam(params, "ef", 64)
 	ef = max(ef, k)
 	s := ix.sc
-	s.dists = 0
+	s.dists, s.expand, s.passed = 0, 0, 0
 	cur := item{distance.Dot(query, ix.vec(ix.entry)), ix.entry}
 	s.dists++
+	// The upper-layer descent ignores the filter (section 11.3).
 	for l := ix.top; l >= 1; l-- {
 		cur = ix.greedy(query, cur, l, s, false)
 	}
-	ix.searchLayer(query, cur, ef, 0, s, false)
+	mask := filterMask(params)
+	ix.filterRows += ix.passCount(mask)
+	if mask != nil {
+		ix.searchLayerFiltered(query, cur, ef, s, mask)
+	} else {
+		d0 := s.dists
+		ix.searchLayer(query, cur, ef, 0, s, false)
+		s.passed = s.dists - d0 + 1 // every layer-0 node scored passes (entry included)
+	}
+	ix.visitedSum += s.expand
+	ix.passedSum += s.passed
 	res := append(s.pool[:0], s.res.a...)
 	s.pool = res
 	sort.Slice(res, func(a, b int) bool { return better(res[a], res[b]) })
@@ -769,6 +838,43 @@ func (ix *Index) Extra() map[string]any {
 	}
 }
 
-// SearchCounters returns cumulative per-search counters. HNSW has none beyond
-// distance computations.
-func (ix *Index) SearchCounters() map[string]float64 { return map[string]float64{} }
+// SearchCounters returns cumulative per-search counters: visited = layer-0
+// nodes expanded, filter_rows = corpus rows that pass the filter (n for
+// none), passing_scored = layer-0 nodes scored that passed the filter.
+func (ix *Index) SearchCounters() map[string]float64 {
+	return map[string]float64{"visited": float64(ix.visitedSum), "passing_scored": float64(ix.passedSum), "filter_rows": float64(ix.filterRows)}
+}
+
+// filterMask returns the mask for params["filter"], or nil for no filter.
+// bench loads every mask before the build, so an error here is a program bug.
+func filterMask(params map[string]any) []bool {
+	name, _ := params["filter"].(string)
+	m, err := npy.FilterMask(DataDir, name)
+	if err != nil {
+		panic(err)
+	}
+	return m
+}
+
+// passCount returns the number of rows among the first n that pass mask
+// (n for no mask). It is computed once per mask and cached on the index, so
+// the timed search does not scan the mask.
+func (ix *Index) passCount(mask []bool) int64 {
+	if mask == nil {
+		return int64(ix.n)
+	}
+	if ix.passCache == nil {
+		ix.passCache = map[*bool]int64{}
+	}
+	if c, ok := ix.passCache[&mask[0]]; ok {
+		return c
+	}
+	var c int64
+	for _, b := range mask[:ix.n] {
+		if b {
+			c++
+		}
+	}
+	ix.passCache[&mask[0]] = c
+	return c
+}

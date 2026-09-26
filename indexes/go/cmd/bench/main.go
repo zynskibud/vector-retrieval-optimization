@@ -107,6 +107,18 @@ func run(args []string) error {
 		return fmt.Errorf("queries have dim %d, corpus has dim %d", qdim, dim)
 	}
 	fillDerived(o.index, buildParams, n)
+	// Read every filter mask before the build (section 11), so a missing or
+	// short mask file fails fast (exit 1) and Search never reads a file.
+	for _, sp := range searchSets {
+		name, _ := sp["filter"].(string)
+		mask, err := npy.FilterMask(o.data, name)
+		if err != nil {
+			return err
+		}
+		if mask != nil && len(mask) < n {
+			return fmt.Errorf("filter %s has %d rows, corpus has %d", name, len(mask), n)
+		}
+	}
 
 	res, err := benchmark(o, spec, vectors, n, dim, queries, q, buildParams, searchSets)
 	if err != nil {

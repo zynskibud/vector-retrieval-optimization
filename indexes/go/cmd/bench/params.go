@@ -62,7 +62,8 @@ func resolveParams(defaults map[string]any, items []string, phase string) (map[s
 
 // checkEnums rejects string values outside the sets of section 6.
 func checkEnums(p map[string]any) error {
-	allowed := map[string][]string{"metric": {"ip", "l2"}, "io": {"mmap", "nocache"}}
+	allowed := map[string][]string{"metric": {"ip", "l2"}, "io": {"mmap", "nocache"},
+		"filter": {"none", "top50", "top10", "top1", "top01"}}
 	for key, vals := range allowed {
 		v, ok := p[key].(string)
 		if !ok {

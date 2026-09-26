@@ -36,3 +36,11 @@ The report prints the spread of the repeat runs (`p50_spread`, min-max of each r
 **Cause.** NumPy on macOS arm64 uses Apple Accelerate, which runs matrix products on the AMX unit and on several threads.
 
 **Fix.** `indexes/python/bench.py` sets the BLAS thread variables to 1 before NumPy loads. Python flat is now 4.9 ms. The report must say that Python's flat speed comes from Accelerate, not from Python.
+
+## 4. Corpus rows are ordered by page views (open, affects prefix subsets)
+
+**Observed.** In `data/processed/dev`, all 10,002 rows that pass `top10` and all 101 that pass `top01` sit inside the first 20,000 rows. The Hugging Face shards are ordered by `views` descending, and the dev sample keeps the corpus order.
+
+**Effect.** Any test or run that uses `--limit N` sees a prefix of the most-viewed rows: a filter named `top10` keeps 50% of a 20,000-row prefix, not 10%. The full dev set and the full corpus are not affected, because their masks and truth are computed over all rows. Filtered recall numbers from a prefix are still correct against the truth the test computes, but their selectivity labels are not the contract's.
+
+**Options.** Shuffle the corpus once in `tools/data/prepare.py` with the fixed seed (changes every row ID, so every ground-truth file and every stored result must be regenerated), or keep the order and never quote filtered numbers from a prefix. Decision: keep the order for now; the sweeps use full sets. Revisit before the write-up.

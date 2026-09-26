@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -86,5 +87,64 @@ func TestScoreNull(t *testing.T) {
 	b, _ := json.Marshal([]score{0.5, score(math.Inf(-1))})
 	if string(b) != "[0.5,null]" {
 		t.Fatalf("got %s", b)
+	}
+}
+
+// TestMain lets a test run this binary as a subprocess: with BENCH_SUBPROCESS=1
+// the test binary behaves as bench.
+func TestMain(m *testing.M) {
+	if os.Getenv("BENCH_SUBPROCESS") == "1" {
+		main()
+		return
+	}
+	os.Exit(m.Run())
+}
+
+// TestHNSWFilterJSON runs bench as a subprocess with three filters and checks
+// search_params.filter and extra.filter_rows / extra.visited (section 11.2).
+func TestHNSWFilterJSON(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "hnsw.json")
+	data := filepath.Join(repoRoot(), "data", "processed", "dev")
+	cmd := exec.Command(os.Args[0], "--index", "hnsw", "--data", data, "--out", out, "--limit", "20000",
+		"--warmup", "10", "--search", "filter=none", "--search", "filter=top10", "--search", "filter=top01")
+	cmd.Env = append(os.Environ(), "BENCH_SUBPROCESS=1")
+	if b, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("bench failed: %v\n%s", err, b)
+	}
+	raw, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Searches []struct {
+			SearchParams map[string]any     `json:"search_params"`
+			Extra        map[string]float64 `json:"extra"`
+		} `json:"searches"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"none", "top10", "top01"}
+	if len(doc.Searches) != len(want) {
+		t.Fatalf("%d searches, want %d", len(doc.Searches), len(want))
+	}
+	for i, s := range doc.Searches {
+		if s.SearchParams["filter"] != want[i] {
+			t.Errorf("search %d: filter %v, want %s", i, s.SearchParams["filter"], want[i])
+		}
+		if _, ok := s.Extra["filter_rows"]; !ok {
+			t.Errorf("search %d: no extra.filter_rows", i)
+		}
+		if s.Extra["visited"] <= 0 {
+			t.Errorf("search %d: extra.visited = %v", i, s.Extra["visited"])
+		}
+		t.Logf("filter=%s extra=%v", want[i], s.Extra)
+	}
+}
+
+func TestBadFilterIsUsageError(t *testing.T) {
+	_, err := resolveParams(map[string]any{"filter": "none"}, []string{"filter=top5"}, "search")
+	if _, ok := err.(usageError); !ok {
+		t.Fatalf("err = %v, want usageError", err)
 	}
 }

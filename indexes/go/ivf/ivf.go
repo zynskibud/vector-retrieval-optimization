@@ -19,6 +19,7 @@ import (
 
 	"vro/indexes/go/distance"
 	"vro/indexes/go/kmeans"
+	"vro/indexes/go/npy"
 )
 
 // BuildDefaults lists every build parameter with its default.
@@ -27,7 +28,11 @@ var BuildDefaults = map[string]any{"nlist": int64(1024), "train_size": int64(-1)
 
 // SearchDefaults lists every search parameter with its default. Values are
 // int64 because bench parses command-line values to the type of the default.
-var SearchDefaults = map[string]any{"nprobe": int64(8)}
+// filter names a mask filter_<name>.npy in DataDir (section 11); "none" = no filter.
+var SearchDefaults = map[string]any{"nprobe": int64(8), "filter": "none"}
+
+// DataDir is the data directory that holds filter_<name>.npy. bench sets it.
+var DataDir string
 
 // Index is the IVF index.
 type Index struct {
@@ -40,6 +45,9 @@ type Index struct {
 
 	trainS, addS float64
 	dists        int64
+	filterRows   int64           // corpus rows passing the filter, summed over searches
+	passCache    map[*bool]int64 // pass count per mask
+	passed       int64           // scanned rows that passed the filter, summed over searches
 
 	topk   *distance.TopK // result selector, reused across queries
 	probeK *distance.TopK // center selector, reused across queries
@@ -172,18 +180,24 @@ func Search(ix *Index, query []float32, k int, params map[string]any) ([]int64, 
 
 	tk := ix.topk
 	tk.Reset()
-	scanned := 0
+	mask := filterMask(params)
+	scanned := 0 // rows scored
 	for _, c := range lists {
 		if c < 0 {
 			continue
 		}
 		for _, id := range ix.ids[ix.offsets[c]:ix.offsets[c+1]] {
 			row := int(id)
+			if mask != nil && !mask[row] {
+				continue // fails the filter: not scored (section 11.3)
+			}
 			tk.Push(int64(id), distance.Dot(query, ix.vectors[row*d:(row+1)*d]))
+			scanned++
 		}
-		scanned += int(ix.offsets[c+1] - ix.offsets[c])
 	}
 	ix.dists += int64(ix.nlist + scanned)
+	ix.passed += int64(scanned)
+	ix.filterRows += ix.passCount(mask)
 	return tk.Results()
 }
 
@@ -222,5 +236,43 @@ func (ix *Index) Extra() map[string]any {
 	}
 }
 
-// SearchCounters returns cumulative per-search counters. IVF has none.
-func (ix *Index) SearchCounters() map[string]float64 { return map[string]float64{} }
+// SearchCounters returns cumulative per-search counters. filter_rows is the
+// number of corpus rows that pass the filter (n for none). passing_scored is
+// the number of rows in the probed lists that passed and were scored.
+func (ix *Index) SearchCounters() map[string]float64 {
+	return map[string]float64{"passing_scored": float64(ix.passed), "filter_rows": float64(ix.filterRows)}
+}
+
+// filterMask returns the mask for params["filter"], or nil for no filter.
+// bench loads every mask before the build, so an error here is a program bug.
+func filterMask(params map[string]any) []bool {
+	name, _ := params["filter"].(string)
+	m, err := npy.FilterMask(DataDir, name)
+	if err != nil {
+		panic(err)
+	}
+	return m
+}
+
+// passCount returns the number of rows among the first n that pass mask
+// (n for no mask). It is computed once per mask and cached on the index, so
+// the timed search does not scan the mask.
+func (ix *Index) passCount(mask []bool) int64 {
+	if mask == nil {
+		return int64(ix.n)
+	}
+	if ix.passCache == nil {
+		ix.passCache = map[*bool]int64{}
+	}
+	if c, ok := ix.passCache[&mask[0]]; ok {
+		return c
+	}
+	var c int64
+	for _, b := range mask[:ix.n] {
+		if b {
+			c++
+		}
+	}
+	ix.passCache[&mask[0]] = c
+	return c
+}

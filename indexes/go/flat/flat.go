@@ -7,13 +7,18 @@ import (
 	"time"
 
 	"vro/indexes/go/distance"
+	"vro/indexes/go/npy"
 )
 
 // BuildDefaults lists every build parameter with its default. Flat has none.
 var BuildDefaults = map[string]any{}
 
-// SearchDefaults lists every search parameter with its default. Flat has none.
-var SearchDefaults = map[string]any{}
+// SearchDefaults lists every search parameter with its default. filter names
+// a mask filter_<name>.npy in DataDir (CONTRACT.md section 11); "none" = no filter.
+var SearchDefaults = map[string]any{"filter": "none"}
+
+// DataDir is the data directory that holds filter_<name>.npy. bench sets it.
+var DataDir string
 
 // Index holds a reference to the corpus. It copies nothing.
 type Index struct {
@@ -22,6 +27,7 @@ type Index struct {
 	trainS  float64
 	addS    float64
 	dists   int64
+	passed  int64 // rows that passed the filter, summed over searches
 	topk    *distance.TopK
 }
 
@@ -41,10 +47,26 @@ func Search(ix *Index, query []float32, k int, params map[string]any) ([]int64, 
 	tk := ix.topk
 	tk.Reset()
 	d := ix.dim
-	for i := 0; i < ix.n; i++ {
-		tk.Push(int64(i), distance.Dot(query, ix.vectors[i*d:(i+1)*d]))
+	mask := filterMask(params)
+	if mask == nil {
+		for i := 0; i < ix.n; i++ {
+			tk.Push(int64(i), distance.Dot(query, ix.vectors[i*d:(i+1)*d]))
+		}
+		ix.dists += int64(ix.n)
+		ix.passed += int64(ix.n)
+		return tk.Results()
 	}
-	ix.dists += int64(ix.n)
+	// Filtered: iterate all rows and skip the rows that fail (section 11.3).
+	scored := 0
+	for i := 0; i < ix.n; i++ {
+		if !mask[i] {
+			continue
+		}
+		tk.Push(int64(i), distance.Dot(query, ix.vectors[i*d:(i+1)*d]))
+		scored++
+	}
+	ix.dists += int64(scored)
+	ix.passed += int64(scored)
 	return tk.Results()
 }
 
@@ -63,6 +85,20 @@ func (ix *Index) DistanceComputations() int64 { return ix.dists }
 // Extra returns index-specific build-time output keys (top-level "extra").
 func (ix *Index) Extra() map[string]any { return map[string]any{} }
 
-// SearchCounters returns cumulative per-search counters, for example
-// disk_reads. bench reports the mean per query in each search run's "extra".
-func (ix *Index) SearchCounters() map[string]float64 { return map[string]float64{} }
+// SearchCounters returns cumulative per-search counters. filter_rows is the
+// number of rows that passed the filter (all rows for filter=none).
+// bench reports the mean per query in each search run's "extra".
+func (ix *Index) SearchCounters() map[string]float64 {
+	return map[string]float64{"filter_rows": float64(ix.passed)}
+}
+
+// filterMask returns the mask for params["filter"], or nil for no filter.
+// bench loads every mask before the build, so an error here is a program bug.
+func filterMask(params map[string]any) []bool {
+	name, _ := params["filter"].(string)
+	m, err := npy.FilterMask(DataDir, name)
+	if err != nil {
+		panic(err)
+	}
+	return m
+}

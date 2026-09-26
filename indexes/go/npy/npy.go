@@ -7,8 +7,10 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"unsafe"
 )
 
@@ -21,7 +23,7 @@ type header struct {
 
 // ReadFloat32 reads a 2-D '<f4' array. It returns the row-major data and its shape.
 func ReadFloat32(path string) (data []float32, rows, dim int, err error) {
-	raw, h, off, err := load(path, "<f4")
+	raw, h, off, err := load(path, "<f4", 2)
 	if err != nil {
 		return nil, 0, 0, err
 	}
@@ -42,7 +44,7 @@ func ReadFloat32(path string) (data []float32, rows, dim int, err error) {
 
 // ReadInt64 reads a 2-D '<i8' array. It returns the row-major data and its shape.
 func ReadInt64(path string) (data []int64, rows, cols int, err error) {
-	raw, h, off, err := load(path, "<i8")
+	raw, h, off, err := load(path, "<i8", 2)
 	if err != nil {
 		return nil, 0, 0, err
 	}
@@ -59,9 +61,68 @@ func ReadInt64(path string) (data []int64, rows, cols int, err error) {
 	return data, rows, cols, nil
 }
 
+// ReadBool reads a 1-D '|b1' array (NumPy bool: one byte per element, 0 or 1).
+func ReadBool(path string) ([]bool, error) {
+	raw, h, off, err := load(path, "|b1", 1)
+	if err != nil {
+		return nil, err
+	}
+	n := h.shape[0]
+	body := raw[off:]
+	if len(body) != n {
+		return nil, fmt.Errorf("npy %s: data is %d bytes, shape needs %d", path, len(body), n)
+	}
+	out := make([]bool, n)
+	for i, b := range body {
+		switch b {
+		case 0:
+		case 1:
+			out[i] = true
+		default:
+			return nil, fmt.Errorf("npy %s: byte %d at row %d is not a bool", path, b, i)
+		}
+	}
+	return out, nil
+}
+
+var (
+	maskMu    sync.Mutex
+	maskCache = map[string][]bool{}
+)
+
+// FilterNames are the filter names of CONTRACT.md section 11.1, plus "none".
+var FilterNames = []string{"none", "top50", "top10", "top1", "top01"}
+
+// FilterMask returns the mask filter_<name>.npy in dir, read once and cached.
+// Name "none" returns nil (no filter). An unknown name is an error.
+func FilterMask(dir, name string) ([]bool, error) {
+	if name == "" || name == "none" {
+		return nil, nil
+	}
+	known := false
+	for _, f := range FilterNames {
+		known = known || f == name
+	}
+	if !known {
+		return nil, fmt.Errorf("unknown filter %q, want one of %v", name, FilterNames)
+	}
+	path := filepath.Join(dir, "filter_"+name+".npy")
+	maskMu.Lock()
+	defer maskMu.Unlock()
+	if m, ok := maskCache[path]; ok {
+		return m, nil
+	}
+	m, err := ReadBool(path)
+	if err != nil {
+		return nil, err
+	}
+	maskCache[path] = m
+	return m, nil
+}
+
 // load reads the file, checks the magic, version and header, and returns the
 // raw bytes plus the data offset.
-func load(path, wantDescr string) ([]byte, header, int, error) {
+func load(path, wantDescr string, wantDims int) ([]byte, header, int, error) {
 	if !hostLittleEndian() {
 		return nil, header{}, 0, fmt.Errorf("npy: big-endian hosts are not supported")
 	}
@@ -90,8 +151,8 @@ func load(path, wantDescr string) ([]byte, header, int, error) {
 	if h.fortran {
 		return nil, header{}, 0, fmt.Errorf("npy %s: fortran_order is True, want False", path)
 	}
-	if len(h.shape) != 2 {
-		return nil, header{}, 0, fmt.Errorf("npy %s: shape %v, want 2 dimensions", path, h.shape)
+	if len(h.shape) != wantDims {
+		return nil, header{}, 0, fmt.Errorf("npy %s: shape %v, want %d dimensions", path, h.shape, wantDims)
 	}
 	return raw, h, off, nil
 }

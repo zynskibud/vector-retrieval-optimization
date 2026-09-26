@@ -10,11 +10,15 @@ import (
 	"time"
 
 	"vro/indexes/go/diskann"
+	"vro/indexes/go/flat"
+	"vro/indexes/go/hnsw"
+	"vro/indexes/go/ivf"
 )
 
 func benchmark(o options, spec indexSpec, vectors []float32, n, dim int, queries []float32, q int,
 	buildParams map[string]any, searchSets []map[string]any) (*result, error) {
 	diskann.OutPath = o.out
+	flat.DataDir, ivf.DataDir, hnsw.DataDir = o.data, o.data, o.data
 	fmt.Fprintf(os.Stderr, "bench: building %s on %d rows\n", o.index, n)
 	inst, err := spec.build(vectors, n, dim, buildParams, o.threads, o.seed)
 	if err != nil {
