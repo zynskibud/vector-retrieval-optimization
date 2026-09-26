@@ -31,6 +31,11 @@ class Client(Protocol):
         ...                                      # create the index, wait until it is built; returns seconds
     def search(self, query: np.ndarray, k: int, params: dict) -> tuple[list[int], list[float]]:
         ...                                      # one query; IDs best first, padded with -1; scores as the DB reports them (see Scores)
+    # Phase 4 (CONTRACT section 12.3, tools/load/bench.py):
+    def attach(self, index: str) -> None: ...    # a new connection to an index another connection built: set the search state only
+    def insert(self, vectors: np.ndarray, meta_rows: pa.Table, ids: list[int]) -> float:
+        ...                                      # add rows to the built index (ID = row index); returns seconds
+    def finish_inserts(self) -> None: ...        # make every inserted row searchable before the after-inserts pass
     def stats(self) -> dict: ...                 # server-side numbers: row count, index size or segment info, server version, disk bytes if reported
     def close(self) -> None: ...
 ```
@@ -81,6 +86,18 @@ Qdrant extras (Phase 1's "scalar, product, binary quantization"): run `hnsw` wit
 - `server_build_s`: from the index-create call until the server reports the index ready (Qdrant: collection status green; pgvector: `CREATE INDEX` returns; Milvus: `index_building_progress` at 100% and the collection loaded).
 - Ties and padding: as CONTRACT section 6 (lower ID first where the client can enforce it; pad with -1 / null).
 
+## Load runs (Phase 4, CONTRACT section 12)
+
+`python -m tools.load.bench` takes the `tools.db.bench` flags plus `--clients C` (default 1), `--duration S` (default 20), and `--insert-rate R` (default 0). Each of the C worker threads opens its own connection (`get_client`, `connect`, `attach`). The protocol and the JSON keys are in the module docstring and CONTRACT section 12. `make load-db ARGS="--data data/processed/dev --languages <db>"` runs the runner's load sweep for one database.
+
+Inserts during searches (`--insert-rate`), one batch of 100 rows per `insert` call:
+
+- Qdrant: `upsert(wait=True)`. The rows are searchable when the call returns; the optimizer indexes them later, and Qdrant scans unindexed segments exactly until then. `finish_inserts` does nothing.
+- pgvector: one binary `COPY` per batch, in one transaction. Postgres adds each row to the HNSW or IVFFlat index inside the `COPY`, so the rows are searchable at commit. `finish_inserts` does nothing.
+- Milvus: `insert` without a flush. The rows go to a growing segment, which Milvus searches by brute force. With the default `Bounded` consistency, a search can miss rows inserted in the last moments: in a test, 88 of 100 rows were found as their own top-1 right after the insert, and 100 of 100 with `consistency_level="Strong"`, without a flush. `finish_inserts` flushes once and sets `Strong` consistency for the after-inserts pass.
+
+If the database inserts slower than R, the inserter continues after the loop until every row is in. `extra.inserted_during_loop` counts the rows added inside the loop.
+
 ## Tests (`tests/test_<db>.py`)
 
 Run with the database up, against `data/processed/dev` with `--limit 20000` and brute-force truth computed in the test:
@@ -89,5 +106,6 @@ Run with the database up, against `data/processed/dev` with `--limit 20000` and 
 2. For each supported index at default params: recall@10 ≥ the CONTRACT section 9 floor (hnsw ≥ 0.95 at ef=64; ivf ≥ 0.75 at nprobe=8; ivf_pq ≥ 0.45; diskann ≥ 0.90; flat = 1.0).
 3. A `bench` subprocess run produces JSON that passes `tools.bench.schema.validate`.
 4. The test leaves the collection dropped (`reset` at the end).
+5. `test_load` (Phase 4, `tests/load.py`): hnsw ef=64, `--clients 8 --duration 5`: zero errors, qps > 0, first-pass recall >= 0.95. Then `--clients 4 --duration 10 --insert-rate 2000` (build on 18,000): zero errors, `inserted_rows` = 2,000, after-inserts recall within 0.01 of a static 20,000-row build (both computed in the test). Run: `pytest tools/db/tests/test_<db>.py -k test_load`.
 
 The test must finish in under 10 minutes. After the tests, stop the database (`make db-down`).

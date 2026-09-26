@@ -130,6 +130,22 @@ class QdrantDB:
         self._wait_green(require_indexed=(index == "hnsw"))
         return time.perf_counter() - t0
 
+    def attach(self, index: str) -> None:
+        self.index = index
+
+    def insert(self, vectors: np.ndarray, meta_rows: pa.Table, ids: list[int]) -> float:
+        """Upsert rows into the built collection (wait=True: the call returns when the rows are
+        searchable; the optimizer indexes them later, and until then Qdrant scans them exactly)."""
+        t0 = time.perf_counter()
+        cols = {c: meta_rows.column(c).to_pylist() for c in base.META_COLUMNS}
+        payload = [{c: cols[c][i] for c in base.META_COLUMNS} for i in range(len(ids))]
+        self.client.upsert(COLLECTION, points=m.Batch(ids=[int(i) for i in ids], vectors=vectors.tolist(),
+                           payloads=payload), wait=True)
+        return time.perf_counter() - t0
+
+    def finish_inserts(self) -> None:
+        pass  # upsert(wait=True) already made each batch searchable
+
     def search(self, query: np.ndarray, k: int, params: dict) -> tuple[list[int], list[float]]:
         rescore = bool(params.get("rescore") or params.get("rerank"))
         sp = m.SearchParams(

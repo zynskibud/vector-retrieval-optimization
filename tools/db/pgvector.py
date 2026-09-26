@@ -171,6 +171,27 @@ class PgvectorClient:
         self.index_name = name
         return dt + views_s
 
+    def attach(self, index: str) -> None:
+        self.index_name = {"ivf": "items_ivf", "hnsw": "items_hnsw"}.get(index)
+
+    def insert(self, vectors: np.ndarray, meta_rows: pa.Table, ids: list[int]) -> float:
+        """One binary COPY into the indexed table, in one transaction. Postgres updates the
+        vector index row by row inside the COPY, so the rows are searchable at commit."""
+        cols = {c: meta_rows.column(c).to_pylist() for c in base.META_COLUMNS}
+        t0 = time.perf_counter()
+        with self.conn.cursor() as cur, self.conn.transaction():
+            with cur.copy(
+                "COPY items (id, embedding, views, title, wiki_id, paragraph_id, langs) FROM STDIN (FORMAT BINARY)"
+            ) as cp:
+                cp.set_types(["int8", self.vector_oid, "float4", "text", "int8", "int4", "int4"])
+                for j, i in enumerate(ids):
+                    cp.write_row((int(i), Vec(vectors[j]), cols["views"][j], cols["title"][j],
+                                  cols["wiki_id"][j], cols["paragraph_id"][j], cols["langs"][j]))
+        return time.perf_counter() - t0
+
+    def finish_inserts(self) -> None:
+        pass  # each COPY commits; committed rows are visible to every later query
+
     # -- search -----------------------------------------------------------
     def search(self, query: np.ndarray, k: int, params: dict) -> tuple[list[int], list[float]]:
         with self.conn.transaction():

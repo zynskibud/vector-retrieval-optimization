@@ -99,3 +99,16 @@ def test_bench_subprocess(setup):
     assert errors == [], errors
     assert "load_s" in doc["extra"] and "server_build_s" in doc["extra"]
     c.index = None  # the subprocess replaced the collection
+
+
+def test_load():
+    """Phase 4 (CONTRACT section 12.5): 8 clients; then 4 clients with inserts. Leaves the data dropped."""
+    from tools.db.tests import load
+
+    try:
+        load.check("milvus")
+    finally:
+        c = make_client()
+        c.connect()
+        c.reset()
+        c.close()

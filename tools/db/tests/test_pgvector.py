@@ -107,3 +107,16 @@ def test_bench_subprocess(setup, tmp_path):
     assert doc["extra"]["load_s"] > 0
     assert doc["extra"]["server_build_s"] > 0
     assert doc["build"]["index_bytes"] > 0
+
+
+def test_load():
+    """Phase 4 (CONTRACT section 12.5): 8 clients; then 4 clients with inserts. Leaves the data dropped."""
+    from tools.db.tests import load
+
+    try:
+        load.check("pgvector")
+    finally:
+        c = make_client()
+        c.connect()
+        c.reset()
+        c.close()

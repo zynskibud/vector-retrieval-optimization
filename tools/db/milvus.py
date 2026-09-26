@@ -32,6 +32,7 @@ class MilvusDB:
         self.client: MilvusClient | None = None
         self.index = None
         self.data_dir = None
+        self.consistency: str | None = None  # None = the collection default (Bounded)
 
     def connect(self) -> None:
         self.client = MilvusClient(uri=self.uri, timeout=60)
@@ -52,24 +53,29 @@ class MilvusDB:
         schema.add_field("langs", DataType.INT64)
         self.client.create_collection(COLLECTION, schema=schema)
 
+    @staticmethod
+    def _rows(vectors: np.ndarray, cols: dict, ids, offset: int = 0) -> list[dict]:
+        rows = []
+        for j, i in enumerate(ids):
+            c = j + offset
+            rows.append({
+                "id": int(i),
+                "embedding": vectors[j].tolist(),
+                "views": float(cols["views"][c] or 0.0),
+                "title": (cols["title"][c] or "")[:512].encode("utf-8")[:512].decode("utf-8", "ignore"),
+                "wiki_id": int(cols["wiki_id"][c] or 0),
+                "paragraph_id": int(cols["paragraph_id"][c] or 0),
+                "langs": int(cols["langs"][c] or 0),
+            })
+        return rows
+
     def load(self, vectors: np.ndarray, meta: pa.Table, batch: int) -> float:
         t0 = time.perf_counter()
         self._create()
         cols = {c: meta.column(c).to_pylist() for c in base.META_COLUMNS}
         for start in range(0, len(vectors), batch):
             end = min(start + batch, len(vectors))
-            rows = [
-                {
-                    "id": i,
-                    "embedding": vectors[i].tolist(),
-                    "views": float(cols["views"][i] or 0.0),
-                    "title": (cols["title"][i] or "")[:512].encode("utf-8")[:512].decode("utf-8", "ignore"),
-                    "wiki_id": int(cols["wiki_id"][i] or 0),
-                    "paragraph_id": int(cols["paragraph_id"][i] or 0),
-                    "langs": int(cols["langs"][i] or 0),
-                }
-                for i in range(start, end)
-            ]
+            rows = self._rows(vectors[start:end], cols, range(start, end), offset=start)
             self.client.insert(COLLECTION, rows)
         self.client.flush(COLLECTION)
         return time.perf_counter() - t0
@@ -105,6 +111,24 @@ class MilvusDB:
         self.index = index
         return time.perf_counter() - t0
 
+    def attach(self, index: str) -> None:
+        self.index = index
+
+    def insert(self, vectors: np.ndarray, meta_rows: pa.Table, ids: list[int]) -> float:
+        """Insert into the loaded collection. The rows land in a growing segment, which Milvus
+        searches by brute force; with the default Bounded consistency a search can miss rows
+        inserted in the last moments. No flush per batch (a flush seals a segment and is slow)."""
+        cols = {c: meta_rows.column(c).to_pylist() for c in base.META_COLUMNS}
+        t0 = time.perf_counter()
+        self.client.insert(COLLECTION, self._rows(vectors, cols, ids))
+        return time.perf_counter() - t0
+
+    def finish_inserts(self) -> None:
+        """Flush once after the inserter, and search with Strong consistency from now on, so
+        the after-inserts pass sees every inserted row."""
+        self.client.flush(COLLECTION)
+        self.consistency = "Strong"
+
     def search(self, query: np.ndarray, k: int, params: dict) -> tuple[list[int], list[float]]:
         sp: dict = {}
         limit = k
@@ -120,7 +144,8 @@ class MilvusDB:
         t = base.views_min(self.data_dir, str(params.get("filter", "none")))
         expr = "" if t is None else f"views >= {t!r}"
         res = self.client.search(COLLECTION, data=[query.tolist()], anns_field="embedding", limit=limit, filter=expr,
-                                 output_fields=[], search_params={"metric_type": "IP", "params": sp})
+                                 output_fields=[], search_params={"metric_type": "IP", "params": sp},
+                                 **({"consistency_level": self.consistency} if self.consistency else {}))
         hits = res[0]
         ids = [int(h["id"]) for h in hits]
         scores = [float(h["distance"]) for h in hits]

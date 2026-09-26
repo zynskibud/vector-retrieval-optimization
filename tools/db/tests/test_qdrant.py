@@ -94,3 +94,11 @@ def test_bench_subprocess(client, tmp_path):
     assert "load_s" in doc["extra"] and "server_build_s" in doc["extra"]
     client.reset()
     assert not client.client.collection_exists("vro")
+
+
+def test_load(client):
+    """Phase 4 (CONTRACT section 12.5): 8 clients; then 4 clients with inserts. Leaves the collection dropped."""
+    from tools.db.tests import load
+
+    load.check("qdrant")
+    client.reset()
