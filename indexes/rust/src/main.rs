@@ -5,7 +5,8 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::ExitCode;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 /// A failure, with the exit code of CONTRACT section 2.
 enum BenchError {
@@ -28,6 +29,17 @@ struct Args {
     seed: u64,
     warmup: usize,
     limit: Option<usize>,
+    /// Load run (CONTRACT 12.1): worker threads, seconds, insert rows per second.
+    clients: usize,
+    duration: f64,
+    insert_rate: f64,
+}
+
+impl Args {
+    /// True for a load run; false keeps the one-pass, one-thread behavior.
+    fn load_run(&self) -> bool {
+        self.clients != 1 || self.duration > 0.0 || self.insert_rate > 0.0
+    }
 }
 
 fn main() -> ExitCode {
@@ -57,6 +69,9 @@ fn parse_args(argv: &[String]) -> Result<Args, BenchError> {
         seed: 42,
         warmup: 100,
         limit: None,
+        clients: 1,
+        duration: 0.0,
+        insert_rate: 0.0,
     };
     let mut it = argv.iter();
     while let Some(flag) = it.next() {
@@ -76,6 +91,9 @@ fn parse_args(argv: &[String]) -> Result<Args, BenchError> {
             "--seed" => args.seed = parse_num(flag, &value()?)?,
             "--warmup" => args.warmup = parse_num(flag, &value()?)?,
             "--limit" => args.limit = Some(parse_num(flag, &value()?)?),
+            "--clients" => args.clients = parse_num(flag, &value()?)?,
+            "--duration" => args.duration = parse_num(flag, &value()?)?,
+            "--insert-rate" => args.insert_rate = parse_num(flag, &value()?)?,
             other => return Err(Usage(format!("unknown option: {other}"))),
         }
     }
@@ -90,6 +108,21 @@ fn parse_args(argv: &[String]) -> Result<Args, BenchError> {
     }
     if args.threads == 0 {
         return Err(Usage("--threads must be >= 1".into()));
+    }
+    if args.clients == 0 {
+        return Err(Usage("--clients must be >= 1".into()));
+    }
+    if !(args.duration >= 0.0 && args.duration.is_finite()) {
+        return Err(Usage("--duration must be >= 0".into()));
+    }
+    if !(args.insert_rate >= 0.0 && args.insert_rate.is_finite()) {
+        return Err(Usage("--insert-rate must be >= 0".into()));
+    }
+    if args.load_run() && args.index != "hnsw" {
+        return Err(Usage(format!(
+            "--clients, --duration and --insert-rate need --index hnsw (CONTRACT 12); {} is read-only",
+            args.index
+        )));
     }
     Ok(args)
 }
@@ -195,7 +228,10 @@ fn run(args: &Args) -> Result<(), BenchError> {
     let build_defaults = bench::build_defaults(&args.index, n).expect("index name checked");
     let build_params = apply_params(&build_defaults, &build_specs, "build")?;
 
-    let mut index = build_index(args, vectors, &build_params)?;
+    // CONTRACT 12.2: with inserts, the build takes the first 90% of the rows.
+    let build_rows = (args.insert_rate > 0.0).then(|| (n * 9 / 10).max(1));
+    let tail = build_rows.map(|b| vectors.data[b * dim..].to_vec());
+    let mut index = build_index(args, vectors, &build_params, build_rows)?;
     index.set_filter_dir(&args.data);
     let times = index.build_times();
     let build = BuildReport {
@@ -207,10 +243,47 @@ fn run(args: &Args) -> Result<(), BenchError> {
     };
 
     warm_up(index.as_ref(), &queries, args, &search_sets[0])?;
-    let searches = search_sets
-        .into_iter()
-        .map(|p| timed_search(index.as_ref(), &queries, args.k, p))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut top_extra = index.extra();
+    let searches = if args.load_run() {
+        let inserter = build_rows.zip(tail).map(|(first, rows)| Inserter {
+            first,
+            dim,
+            rows,
+            next: AtomicUsize::new(first),
+            batch_ms: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut runs = search_sets
+            .iter()
+            .map(|p| load_search(index.as_ref(), &queries, args, p.clone(), inserter.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(ins) = &inserter {
+            let (a, b) = index.repair().map_err(Runtime)?;
+            let mut params = search_sets[0].clone();
+            params.insert("phase", ParamValue::Str("after_inserts".into()));
+            let mut after = timed_search(index.as_ref(), &queries, args.k, params)?;
+            let inserted = ins.next.load(Ordering::Acquire) - ins.first;
+            let mut batch_ms = ins.batch_ms.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let p50 = median(&mut batch_ms);
+            for (key, v) in [
+                ("inserted_rows", inserted as f64),
+                ("insert_p50_ms", p50),
+                ("insert_batches", batch_ms.len() as f64),
+                ("build_rows", ins.first as f64),
+                ("repair_added_after_inserts", a as f64),
+                ("repair_added_unreachable_after_inserts", b as f64),
+            ] {
+                after.extra.insert(key.into(), v);
+                top_extra.insert(key.into(), v.into());
+            }
+            runs.push(after);
+        }
+        runs
+    } else {
+        search_sets
+            .into_iter()
+            .map(|p| timed_search(index.as_ref(), &queries, args.k, p))
+            .collect::<Result<Vec<_>, _>>()?
+    };
 
     let output = Output {
         contract_version: 1,
@@ -227,7 +300,7 @@ fn run(args: &Args) -> Result<(), BenchError> {
         build,
         searches,
         machine: machine_info(),
-        extra: index.extra(),
+        extra: top_extra,
     };
     write_json(&args.out, &output)
 }
@@ -248,6 +321,7 @@ fn build_index(
     args: &Args,
     vectors: Matrix,
     params: &Params,
+    build_rows: Option<usize>,
 ) -> Result<Box<dyn AnnIndex>, BenchError> {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(args.threads)
@@ -256,8 +330,13 @@ fn build_index(
     let ctx = BuildContext {
         out_path: args.out.clone(),
     };
-    pool.install(|| bench::build(&args.index, vectors, params, args.threads, args.seed, &ctx))
-        .map_err(Runtime)
+    pool.install(|| match build_rows {
+        Some(rows) => {
+            bench::build_partial(&args.index, vectors, params, args.threads, args.seed, rows)
+        }
+        None => bench::build(&args.index, vectors, params, args.threads, args.seed, &ctx),
+    })
+    .map_err(Runtime)
 }
 
 /// Runs the first `--warmup` queries once with the first search set, untimed.
@@ -296,6 +375,210 @@ fn timed_search(
     }
     let total_s = loop_start.elapsed().as_secs_f64();
     Ok(report(params, results, latency_ms, total_s))
+}
+
+/// The rows that the inserter adds during load runs (CONTRACT 12.2).
+struct Inserter {
+    /// First row that is not in the build.
+    first: usize,
+    dim: usize,
+    /// Rows `first..N`, row-major.
+    rows: Vec<f32>,
+    /// Next row to insert. Shared by all search settings.
+    next: AtomicUsize,
+    /// Wall time of each batch of 100 rows, in ms.
+    batch_ms: std::sync::Mutex<Vec<f64>>,
+}
+
+const INSERT_BATCH: usize = 100;
+
+impl Inserter {
+    /// Inserts batches of 100 rows at `rate` rows per second until the rows run out
+    /// or `stop` is set. Returns the number of failed batches.
+    fn run(&self, index: &dyn AnnIndex, rate: f64, stop: &AtomicBool) -> u64 {
+        let total = self.first + self.rows.len() / self.dim;
+        let start = Instant::now();
+        let mut failed = 0u64;
+        let mut batch = 0u64;
+        while !stop.load(Ordering::Acquire) {
+            let lo = self.next.load(Ordering::Acquire);
+            if lo >= total {
+                break;
+            }
+            // Batch j starts at j * 100 / rate seconds after the loop starts.
+            let due = start + Duration::from_secs_f64(batch as f64 * INSERT_BATCH as f64 / rate);
+            let now = Instant::now();
+            if now < due {
+                std::thread::sleep((due - now).min(Duration::from_millis(5)));
+                continue;
+            }
+            let hi = (lo + INSERT_BATCH).min(total);
+            let ids: Vec<i64> = (lo as i64..hi as i64).collect();
+            let vecs = &self.rows[(lo - self.first) * self.dim..(hi - self.first) * self.dim];
+            let t = Instant::now();
+            match index.insert(&ids, vecs) {
+                Ok(()) => {
+                    let ms = t.elapsed().as_secs_f64() * 1e3;
+                    self.batch_ms
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(ms);
+                    self.next.store(hi, Ordering::Release);
+                }
+                Err(e) => {
+                    eprintln!("bench: insert failed: {e}");
+                    failed += 1;
+                    break;
+                }
+            }
+            batch += 1;
+        }
+        failed
+    }
+}
+
+/// What one load worker returns.
+struct WorkerOut {
+    latency_ms: Vec<f64>,
+    /// Worker 0 only: its first pass over the queries, in query order.
+    first_pass: Vec<SearchResult>,
+    errors: u64,
+}
+
+/// Load run of CONTRACT 12.1 for one search setting: `--clients` threads, each in a
+/// closed loop over the queries for `--duration` seconds (0 = one pass each), and the
+/// inserter thread if `--insert-rate` > 0. Worker 0 starts at query 0; worker w starts
+/// at query w * Q / C, so the workers do not run the same query at the same time.
+fn load_search(
+    index: &dyn AnnIndex,
+    queries: &Matrix,
+    args: &Args,
+    params: Params,
+    inserter: Option<&Inserter>,
+) -> Result<SearchReport, BenchError> {
+    if !index.supports_concurrency() {
+        return Err(Usage("this index does not support load runs".into()));
+    }
+    let q = queries.rows;
+    let (clients, k) = (args.clients, args.k);
+    let stop = AtomicBool::new(false);
+    let cpu_before = cpu_seconds();
+    let loop_start = Instant::now();
+    let (outs, insert_failed, wall) = std::thread::scope(|sc| {
+        let ins = inserter.map(|ins| sc.spawn(|| ins.run(index, args.insert_rate, &stop)));
+        let workers: Vec<_> = (0..clients)
+            .map(|w| {
+                let (stop, params) = (&stop, &params);
+                sc.spawn(move || {
+                    let mut out = WorkerOut {
+                        latency_ms: Vec::with_capacity(q),
+                        first_pass: Vec::with_capacity(if w == 0 { q } else { 0 }),
+                        errors: 0,
+                    };
+                    let offset = w * q / clients;
+                    let mut i = 0usize;
+                    loop {
+                        if args.duration > 0.0 && stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if args.duration == 0.0 && i == q {
+                            break;
+                        }
+                        let t = Instant::now();
+                        let r = index.search(queries.row((offset + i) % q), k, params);
+                        out.latency_ms.push(t.elapsed().as_secs_f64() * 1e3);
+                        let r = r.unwrap_or_else(|e| {
+                            if out.errors == 0 {
+                                eprintln!("bench: query failed: {e}");
+                            }
+                            out.errors += 1;
+                            SearchResult {
+                                ids: vec![-1; k],
+                                scores: vec![f32::NEG_INFINITY; k],
+                                distance_computations: None,
+                                counters: BTreeMap::new(),
+                            }
+                        });
+                        if w == 0 && i < q {
+                            out.first_pass.push(r);
+                        }
+                        i += 1;
+                    }
+                    out
+                })
+            })
+            .collect();
+        if args.duration > 0.0 {
+            std::thread::sleep(Duration::from_secs_f64(args.duration));
+            stop.store(true, Ordering::Release);
+        }
+        let outs: Vec<WorkerOut> = workers
+            .into_iter()
+            .map(|h| h.join().expect("worker panicked"))
+            .collect();
+        let wall = loop_start.elapsed().as_secs_f64();
+        stop.store(true, Ordering::Release);
+        let insert_failed = ins.map_or(0, |h| h.join().expect("inserter panicked"));
+        (outs, insert_failed, wall)
+    });
+    let cpu_pct = (cpu_seconds() - cpu_before) / wall * 100.0;
+    let errors: u64 = outs.iter().map(|o| o.errors).sum();
+    let done: usize = outs.iter().map(|o| o.latency_ms.len()).sum();
+    let mut outs = outs.into_iter();
+    let mut first = outs.next().expect("clients >= 1");
+    let mut latency_ms = std::mem::take(&mut first.latency_ms);
+    outs.for_each(|o| latency_ms.extend(o.latency_ms));
+    // A short --duration can end before worker 0 finishes its first pass: complete
+    // it after the loop, untimed, so ids and scores always hold Q rows.
+    let short_pass = q - first.first_pass.len();
+    for i in first.first_pass.len()..q {
+        first
+            .first_pass
+            .push(index.search(queries.row(i), k, &params).map_err(Runtime)?);
+    }
+    let mut rep = report(params, first.first_pass, latency_ms, wall);
+    rep.qps = done as f64 / wall;
+    for (key, v) in [
+        ("errors", errors as f64),
+        ("cpu_pct", cpu_pct),
+        ("clients", clients as f64),
+        ("duration_s", args.duration),
+        ("queries_done", done as f64),
+        ("first_pass_completed_after_loop", short_pass as f64),
+    ] {
+        rep.extra.insert(key.into(), v);
+    }
+    if inserter.is_some() {
+        rep.extra.insert("insert_errors".into(), insert_failed as f64);
+        rep.extra.insert("insert_rate".into(), args.insert_rate);
+    }
+    Ok(rep)
+}
+
+/// Median of `v` (sorts it); 0 for an empty list.
+fn median(v: &mut [f64]) -> f64 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    v.sort_by(f64::total_cmp);
+    let m = v.len() / 2;
+    if v.len() % 2 == 1 {
+        v[m]
+    } else {
+        (v[m - 1] + v[m]) / 2.0
+    }
+}
+
+/// User plus system CPU time of this process, in seconds.
+fn cpu_seconds() -> f64 {
+    // SAFETY: as in `peak_rss_mb`: getrusage writes only into the zeroed plain struct.
+    let usage = unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_SELF, &mut usage);
+        usage
+    };
+    let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 * 1e-6;
+    tv(usage.ru_utime) + tv(usage.ru_stime)
 }
 
 fn report(

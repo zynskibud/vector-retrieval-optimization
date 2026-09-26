@@ -51,6 +51,19 @@ pub trait AnnIndex: Send + Sync {
     /// Sets the data directory that holds `filter_<name>.npy` (CONTRACT 11).
     /// Indexes without the `filter` search key ignore it.
     fn set_filter_dir(&mut self, _dir: &str) {}
+    /// Adds rows `ids` (the next rows in row order) with their `vectors` (row-major)
+    /// while queries run (CONTRACT 12.2). Only hnsw supports it.
+    fn insert(&self, _ids: &[i64], _vectors: &[f32]) -> Result<(), String> {
+        Err("this index does not support inserts".into())
+    }
+    /// Runs the repair pass once after inserts. Returns (step A edges, step B edges).
+    fn repair(&self) -> Result<(u64, u64), String> {
+        Err("this index has no repair pass".into())
+    }
+    /// True if `search` is safe and lock-free for many client threads (CONTRACT 12).
+    fn supports_concurrency(&self) -> bool {
+        false
+    }
     /// Build-time keys for the top-level `"extra"` object of the output JSON.
     fn extra(&self) -> serde_json::Map<String, serde_json::Value> {
         serde_json::Map::new()
@@ -194,4 +207,21 @@ pub fn build(
         "diskann" => boxed(diskann::build(vectors, params, threads, seed, ctx)),
         other => Err(format!("unknown index: {other}")),
     }
+}
+
+/// Builds the named index on only the first `build_rows` rows; the other rows are
+/// added later with [`AnnIndex::insert`] (CONTRACT 12.2). Only hnsw supports it.
+pub fn build_partial(
+    index: &str,
+    vectors: Matrix,
+    params: &Params,
+    threads: usize,
+    seed: u64,
+    build_rows: usize,
+) -> Result<Box<dyn AnnIndex>, String> {
+    if index != "hnsw" {
+        return Err(format!("{index} does not support a partial build"));
+    }
+    hnsw::build_partial(vectors, params, threads, seed, build_rows)
+        .map(|i| Box::new(i) as Box<dyn AnnIndex>)
 }

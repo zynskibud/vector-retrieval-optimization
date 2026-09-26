@@ -17,6 +17,14 @@
 //! Parallel workers claim chunks of 64 consecutive rows.
 //! The new node selects m neighbors on every layer; 2m is only the layer-0 cap.
 //!
+//! Concurrency (CONTRACT 12): slots and counts stay atomics after the build. A query
+//! takes no lock: relaxed loads of the lists, the entry point and top layer from one
+//! atomic word, and a thread-local scratch. [`HnswIndex::insert`] adds rows in row order
+//! under the per-node lock stripe (slots stored first, then the count, release); the
+//! entry point changes under the global lock. The index owns all N rows from the build
+//! on and draws all N levels then; [`build_partial`] links only the first rows, so an
+//! insert never moves memory that a query reads.
+//!
 //! Filter (CONTRACT 11.3): the upper-layer descent ignores the filter. On layer 0,
 //! [`search_layer0`] puts a node in the result heap only if it passes the mask; every
 //! visited node still goes to the candidate heap (under the usual admission rule) and
@@ -29,7 +37,8 @@ use crate::{AnnIndex, BuildTimes, FilterMasks, Matrix, ParamValue::*, Params, Se
 use rayon::prelude::*;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering as AtOrd};
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering as AtOrd};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -249,9 +258,10 @@ fn select_heuristic(vectors: &Matrix, cands: &[Cand], limit: usize) -> Vec<u32> 
     kept
 }
 
-/// One layer during the build. Atomics let threads read lists while other
-/// threads write them under a lock, with no unsafe code.
-struct BuildLayer {
+/// One layer of the graph, during and after the build. Slots and counts are atomics,
+/// so searches read lists while an insert writes them under a lock, with no unsafe code
+/// (CONTRACT 12.2). The layers are sized for all N rows at build time.
+struct Layer {
     cap: usize,
     slots: Vec<AtomicI32>,
     counts: Vec<AtomicU32>,
@@ -259,7 +269,7 @@ struct BuildLayer {
     map: Vec<u32>,
 }
 
-impl BuildLayer {
+impl Layer {
     #[inline]
     fn block(&self, node: u32) -> usize {
         if self.map.is_empty() {
@@ -269,10 +279,31 @@ impl BuildLayer {
         }
     }
 
+    #[inline]
+    fn block_opt(&self, node: u32) -> Option<usize> {
+        match self.map.get(node as usize) {
+            None if self.map.is_empty() => Some(node as usize),
+            Some(&b) if b != ABSENT => Some(b as usize),
+            _ => None,
+        }
+    }
+
+    /// Reads a list for the build and the repair: acquire load of the count.
     fn read(&self, node: u32, out: &mut Vec<u32>) {
+        self.read_with(node, out, AtOrd::Acquire);
+    }
+
+    /// Reads a list for a query: relaxed loads only (CONTRACT 12.2). A concurrent
+    /// insert can make the list look shorter or longer, never torn.
+    fn read_relaxed(&self, node: u32, out: &mut Vec<u32>) {
+        self.read_with(node, out, AtOrd::Relaxed);
+    }
+
+    #[inline]
+    fn read_with(&self, node: u32, out: &mut Vec<u32>, order: AtOrd) {
         out.clear();
         let b = self.block(node);
-        let c = (self.counts[b].load(AtOrd::Acquire) as usize).min(self.cap);
+        let c = (self.counts[b].load(order) as usize).min(self.cap);
         for slot in &self.slots[b * self.cap..b * self.cap + c] {
             let v = slot.load(AtOrd::Relaxed);
             if v >= 0 {
@@ -281,64 +312,46 @@ impl BuildLayer {
         }
     }
 
+    /// Writes the slots first, then the count with a release store.
     fn write(&self, node: u32, ids: &[u32]) {
         let b = self.block(node);
         for (slot, &id) in self.slots[b * self.cap..].iter().zip(ids) {
-            slot.store(id as i32, AtOrd::Relaxed);
+            slot.store(id as i32, AtOrd::Release);
         }
         self.counts[b].store(ids.len() as u32, AtOrd::Release);
     }
+
+    fn count(&self, block: usize) -> u32 {
+        self.counts[block].load(AtOrd::Acquire)
+    }
 }
 
-/// One layer of the finished graph.
-struct Layer {
-    cap: usize,
-    slots: Vec<i32>,
-    counts: Vec<u32>,
-    map: Vec<u32>,
+thread_local! {
+    /// Per-thread search scratch, so concurrent queries share no lock (CONTRACT 12).
+    static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::new(0));
 }
 
-impl Layer {
-    #[inline]
-    fn block(&self, node: u32) -> Option<usize> {
-        if self.map.is_empty() {
-            Some(node as usize)
-        } else {
-            match self.map[node as usize] {
-                ABSENT => None,
-                b => Some(b as usize),
-            }
+/// Runs `f` with this thread's scratch, grown to at least `n` rows.
+fn with_scratch<R>(n: usize, f: impl FnOnce(&mut Scratch) -> R) -> R {
+    SCRATCH.with(|cell| {
+        let mut s = cell.borrow_mut();
+        if s.visited.len() < n {
+            s.visited.resize(n, 0);
         }
-    }
-
-    #[inline]
-    fn list(&self, node: u32) -> &[i32] {
-        match self.block(node) {
-            Some(b) => &self.slots[b * self.cap..b * self.cap + self.counts[b] as usize],
-            None => &[],
-        }
-    }
-
-    fn read(&self, node: u32, out: &mut Vec<u32>) {
-        out.clear();
-        out.extend(self.list(node).iter().map(|&v| v as u32));
-    }
+        f(&mut s)
+    })
 }
 
 pub struct HnswIndex {
-    vectors: Matrix,
-    levels: Vec<u8>,
-    layers: Vec<Layer>,
-    entry: u32,
-    m: usize,
-    ef_construct: usize,
+    graph: Graph,
     unreachable_before_repair: usize,
     repair_added: u64,
     repair_added_unreachable: u64,
     build_threads: usize,
     times: BuildTimes,
-    pool: Mutex<Vec<Scratch>>,
     filters: FilterMasks,
+    /// Serializes calls to [`HnswIndex::insert`], so rows go in strictly in row order.
+    insert_lock: Mutex<()>,
 }
 
 /// Levels of CONTRACT 6.6: one SplitMix64 seeded `seed`, one `next_f64` per row, in row order.
@@ -358,19 +371,34 @@ pub fn draw_levels(n: usize, m: usize, seed: u64) -> Vec<u8> {
         .collect()
 }
 
-/// The graph during the build.
-struct Builder<'a> {
-    vectors: &'a Matrix,
-    levels: &'a [u8],
-    layers: Vec<BuildLayer>,
+/// The graph. It owns all N corpus rows from the build on; rows `active..N` are
+/// stored but not yet linked (CONTRACT 12.2: the build takes the first 90%).
+struct Graph {
+    vectors: Matrix,
+    levels: Vec<u8>,
+    layers: Vec<Layer>,
     locks: Vec<Mutex<()>>,
-    /// (entry point, top layer).
+    /// (entry point, top layer). Changed only under this global lock.
     entry: Mutex<(u32, usize)>,
+    /// Copy of `entry` as `(entry << 32) | top`, for lock-free reads by queries.
+    entry_top: AtomicU64,
+    /// Rows `0..active` are in the graph.
+    active: AtomicUsize,
     m: usize,
     ef_construct: usize,
 }
 
-impl Builder<'_> {
+fn pack(entry: u32, top: usize) -> u64 {
+    ((entry as u64) << 32) | top as u64
+}
+
+impl Graph {
+    /// (entry point, top layer), read without a lock.
+    fn entry_top(&self) -> (u32, usize) {
+        let v = self.entry_top.load(AtOrd::Acquire);
+        ((v >> 32) as u32, (v & 0xffff_ffff) as usize)
+    }
+
     fn lock(&self, node: u32) -> MutexGuard<'_, ()> {
         self.locks[node as usize % self.locks.len()]
             .lock()
@@ -406,7 +434,7 @@ impl Builder<'_> {
         let mut kept: Vec<u32> = buf.iter().copied().filter(|id| keep.contains(id)).collect();
         kept.truncate(l.cap);
         let room = l.cap - kept.len();
-        kept.extend(select_heuristic(self.vectors, &cands, room));
+        kept.extend(select_heuristic(&self.vectors, &cands, room));
         l.write(node, &kept);
     }
 
@@ -430,7 +458,7 @@ impl Builder<'_> {
         }];
         for layer in (level + 1..=top).rev() {
             let bl = &self.layers[layer];
-            let w = search_layer(q, self.vectors, &cur, 1, |n, o| bl.read(n, o), s, &mut dc);
+            let w = search_layer(q, &self.vectors, &cur, 1, |n, o| bl.read(n, o), s, &mut dc);
             cur.truncate(0);
             cur.push(w[0]);
         }
@@ -439,7 +467,7 @@ impl Builder<'_> {
             let bl = &self.layers[layer];
             let w = search_layer(
                 q,
-                self.vectors,
+                &self.vectors,
                 &cur,
                 self.ef_construct,
                 |n, o| bl.read(n, o),
@@ -447,7 +475,7 @@ impl Builder<'_> {
                 &mut dc,
             );
             // The new node selects m on every layer; 2m is only the layer-0 cap.
-            let chosen = select_heuristic(self.vectors, &w, self.m);
+            let chosen = select_heuristic(&self.vectors, &w, self.m);
             self.add_links(i, layer, &chosen, &[], &mut buf);
             for &nb in &chosen {
                 self.add_links(nb, layer, &[i], &[], &mut buf);
@@ -456,6 +484,7 @@ impl Builder<'_> {
         }
         if let Some(mut g) = hold {
             *g = (i, level);
+            self.entry_top.store(pack(i, level), AtOrd::Release);
         }
     }
 
@@ -464,10 +493,10 @@ impl Builder<'_> {
         self.reach(entry).iter().filter(|&&r| !r).count()
     }
 
-    /// Layer-0 BFS from `entry`: `true` for every reached node.
+    /// Layer-0 BFS from `entry` over the active rows: `true` for every reached node.
     fn reach(&self, entry: u32) -> Vec<bool> {
         let l0 = &self.layers[0];
-        let n = self.vectors.rows;
+        let n = self.active.load(AtOrd::Acquire);
         let mut seen = vec![false; n];
         seen[entry as usize] = true;
         let mut stack = vec![entry];
@@ -496,7 +525,7 @@ impl Builder<'_> {
         let mut dc = 0;
         let mut w = search_layer(
             q,
-            self.vectors,
+            &self.vectors,
             &start,
             self.ef_construct,
             |x, o| l0.read(x, o),
@@ -532,8 +561,8 @@ impl Builder<'_> {
     /// passes. Returns (edges added by step A, edges added by step B).
     fn repair(&self, entry: u32) -> (u64, u64) {
         let l0 = &self.layers[0];
-        let n = self.vectors.rows;
-        let mut s = Scratch::new(n);
+        let n = self.active.load(AtOrd::Acquire);
+        let mut s = Scratch::new(self.vectors.rows);
         let mut buf = Vec::new();
         let mut protected: HashMap<u32, Vec<u32>> = HashMap::new();
         let (mut added_a, mut added_b) = (0u64, 0u64);
@@ -572,7 +601,7 @@ impl Builder<'_> {
                 let w = self.search_from_entry(v, entry, &mut s);
                 let u = w
                     .iter()
-                    .find(|c| (l0.counts[l0.block(c.id)].load(AtOrd::Acquire) as usize) < l0.cap)
+                    .find(|c| (l0.count(l0.block(c.id)) as usize) < l0.cap)
                     .or(w.first());
                 if let Some(u) = u {
                     self.add_protected(u.id, v, &mut protected, &mut buf);
@@ -590,6 +619,21 @@ pub fn build(
     threads: usize,
     seed: u64,
 ) -> Result<HnswIndex, String> {
+    let n = vectors.rows;
+    build_partial(vectors, params, threads, seed, n)
+}
+
+/// Builds the graph on the first `build_rows` rows of `vectors`. The other rows stay
+/// stored, unlinked, until [`HnswIndex::insert`] adds them (CONTRACT 12.2). Levels are
+/// drawn for all N rows here, in row order, so an inserted row gets the same level as
+/// in a full build. With `build_rows == N` this is the build of CONTRACT 6.6.
+pub fn build_partial(
+    vectors: Matrix,
+    params: &Params,
+    threads: usize,
+    seed: u64,
+    build_rows: usize,
+) -> Result<HnswIndex, String> {
     let m = params.get_usize("m")?;
     let ef_construct = params.get_usize("ef_construct")?;
     if m < 2 {
@@ -599,8 +643,11 @@ pub fn build(
         return Err("ef_construct must be >= 1".into());
     }
     let n = vectors.rows;
-    if n == 0 {
+    if n == 0 || build_rows == 0 {
         return Err("empty corpus".into());
+    }
+    if build_rows > n {
+        return Err(format!("build_rows {build_rows} > corpus rows {n}"));
     }
     if n > i32::MAX as usize {
         return Err("corpus too large for int32 IDs".into());
@@ -625,7 +672,7 @@ pub fn build(
             }
             (map, c as usize)
         };
-        layers.push(BuildLayer {
+        layers.push(Layer {
             cap,
             slots: (0..count * cap).map(|_| AtomicI32::new(-1)).collect(),
             counts: (0..count).map(|_| AtomicU32::new(0)).collect(),
@@ -633,54 +680,40 @@ pub fn build(
         });
     }
 
-    let builder = Builder {
-        vectors: &vectors,
-        levels: &levels,
+    let graph = Graph {
+        vectors,
+        entry: Mutex::new((0, levels[0] as usize)),
+        entry_top: AtomicU64::new(pack(0, levels[0] as usize)),
+        active: AtomicUsize::new(build_rows),
+        levels,
         layers,
         locks: (0..LOCK_STRIPES.min(n)).map(|_| Mutex::new(())).collect(),
-        entry: Mutex::new((0, levels[0] as usize)),
         m,
         ef_construct,
     };
     if threads <= 1 {
         let mut s = Scratch::new(n);
-        for i in 1..n as u32 {
-            builder.insert(i, &mut s);
+        for i in 1..build_rows as u32 {
+            graph.insert(i, &mut s);
         }
     } else {
         // Workers claim chunks of 64 consecutive rows (CONTRACT 6.6).
         const CHUNK: usize = 64;
-        (0..n.div_ceil(CHUNK)).into_par_iter().for_each_init(
+        (0..build_rows.div_ceil(CHUNK)).into_par_iter().for_each_init(
             || Scratch::new(n),
             |s, c| {
-                for i in (c * CHUNK).max(1)..((c + 1) * CHUNK).min(n) {
-                    builder.insert(i as u32, s);
+                for i in (c * CHUNK).max(1)..((c + 1) * CHUNK).min(build_rows) {
+                    graph.insert(i as u32, s);
                 }
             },
         );
     }
-    let (entry, _) = *builder.entry.lock().unwrap_or_else(|e| e.into_inner());
-    let unreachable_before_repair = builder.unreachable(entry);
-    let (repair_added, repair_added_unreachable) = builder.repair(entry);
-    let (bm, bef) = (builder.m, builder.ef_construct);
-    let layers: Vec<Layer> = builder
-        .layers
-        .into_iter()
-        .map(|l| Layer {
-            cap: l.cap,
-            slots: l.slots.into_iter().map(AtomicI32::into_inner).collect(),
-            counts: l.counts.into_iter().map(AtomicU32::into_inner).collect(),
-            map: l.map,
-        })
-        .collect();
+    let (entry, _) = graph.entry_top();
+    let unreachable_before_repair = graph.unreachable(entry);
+    let (repair_added, repair_added_unreachable) = graph.repair(entry);
     let add_s = start.elapsed().as_secs_f64();
     Ok(HnswIndex {
-        vectors,
-        levels,
-        layers,
-        entry,
-        m: bm,
-        ef_construct: bef,
+        graph,
         unreachable_before_repair,
         repair_added,
         repair_added_unreachable,
@@ -689,13 +722,15 @@ pub fn build(
             train_s: 0.0,
             add_s,
         },
-        pool: Mutex::new(Vec::new()),
         filters: FilterMasks::default(),
+        insert_lock: Mutex::new(()),
     })
 }
 
 /// Algorithm 5: greedy descent to layer 1 with ef = 1, then search-layer on
 /// layer 0 with max(ef, k). Returns the top k, padded with -1 and `-inf`.
+/// Takes no lock: lists are read with relaxed atomic loads, the entry point from
+/// one atomic word, and the scratch memory is per thread.
 pub fn search(
     index: &HnswIndex,
     query: &[f32],
@@ -703,48 +738,43 @@ pub fn search(
     params: &Params,
 ) -> Result<SearchResult, String> {
     let ef = params.get_usize("ef")?.max(k).max(1);
-    let n = index.vectors.rows;
+    let g = &index.graph;
     let mask = index.filters.for_params(params)?;
     let pass = mask.as_ref().map(|m| m.pass.as_slice());
     let filter_rows = mask.as_ref().map(|m| m.rows);
-    let mut s = index
-        .pool
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .pop()
-        .unwrap_or_else(|| Scratch::new(n));
     let mut dc = 1u64;
-    let ep = index.entry;
-    let mut cur = vec![Cand {
-        score: dot(query, index.vectors.row(ep as usize)),
-        id: ep,
-    }];
-    for layer in (1..index.layers.len()).rev() {
-        let l = &index.layers[layer];
-        let w = search_layer(
+    let (ep, top) = g.entry_top();
+    let (w, visited) = with_scratch(g.vectors.rows, |s| {
+        let mut cur = vec![Cand {
+            score: dot(query, g.vectors.row(ep as usize)),
+            id: ep,
+        }];
+        for layer in (1..=top).rev() {
+            let l = &g.layers[layer];
+            let w = search_layer(
+                query,
+                &g.vectors,
+                &cur,
+                1,
+                |nd, o| l.read_relaxed(nd, o),
+                s,
+                &mut dc,
+            );
+            cur.truncate(0);
+            cur.push(w[0]);
+        }
+        let l0 = &g.layers[0];
+        search_layer0(
             query,
-            &index.vectors,
-            &cur,
-            1,
-            |nd, o| l.read(nd, o),
-            &mut s,
+            &g.vectors,
+            cur[0],
+            ef,
+            pass,
+            |nd, o| l0.read_relaxed(nd, o),
+            s,
             &mut dc,
-        );
-        cur.truncate(0);
-        cur.push(w[0]);
-    }
-    let l0 = &index.layers[0];
-    let (w, visited) = search_layer0(
-        query,
-        &index.vectors,
-        cur[0],
-        ef,
-        pass,
-        |nd, o| l0.read(nd, o),
-        &mut s,
-        &mut dc,
-    );
-    index.pool.lock().unwrap_or_else(|e| e.into_inner()).push(s);
+        )
+    });
     let mut ids: Vec<i64> = w.iter().take(k).map(|c| c.id as i64).collect();
     let mut scores: Vec<f32> = w.iter().take(k).map(|c| c.score).collect();
     ids.resize(k, -1);
@@ -764,31 +794,87 @@ pub fn search(
 impl HnswIndex {
     /// Sets the directory that holds `filter_<name>.npy` (CONTRACT 11).
     pub fn set_filter_dir(&mut self, dir: &str) {
-        self.filters = FilterMasks::new(dir, self.vectors.rows);
+        self.filters = FilterMasks::new(dir, self.graph.vectors.rows);
     }
-    /// Level of every node, in row order.
+    /// Adds rows to the graph while queries run (CONTRACT 12.2). `ids` must be the next
+    /// rows in row order (starting at [`HnswIndex::active_rows`]), and `vectors` their
+    /// rows, `ids.len() x dim` values, equal to the rows stored at build time.
+    /// Each row is inserted with Algorithm 1 and its level from the build-time draw.
+    pub fn insert(&self, ids: &[i64], vectors: &[f32]) -> Result<(), String> {
+        let _order = self.insert_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let g = &self.graph;
+        let dim = g.vectors.cols;
+        if vectors.len() != ids.len() * dim {
+            return Err(format!(
+                "insert: {} values for {} rows of dim {dim}",
+                vectors.len(),
+                ids.len()
+            ));
+        }
+        let first = g.active.load(AtOrd::Acquire);
+        for (j, &id) in ids.iter().enumerate() {
+            if id != (first + j) as i64 || id as usize >= g.vectors.rows {
+                return Err(format!(
+                    "insert: row {id} out of order (next row is {}, corpus has {})",
+                    first + j,
+                    g.vectors.rows
+                ));
+            }
+            if g.vectors.row(id as usize) != &vectors[j * dim..(j + 1) * dim] {
+                return Err(format!("insert: vector of row {id} differs from the corpus"));
+            }
+        }
+        with_scratch(g.vectors.rows, |s| {
+            for &id in ids {
+                g.insert(id as u32, s);
+                g.active.store(id as usize + 1, AtOrd::Release);
+            }
+        });
+        Ok(())
+    }
+    /// Rows in the graph now: the build rows plus the inserted rows.
+    pub fn active_rows(&self) -> usize {
+        self.graph.active.load(AtOrd::Acquire)
+    }
+    /// Runs the repair pass of CONTRACT 6.6 once over the active rows (after inserts).
+    /// Returns (edges added by step A, edges added by step B). Call it when no insert runs.
+    pub fn repair(&self) -> (u64, u64) {
+        let _order = self.insert_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let (entry, _) = self.graph.entry_top();
+        self.graph.repair(entry)
+    }
+    /// Level of every node, in row order (all N rows, inserted or not).
     pub fn levels(&self) -> &[u8] {
-        &self.levels
+        &self.graph.levels
     }
     /// The entry point of search.
     pub fn entry_point(&self) -> u32 {
-        self.entry
+        self.graph.entry_top().0
     }
-    /// Number of layers (top layer + 1).
+    /// Number of layers (top layer + 1) of the current graph.
     pub fn num_layers(&self) -> usize {
-        self.layers.len()
+        self.graph.entry_top().1 + 1
     }
     /// Slot limit per node on `layer`: 2m on layer 0, m above.
     pub fn layer_cap(&self, layer: usize) -> usize {
-        self.layers[layer].cap
+        self.graph.layers[layer].cap
     }
-    /// Stored count of every node block on `layer`, before clamping.
-    pub fn layer_counts(&self, layer: usize) -> &[u32] {
-        &self.layers[layer].counts
+    /// Stored count of every node block on `layer`, before clamping (a snapshot).
+    pub fn layer_counts(&self, layer: usize) -> Vec<u32> {
+        let l = &self.graph.layers[layer];
+        (0..l.counts.len()).map(|b| l.count(b)).collect()
     }
-    /// Neighbor IDs of `node` on `layer` (empty if the node is not on that layer).
-    pub fn neighbors(&self, layer: usize, node: u32) -> &[i32] {
-        self.layers[layer].list(node)
+    /// Neighbor IDs of `node` on `layer` (empty if the node is not on that layer), a snapshot.
+    pub fn neighbors(&self, layer: usize, node: u32) -> Vec<i32> {
+        let l = &self.graph.layers[layer];
+        match l.block_opt(node) {
+            Some(_) => {
+                let mut out = Vec::new();
+                l.read(node, &mut out);
+                out.into_iter().map(|v| v as i32).collect()
+            }
+            None => Vec::new(),
+        }
     }
     /// Layer-0 nodes that BFS from the entry point did not reach before the repair pass.
     pub fn unreachable_before_repair(&self) -> usize {
@@ -802,20 +888,29 @@ impl HnswIndex {
     pub fn repair_added_unreachable(&self) -> u64 {
         self.repair_added_unreachable
     }
-    /// Nodes on each layer, layer 0 first.
+    /// Nodes on each layer, layer 0 first (all N rows, by their drawn level).
     pub fn nodes_per_layer(&self) -> Vec<usize> {
-        self.layers.iter().map(|l| l.counts.len()).collect()
+        self.graph.layers[..self.num_layers()]
+            .iter()
+            .map(|l| l.counts.len())
+            .collect()
     }
     fn edges(&self) -> u64 {
-        self.layers
+        self.graph
+            .layers
             .iter()
-            .map(|l| l.counts.iter().map(|&c| c as u64).sum::<u64>())
+            .map(|l| {
+                (0..l.counts.len())
+                    .map(|b| l.count(b) as u64)
+                    .sum::<u64>()
+            })
             .sum()
     }
     fn bookkeeping_bytes(&self) -> u64 {
-        let counts: u64 = self.layers.iter().map(|l| l.counts.len() as u64 * 4).sum();
-        let maps: u64 = self.layers.iter().map(|l| l.map.len() as u64 * 4).sum();
-        self.levels.len() as u64 + counts + maps
+        let layers = &self.graph.layers[..self.num_layers()];
+        let counts: u64 = layers.iter().map(|l| l.counts.len() as u64 * 4).sum();
+        let maps: u64 = layers.iter().map(|l| l.map.len() as u64 * 4).sum();
+        self.graph.levels.len() as u64 + counts + maps
     }
 }
 
@@ -838,16 +933,25 @@ impl AnnIndex for HnswIndex {
     fn build_times(&self) -> BuildTimes {
         self.times
     }
+    fn insert(&self, ids: &[i64], vectors: &[f32]) -> Result<(), String> {
+        HnswIndex::insert(self, ids, vectors)
+    }
+    fn repair(&self) -> Result<(u64, u64), String> {
+        Ok(HnswIndex::repair(self))
+    }
+    fn supports_concurrency(&self) -> bool {
+        true
+    }
     fn extra(&self) -> serde_json::Map<String, serde_json::Value> {
         let mut e = serde_json::Map::new();
-        e.insert("top_layer".into(), (self.layers.len() - 1).into());
-        e.insert("entry_point".into(), self.entry.into());
+        e.insert("top_layer".into(), (self.num_layers() - 1).into());
+        e.insert("entry_point".into(), self.entry_point().into());
         e.insert("nodes_per_layer".into(), self.nodes_per_layer().into());
         e.insert("edges".into(), self.edges().into());
         e.insert("edge_bytes".into(), (self.edges() * 4).into());
         e.insert("bookkeeping_bytes".into(), self.bookkeeping_bytes().into());
-        e.insert("m".into(), self.m.into());
-        e.insert("ef_construct".into(), self.ef_construct.into());
+        e.insert("m".into(), self.graph.m.into());
+        e.insert("ef_construct".into(), self.graph.ef_construct.into());
         e.insert(
             "unreachable_before_repair".into(),
             self.unreachable_before_repair.into(),

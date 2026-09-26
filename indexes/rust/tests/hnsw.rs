@@ -124,7 +124,7 @@ fn slot_counts_within_limits() {
     for layer in 0..f.index.num_layers() {
         let cap = f.index.layer_cap(layer);
         assert_eq!(cap, if layer == 0 { 32 } else { 16 });
-        for &c in f.index.layer_counts(layer) {
+        for &c in &f.index.layer_counts(layer) {
             assert!(c as usize <= cap, "layer {layer}: count {c} > {cap}");
         }
     }
@@ -147,7 +147,7 @@ fn reachable(index: &hnsw::HnswIndex, n: usize) -> usize {
     seen[index.entry_point() as usize] = true;
     let mut reached = 1usize;
     while let Some(v) = stack.pop() {
-        for &u in index.neighbors(0, v) {
+        for &u in &index.neighbors(0, v) {
             assert!(u >= 0 && (u as usize) < n && u as u32 != v);
             if !seen[u as usize] {
                 seen[u as usize] = true;
