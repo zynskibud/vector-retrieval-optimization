@@ -6,6 +6,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace vro {
@@ -45,10 +46,26 @@ public:
 
 // Everything that build() needs besides vectors and params.
 struct BuildContext {
+    BuildContext() = default;
+    BuildContext(int t, std::uint64_t s, std::string out, std::string data = "")
+        : threads(t), seed(s), out_path(std::move(out)), data_dir(std::move(data)) {}
     int threads = 1;
     std::uint64_t seed = 42;
     std::string out_path;  // the output JSON path; diskann writes <out_path>.diskann
+    std::string data_dir;  // the --data directory; filtered search reads filter_<name>.npy here
 };
+
+// Metadata filter (CONTRACT 11). pass[i] is 1 if row i passes; pass has one
+// byte per corpus row. rows = number of passing rows.
+struct FilterMask {
+    std::vector<std::uint8_t> pass;
+    std::size_t rows = 0;
+};
+
+// Returns the mask for params "filter", or nullptr for "none" or a missing key.
+// Loads <data_dir>/filter_<name>.npy on first use and caches it (thread-safe).
+// The mask is cut to the first n rows (bench --limit). Bad name: ParamError.
+const FilterMask* get_filter(const std::string& data_dir, const Params& params, std::size_t n);
 
 struct BuildTimes {
     double train_s = 0.0;

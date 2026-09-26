@@ -11,6 +11,7 @@ struct Header {
     std::string descr;
     std::size_t rows = 0;
     std::size_t cols = 0;
+    int ndim = 2;
 };
 
 [[noreturn]] void fail(const std::string& path, const std::string& msg) {
@@ -48,9 +49,16 @@ Header parse_header(const std::string& dict, const std::string& path) {
         dims.push_back(std::stoull(inner.substr(i), &used));
         i += used;
     }
-    if (dims.size() != 2) fail(path, "expected a 2-D array");
-    h.rows = dims[0];
-    h.cols = dims[1];
+    if (dims.size() == 1) {
+        h.ndim = 1;
+        h.rows = dims[0];
+        h.cols = 1;
+    } else if (dims.size() == 2) {
+        h.rows = dims[0];
+        h.cols = dims[1];
+    } else {
+        fail(path, "expected a 1-D or 2-D array");
+    }
     return h;
 }
 
@@ -81,6 +89,7 @@ void read_data(std::ifstream& in, std::vector<T>& out, std::size_t count, const 
 Matrix read_f32(const std::string& path, std::size_t max_rows) {
     std::ifstream in;
     Header h = open_and_parse(in, path);
+    if (h.ndim != 2) fail(path, "expected a 2-D array");
     if (h.descr != "<f4") fail(path, "descr is '" + h.descr + "', expected '<f4'");
     Matrix m;
     m.rows = (max_rows > 0 && max_rows < h.rows) ? max_rows : h.rows;
@@ -92,12 +101,25 @@ Matrix read_f32(const std::string& path, std::size_t max_rows) {
 Int64Array read_i64(const std::string& path) {
     std::ifstream in;
     Header h = open_and_parse(in, path);
+    if (h.ndim != 2) fail(path, "expected a 2-D array");
     if (h.descr != "<i8") fail(path, "descr is '" + h.descr + "', expected '<i8'");
     Int64Array a;
     a.rows = h.rows;
     a.cols = h.cols;
     read_data(in, a.data, a.rows * a.cols, path);
     return a;
+}
+
+std::vector<std::uint8_t> read_bool(const std::string& path) {
+    std::ifstream in;
+    Header h = open_and_parse(in, path);
+    if (h.ndim != 1) fail(path, "expected a 1-D array");
+    if (h.descr != "|b1") fail(path, "descr is '" + h.descr + "', expected '|b1'");
+    std::vector<std::uint8_t> out;
+    read_data(in, out, h.rows, path);
+    for (std::uint8_t b : out)
+        if (b > 1) fail(path, "bool byte is not 0 or 1");
+    return out;
 }
 
 }  // namespace vro::npy

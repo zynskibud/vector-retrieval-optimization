@@ -17,6 +17,7 @@ namespace vro::hnsw {
 
 struct Index {
     const Matrix* vectors = nullptr;
+    std::string data_dir;             // for filter_<name>.npy (CONTRACT 11)
     std::size_t m = 16;               // slots per node on layers >= 1
     std::size_t m0 = 32;              // slots per node on layer 0 (2m)
     std::size_t ef_construct = 100;

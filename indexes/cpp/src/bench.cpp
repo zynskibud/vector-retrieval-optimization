@@ -57,14 +57,17 @@ struct IndexSpec {
     std::vector<ParamSpec> search;
 };
 
+// CONTRACT 11.2: search key "filter" for flat, ivf, hnsw only.
+const std::vector<std::string> kFilters = {"none", "top50", "top10", "top1", "top01"};
+
 const std::map<std::string, IndexSpec>& index_specs() {
     static const std::map<std::string, IndexSpec> specs = {
-        {"flat", {{}, {}}},
+        {"flat", {{}, {{"filter", "none", PType::kString, kFilters}}}},
         {"ivf",
          {{{"nlist", "1024", PType::kInt, {}},
            {"train_size", "", PType::kInt, {}},
            {"iters", "20", PType::kInt, {}}},
-          {{"nprobe", "8", PType::kInt, {}}}}},
+          {{"nprobe", "8", PType::kInt, {}}, {"filter", "none", PType::kString, kFilters}}}},
         {"pq",
          {{{"m", "48", PType::kInt, {}},
            {"nbits", "8", PType::kInt, {}},
@@ -82,7 +85,7 @@ const std::map<std::string, IndexSpec>& index_specs() {
           {{"nprobe", "8", PType::kInt, {}}, {"rerank", "0", PType::kInt, {}}}}},
         {"hnsw",
          {{{"m", "16", PType::kInt, {}}, {"ef_construct", "100", PType::kInt, {}}},
-          {{"ef", "64", PType::kInt, {}}}}},
+          {{"ef", "64", PType::kInt, {}}, {"filter", "none", PType::kString, kFilters}}}},
         {"diskann",
          {{{"r", "64", PType::kInt, {}},
            {"l_build", "100", PType::kInt, {}},
@@ -369,7 +372,7 @@ int run(int argc, char** argv) {
         build_params.values["train_size"] = std::to_string(default_train_size(n, nlist));
     }
 
-    BuildContext ctx{args.threads, args.seed, args.out};
+    BuildContext ctx{args.threads, args.seed, args.out, args.data};
     std::cerr << "building " << args.index << " on " << n << " rows\n";
     std::unique_ptr<AnyIndex> index = build_index(args.index, vectors, build_params, ctx);
     BuildTimes times = index->times();
@@ -395,6 +398,7 @@ int run(int argc, char** argv) {
     warm_up(*index, queries, args.k, args.warmup, search_sets.front());
     json searches = json::array();
     for (const auto& p : search_sets) {
+        get_filter(args.data, p, n);  // load the mask before the timed pass (cached)
         std::cerr << "searching " << search_sets.size() << " set(s)\n";
         searches.push_back(run_search(*index, queries, args.k, p, spec.search));
     }

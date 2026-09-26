@@ -143,6 +143,51 @@ std::vector<Cand> search_layer(Access& a, const float* q, const std::vector<Cand
     return out;
 }
 
+// Filtered search-layer on layer 0 (CONTRACT 11.3). Same as search_layer, with
+// one change: a node enters the result heap only if pass[node] is 1. Every
+// scored node that is better than the worst result (or scored while the result
+// heap is not full) enters the candidate heap and is expanded, also if it fails.
+// pass == nullptr: no filter (identical to search_layer from one entry point).
+// expanded = nodes popped from the candidate heap and expanded.
+std::vector<Cand> search_layer0_filtered(Access& a, const float* q, Cand ep, std::size_t ef,
+                                         const std::uint8_t* pass, Visited& vis,
+                                         std::int64_t& dc, std::int64_t& expanded) {
+    const Matrix& v = *a.ix->vectors;
+    vis.reset(v.rows);
+    std::priority_queue<Cand, std::vector<Cand>, BestOnTop> cand;
+    std::priority_queue<Cand, std::vector<Cand>, WorstOnTop> res;
+    vis.test_and_set(ep.id);
+    cand.push(ep);
+    if (!pass || pass[static_cast<std::size_t>(ep.id)]) res.push(ep);
+    while (!cand.empty()) {
+        Cand c = cand.top();
+        if (res.size() >= ef && better(res.top(), c)) break;
+        cand.pop();
+        ++expanded;
+        std::int32_t n;
+        const std::int32_t* nb = a.list(0, c.id, n);
+        for (std::int32_t j = 0; j < n; ++j) {
+            std::int32_t e = nb[j];
+            if (vis.test_and_set(e)) continue;
+            Cand ce{dot(q, v.row(static_cast<std::size_t>(e)), v.dim), e};
+            ++dc;
+            if (res.size() < ef || better(ce, res.top())) {
+                cand.push(ce);
+                if (!pass || pass[static_cast<std::size_t>(e)]) {
+                    res.push(ce);
+                    if (res.size() > ef) res.pop();
+                }
+            }
+        }
+    }
+    std::vector<Cand> out(res.size());
+    for (std::size_t i = out.size(); i-- > 0;) {
+        out[i] = res.top();
+        res.pop();
+    }
+    return out;
+}
+
 // Algorithm 4 with extendCandidates = false, keepPrunedConnections = false.
 // cands sorted best first; scores are similarity to the base point.
 std::vector<std::int32_t> select_heuristic(const Index& ix, const std::vector<Cand>& cands,
@@ -428,6 +473,7 @@ Index build(Matrix& vectors, const Params& params, const BuildContext& ctx) {
 
     Index ix;
     ix.vectors = &vectors;
+    ix.data_dir = ctx.data_dir;
     ix.m = static_cast<std::size_t>(m);
     ix.m0 = 2 * ix.m;
     ix.ef_construct = static_cast<std::size_t>(efc);
@@ -502,7 +548,12 @@ SearchResult search(const Index& ix, const float* query, std::size_t k, const Pa
     ++dc;
     for (int l = ix.top; l >= 1; --l) cur = greedy(a, query, cur, l, dc);
     thread_local Visited vis;
-    std::vector<Cand> w = search_layer(a, query, {cur}, ef, 0, vis, dc);
+    const FilterMask* f = get_filter(ix.data_dir, params, v.rows);
+    std::int64_t expanded = 0;
+    std::vector<Cand> w = search_layer0_filtered(a, query, cur, ef, f ? f->pass.data() : nullptr,
+                                                 vis, dc, expanded);
+    if (f) r.counters["filter_rows"] = static_cast<double>(f->rows);  // omitted for none (11.2)
+    r.counters["visited"] = static_cast<double>(expanded);
     for (std::size_t i = 0; i < k && i < w.size(); ++i) {
         r.ids[i] = w[i].id;
         r.scores[i] = w[i].score;

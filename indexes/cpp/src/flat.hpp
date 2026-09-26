@@ -12,6 +12,7 @@ namespace vro::flat {
 
 struct Index {
     const Matrix* vectors = nullptr;  // the corpus array is the index
+    std::string data_dir;             // for filter_<name>.npy (CONTRACT 11)
     BuildTimes times;
 };
 

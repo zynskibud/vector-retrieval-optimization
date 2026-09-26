@@ -19,6 +19,7 @@ namespace vro::ivf {
 
 struct Index {
     const Matrix* vectors = nullptr;   // the corpus; search scans full vectors
+    std::string data_dir;               // for filter_<name>.npy (CONTRACT 11)
     std::size_t nlist = 0;
     std::size_t dim = 0;
     std::vector<float> centers;         // nlist x dim, row-major

@@ -37,6 +37,7 @@ Index build(Matrix& vectors, const Params& params, const BuildContext& ctx) {
 
     Index index;
     index.vectors = &vectors;
+    index.data_dir = ctx.data_dir;
     index.nlist = nlist;
     index.dim = dim;
 
@@ -101,14 +102,17 @@ SearchResult search(const Index& index, const float* query, std::size_t k, const
                      better);
 
     const Matrix& v = *index.vectors;
+    const FilterMask* f = get_filter(index.data_dir, params, v.rows);
+    const std::uint8_t* pass = f ? f->pass.data() : nullptr;
     TopK top(k);
-    std::int64_t scanned = 0;
+    std::int64_t scanned = 0;  // rows scored (only passing rows when filtered)
     for (std::size_t p = 0; p < nprobe; ++p) {
         const auto c = static_cast<std::size_t>(cs[p].second);
         const std::int32_t lo = index.offsets[c], hi = index.offsets[c + 1];
-        scanned += hi - lo;
         for (std::int32_t j = lo; j < hi; ++j) {
             const std::int32_t id = index.list_ids[static_cast<std::size_t>(j)];
+            if (pass && !pass[static_cast<std::size_t>(id)]) continue;
+            ++scanned;
             float s = dot(query, v.row(static_cast<std::size_t>(id)), dim);
             if (s >= top.threshold()) top.push(id, s);
         }
@@ -116,6 +120,7 @@ SearchResult search(const Index& index, const float* query, std::size_t k, const
     SearchResult r;
     top.result(r.ids, r.scores);
     r.distance_computations = static_cast<std::int64_t>(index.nlist) + scanned;
+    if (f) r.counters["filter_rows"] = static_cast<double>(f->rows);  // omitted for none (11.2)
     return r;
 }
 
