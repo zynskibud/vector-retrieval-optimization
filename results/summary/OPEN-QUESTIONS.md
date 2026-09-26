@@ -2,6 +2,12 @@
 
 Decisions that need the human, the default the session took, and its effect. Newest first. Remove an entry when the human decides.
 
+## 2026-09-26: Phase 4 design taken without human review
+
+- **Question:** how to measure concurrency for the hand-built indexes and the databases, and what "searches during inserts" means.
+- **Default taken (CONTRACT section 12):** closed-loop worker threads (1 to 64) over the query set for a fixed duration inside the same `bench` program, reporting QPS, all latencies, errors, and CPU%; an inserter that adds the last 10% of the rows at a fixed rate during the loop, with a one-thread pass afterwards whose recall must match a static build; lock-free searches over atomic neighbor slots in Go, C++, Rust, with the build's per-node lock stripe for inserts; Python with threads and a lock per node list, GIL-serialized. Only hnsw and the databases take part. Five Opus 5.5 agents.
+- **Effect:** the language comparison gains a concurrency axis (thread scaling and tail latency) that the earlier phases could not show; Python's numbers will show the GIL. IVF, PQ, DiskANN stay read-only.
+
 ## 2026-09-26: Phase 3 design taken without human review
 
 - **Question:** what "metadata filtering" measures and how the filter reaches each index.

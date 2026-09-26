@@ -402,3 +402,38 @@ The same `filter` search key. Qdrant: a `Filter` with `FieldCondition(key="views
 ### 11.5 Tests
 
 On the first 20,000 rows of the dev set with truth computed in the test, for each of flat, ivf, hnsw in each language: `filter=top10` recall@10 ≥ 1.0 for flat, ≥ 0.70 for ivf with nlist = 256 (a list size like the dev default), ≥ 0.85 for hnsw at defaults (on the full dev set with nlist = 1024, ivf gives 0.63 at top10 and 0.06 at top01; that is the measured result, not a failure); every returned ID passes the filter (or is -1); `filter=top01` returns only passing IDs. The report plots recall (y) against selectivity (x, log) per system at the default search setting, and latency likewise.
+
+## 12. Concurrency (Phase 4)
+
+Phase 4 measures throughput and tail latency when many clients search at once, and when inserts happen during searches. It applies to `hnsw` in the four languages and to the three databases (all their indexes); the other hand-built indexes are read-only and out of scope.
+
+### 12.1 Load runs
+
+A **load run** is a `bench` invocation with `--clients C` (C ≥ 1). After the build and the warm-up, C worker threads (goroutines, rayon threads, std::thread, Python threads) each loop over the 1,000 queries in a closed loop (send the next query as soon as the previous answer returns) for `--duration S` seconds (default 20). Each worker records its own per-query latency. The run reports, per search setting:
+
+- `qps` = completed queries / wall time of the loop;
+- `latency_ms` = all per-query latencies from all workers (the report computes p50, p90, p99);
+- `errors` = failed queries;
+- `cpu_pct` = process CPU time during the loop / wall time × 100 (`getrusage` before and after);
+- `ids` and `scores` of the **first** pass over the 1,000 queries by worker 0, so recall can still be checked;
+- `extra.clients`, `extra.duration_s`, `extra.queries_done`.
+
+With `--clients 1` and no `--duration`, `bench` behaves exactly as before (one pass, one thread), so the existing JSON stays valid. The runner sweeps `clients` over 1, 2, 4, 8, 16, 32, 64 at the default search setting.
+
+### 12.2 Inserts during searches
+
+`--insert-rate R` (rows per second, default 0) starts one inserter thread during the loop. The build uses the first 90% of the rows (`--limit` still applies first); the inserter adds the remaining 10% in batches of 100 rows at rate R until they are exhausted or the loop ends. Row IDs stay the row indices, so the ground truth is unchanged. Report `extra.inserted_rows`, `extra.insert_p50_ms` (per batch), and a final one-thread pass over the queries after the loop as `searches[-1]` with `search_params.phase = "after_inserts"`, whose recall against the full ground truth must be within 0.01 of a static build on 100% of the rows (test).
+
+**HNSW under concurrent insert and search.** Searches take no locks and read neighbor lists that inserts may be changing. Each node's slot array and count are read and written with atomic operations (relaxed loads for search, release stores for insert; C++ `std::atomic<int32_t>`, Rust `AtomicI32`, Go `sync/atomic`), the count is written after the slots, and a search that reads a count then the slots may see a shorter or longer list but never a torn value. Inserts keep the per-node lock stripe from the build. The entry point and top layer change under the global lock. The repair pass runs once after the inserter finishes. Python: the GIL serializes Python-level steps; use `threading` workers (NumPy releases the GIL in the dot products) and a lock per node list; say what is and is not concurrent.
+
+### 12.3 Databases
+
+`tools/load/bench.py` runs the same protocol against a database: C client connections (one per worker thread), closed loop, `--duration`, the inserter through the client's `load` in batches of 100 at rate R, then the after-inserts pass. Output: the same JSON with `language` = the database name.
+
+### 12.4 Report
+
+`tools/bench/report.py` adds, from runs with `extra.clients` present: `<index>-load.png` with two panels, QPS against clients and p99 against clients (log x), one line per system; and a `cpu_pct` column. Runs with inserts are separate lines labeled `+inserts`.
+
+### 12.5 Tests
+
+For each language's hnsw and each database: `--clients 8 --duration 5` on 20,000 rows gives qps > 1-client qps, zero errors, and recall of the first pass ≥ the one-thread floor; `--clients 4 --duration 10 --insert-rate 2000` on 20,000 rows (build on 18,000) gives zero errors, `inserted_rows` = 2,000, and after-inserts recall within 0.01 of a static build on 20,000 rows. Tests must stop their database afterwards.
