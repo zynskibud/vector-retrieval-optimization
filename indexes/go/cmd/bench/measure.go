@@ -68,8 +68,12 @@ func benchmark(o options, spec indexSpec, vectors []float32, n, dim int, queries
 	}
 	res.Extra = map[string]any{}
 	if ins != nil {
-		// Repair once after the inserter finished, then one one-thread pass
-		// with the first search setting as searches[-1].
+		// Rows left when the loops ended go in untimed (the insert tail),
+		// then Repair once, then one one-thread pass with the first search
+		// setting as searches[-1].
+		duringLoop := ins.next - nBuild
+		_, tailS := ins.tail()
+		fmt.Fprintf(os.Stderr, "bench: insert tail: %d rows in %.2f s\n", ins.end-nBuild-duringLoop, tailS)
 		inst.repair()
 		sp := make(map[string]any, len(searchSets[0])+1)
 		for key, v := range searchSets[0] {
@@ -82,10 +86,14 @@ func benchmark(o options, spec indexSpec, vectors []float32, n, dim int, queries
 		after.Extra["inserted_rows"] = inserted
 		after.Extra["insert_p50_ms"] = median(ins.batchMS)
 		after.Extra["insert_errors"] = ins.errors
+		after.Extra["inserted_during_loop"] = duringLoop
+		after.Extra["insert_tail_s"] = tailS
 		res.Searches = append(res.Searches, after)
 		res.Extra["inserted_rows"] = inserted
 		res.Extra["insert_p50_ms"] = median(ins.batchMS)
 		res.Extra["insert_rate"] = o.insertRate
+		res.Extra["inserted_during_loop"] = duringLoop
+		res.Extra["insert_tail_s"] = tailS
 		res.Extra["build_rows"] = nBuild
 	}
 	for key, v := range inst.idx.Extra() {

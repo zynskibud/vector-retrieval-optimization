@@ -176,18 +176,23 @@ func TestLoadInsert(t *testing.T) {
 	if after.SearchParams["phase"] != "after_inserts" {
 		t.Errorf("last search phase = %v", after.SearchParams["phase"])
 	}
-	if raceEnabled {
-		t.Logf("-race: inserted %v rows; count and recall checks skipped (inserts are too slow under -race)", doc.Extra["inserted_rows"])
-		return
-	}
 	for _, m := range []map[string]any{doc.Extra, after.Extra} {
 		if got := num(t, m, "inserted_rows"); got != 2000 {
-			t.Errorf("inserted_rows = %v, want 2000", got)
+			t.Errorf("inserted_rows = %v, want 2000 (the insert tail adds what the loop left)", got)
 		}
 		num(t, m, "insert_p50_ms")
+		num(t, m, "insert_tail_s")
+		if d := num(t, m, "inserted_during_loop"); d < 0 || d > 2000 {
+			t.Errorf("inserted_during_loop = %v", d)
+		}
 	}
+	t.Logf("inserted during loop %v, tail %v s", doc.Extra["inserted_during_loop"], doc.Extra["insert_tail_s"])
 	if got := num(t, doc.Extra, "build_rows"); got != 18000 {
 		t.Errorf("build_rows = %v, want 18000", got)
+	}
+	if raceEnabled {
+		t.Log("-race: recall comparison skipped")
+		return
 	}
 	rs, ra, rl := recallOf(static.Searches[0].IDs, truth), recallOf(after.IDs, truth), recallOf(load.IDs, truth)
 	t.Logf("static 20k recall %.4f, after-inserts %.4f, load first pass %.4f; load qps %.0f, insert_p50_ms %.2f, extra %v",

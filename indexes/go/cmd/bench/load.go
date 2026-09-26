@@ -67,23 +67,34 @@ type inserter struct {
 	errors    int
 }
 
+// tail inserts every remaining row with no rate limit and no stop signal
+// (the "insert tail" of section 12.2). It returns the rows and the seconds.
+func (in *inserter) tail() (int, float64) {
+	t0 := time.Now()
+	n := in.run(nil)
+	return n, time.Since(t0).Seconds()
+}
+
 // run inserts batches until the rows are exhausted or stop is closed. Batch j
-// of this call is due at start + j * insertBatch / rate.
+// of this call is due at start + j * insertBatch / rate. With stop == nil it
+// inserts without waiting until the rows are exhausted.
 func (in *inserter) run(stop <-chan struct{}) (inserted int) {
 	start := time.Now()
 	interval := time.Duration(float64(insertBatch) / in.rate * float64(time.Second))
 	for j := 0; in.next < in.end; j++ {
-		if wait := time.Until(start.Add(time.Duration(j) * interval)); wait > 0 {
+		if wait := time.Until(start.Add(time.Duration(j) * interval)); wait > 0 && stop != nil {
 			select {
 			case <-stop:
 				return inserted
 			case <-time.After(wait):
 			}
 		}
-		select {
-		case <-stop:
-			return inserted
-		default:
+		if stop != nil {
+			select {
+			case <-stop:
+				return inserted
+			default:
+			}
 		}
 		hi := min(in.next+insertBatch, in.end)
 		ids := make([]int64, hi-in.next)
