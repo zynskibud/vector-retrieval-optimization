@@ -89,6 +89,7 @@ uv run python -m tools.data.verify       # Phase 0 checks; must print 10 PASS li
 uv run python -m tools.data.subset       # 100k-row dev dataset in data/processed/dev/
 uv run python -m tools.data.verify --data data/processed/dev
 uv run python -m tools.data.filters [--data DIR]   # Phase 3: filter masks and per-filter ground truth (host)
+uv run python -m tools.data.changes [--data DIR]   # Phase 5: delete sets, update set, and their ground truth (host)
 
 uv run python -m tools.bench.schema FILE.json           # validate a bench output against CONTRACT section 3
 uv run python -m tools.bench.faiss_ref --index hnsw --data data/processed/dev --out r.json --search ef=64   # FAISS reference, same CLI as bench
