@@ -10,7 +10,7 @@ Six vector search indexes built by hand in Python, Go, C++, and Rust, checked ag
 | 1 | Indexes by hand, checked against FAISS | In progress: all 24 implementations (6 indexes × 4 languages) done and tested; dev-set sweeps for IVF_PQ and DiskANN running; full-corpus runs next |
 | 2 | Three databases | In progress: Qdrant, pgvector, Milvus clients and tests done inside Docker; the database sweeps wait for the machine lock |
 | 3 | Metadata filtering | Code done: filter= on flat, IVF, HNSW in all four languages, FAISS, and the three databases; sweeps wait for the machine lock |
-| 4 | Concurrency | Not started |
+| 4 | Concurrency | Code done: closed-loop clients 1..64 and inserts during search for HNSW in all four languages and for the three databases; the load sweep waits for the machine lock |
 | 5 | Updates and deletes | Not started |
 | 6 | Embedding cache | Not started |
 | 7 | Backup and restore | Not started |
