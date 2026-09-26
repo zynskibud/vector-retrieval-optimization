@@ -118,6 +118,12 @@ docker compose run --rm bench ctest --test-dir indexes/cpp/build -R '^hnsw$' --o
 docker compose run --rm bench indexes/rust/target/release/bench --index flat --data data/processed/dev --out results/raw/dev/x.json
 make bench ARGS="--data data/processed/dev --languages rust,cpp --indexes flat --repeat 3"
 make report ARGS="--data data/processed/dev"
+make db-up DB=qdrant && make db-test DB=qdrant; make db-down DB=qdrant        # Phase 2/3: one database at a time
+make dbbench ARGS="--db qdrant --index hnsw --data data/processed/dev --out results/raw/dev/x.json --search ef=64"
+make load ARGS="--data data/processed/dev --languages rust,cpp,go,python"     # Phase 4: hnsw load runs, clients 1..64 (timing: lock)
+make load-db ARGS="--data data/processed/dev --languages qdrant"               # Phase 4: databases, dbbench container
+docker compose --profile db run --rm dbbench uv run --frozen python -m tools.load.bench --db qdrant --index hnsw --data data/processed/dev --out results/raw/dev/x.json --clients 8 --duration 20
+scripts/run.sh dev-sweep | db-sweep | load-sweep                               # timing jobs, only after the coordinator's GO
 ```
 
 Rules:
