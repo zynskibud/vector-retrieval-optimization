@@ -15,10 +15,6 @@ from indexes.python.npy import read_npy
 
 DEV = "data/processed/dev"
 LIMIT = 20000
-# CONTRACT 12.5 says --duration 10. Under the GIL the inserter shares one core with 4 search
-# threads and measured about 40 rows/s here (400 of 2,000 rows in 10 s), so this test runs
-# longer to insert all 2,000 rows.
-INSERT_DURATION = "90"
 LOAD_KEYS = {"errors", "cpu_pct", "clients", "duration_s", "queries_done"}
 
 
@@ -61,17 +57,19 @@ def test_clients_8(tmp_path, truth, static):
 
 
 def test_inserts(tmp_path, truth, static):
-    r = bench_json(tmp_path, "ins", "--clients", "4", "--duration", INSERT_DURATION, "--insert-rate", "2000")
+    r = bench_json(tmp_path, "ins", "--clients", "4", "--duration", "10", "--insert-rate", "2000")
     assert r["n"] == LIMIT
     loop, after = r["searches"]
     assert loop["extra"]["errors"] == 0
     assert after["search_params"]["phase"] == "after_inserts"
     assert after["extra"]["inserted_rows"] == 2000
     assert after["extra"]["insert_p50_ms"] > 0
+    assert 0 <= after["extra"]["inserted_during_loop"] <= 2000 and after["extra"]["insert_tail_s"] >= 0
     rec_after = recall(after["ids"], truth)
     rec_static = recall(static["searches"][0]["ids"], truth)
     print(f"after-inserts recall {rec_after:.4f}, static recall {rec_static:.4f}, "
-          f"loop qps {loop['qps']:.1f}, insert p50 {after['extra']['insert_p50_ms']:.1f} ms/100 rows")
+          f"loop qps {loop['qps']:.1f}, insert p50 {after['extra']['insert_p50_ms']:.1f} ms/100 rows, "
+          f"during loop {after['extra']['inserted_during_loop']}, tail {after['extra']['insert_tail_s']:.1f} s")
     assert abs(rec_after - rec_static) <= 0.01
 
 

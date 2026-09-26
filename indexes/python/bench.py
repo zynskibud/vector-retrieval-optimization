@@ -226,11 +226,21 @@ def run_load_all(mod, index, vectors, queries, args, searches, n_build) -> list:
     n = len(vectors)
     stats = {"rows": 0, "batch_ms": []}
 
+    stats["next"] = n_build
+
+    def add_batch():
+        row = stats["next"]
+        batch = list(range(row, min(row + 100, n)))
+        b0 = time.perf_counter()
+        mod.insert(index, batch, vectors[batch[0] : batch[-1] + 1])
+        stats["batch_ms"].append((time.perf_counter() - b0) * 1000.0)
+        stats["next"] = batch[-1] + 1
+
     def inserter(deadline):
         rate = args.insert_rate
         t0 = time.perf_counter()
-        row = n_build
-        while row < n:
+        while stats["next"] < n:
+            row = stats["next"]
             due = t0 + (row - n_build) / rate  # paced: batch j starts at t0 + 100 j / R
             now = time.perf_counter()
             if now >= deadline:
@@ -238,31 +248,36 @@ def run_load_all(mod, index, vectors, queries, args, searches, n_build) -> list:
             if due > now:
                 time.sleep(min(due - now, deadline - now))
                 continue
-            batch = list(range(row, min(row + 100, n)))
-            b0 = time.perf_counter()
-            mod.insert(index, batch, vectors[batch[0] : batch[-1] + 1])
-            stats["batch_ms"].append((time.perf_counter() - b0) * 1000.0)
-            row = batch[-1] + 1
-            stats["rows"] = row - n_build
+            add_batch()
+        stats["rows"] = stats["next"] - n_build
 
     results = []
     for j, p in enumerate(searches):
         ins = inserter if (n_build is not None and j == 0) else None
         results.append(run_load(mod, index, queries, args.k, p, args.clients, args.duration, ins))
     if n_build is not None:
+        # CONTRACT 12.2 insert tail: untimed, no searches running, until every row is in.
+        during = stats["next"] - n_build
+        t0 = time.perf_counter()
+        while stats["next"] < n:
+            add_batch()
+        tail_s = time.perf_counter() - t0
+        stats["rows"] = stats["next"] - n_build
         t0 = time.perf_counter()
         added_a, added_b = mod.repair(index)
         repair_s = time.perf_counter() - t0
         final = run_search(mod, index, queries, args.k, {**searches[0], "phase": "after_inserts"})
         final["extra"].update({
             "inserted_rows": stats["rows"],
+            "inserted_during_loop": during,
+            "insert_tail_s": tail_s,
             "insert_p50_ms": float(np.median(stats["batch_ms"])) if stats["batch_ms"] else None,
             "insert_batches": len(stats["batch_ms"]),
             "repair_added": added_a,
             "repair_added_unreachable": added_b,
             "repair_s": repair_s,
         })
-        results[0]["extra"].update({"inserted_rows": stats["rows"],
+        results[0]["extra"].update({"inserted_rows": stats["rows"], "inserted_during_loop": during,
                                     "insert_p50_ms": final["extra"]["insert_p50_ms"]})
         results.append(final)
     return results
