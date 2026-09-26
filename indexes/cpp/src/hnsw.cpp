@@ -59,9 +59,11 @@ struct Visited {
     }
 };
 
-// Graph access during build and search. With locks == nullptr (search, or a
-// one-thread build) lists are read in place. Otherwise the list is copied
-// under the node's stripe lock.
+// Graph access during build and search. The list is copied into buf: under
+// the node's stripe lock if locks != nullptr (parallel build, insert), else
+// with atomic loads and no lock (search, one-thread build). Without the lock,
+// a concurrent insert can make the copy shorter or longer than the final
+// list, but every slot value is whole (CONTRACT 12.2); -1 slots are skipped.
 struct Access {
     const Index* ix;
     std::mutex* locks;  // nullptr or kStripes mutexes
@@ -70,11 +72,27 @@ struct Access {
     std::mutex& lock_of(std::int32_t node) const {
         return locks[static_cast<std::size_t>(node) & (kStripes - 1)];
     }
+    void copy(int l, std::int32_t node) {
+        std::size_t r = l == 0 ? static_cast<std::size_t>(node)
+                               : static_cast<std::size_t>(ix->ord1[static_cast<std::size_t>(node)]);
+        std::size_t slots = l == 0 ? ix->m0 : ix->m;
+        std::int32_t n = ix->counts[static_cast<std::size_t>(l)][r].load(std::memory_order_acquire);
+        if (static_cast<std::size_t>(n) > slots) n = static_cast<std::int32_t>(slots);
+        const std::atomic<std::int32_t>* p = ix->links[static_cast<std::size_t>(l)].data() + r * slots;
+        buf.clear();
+        for (std::int32_t j = 0; j < n; ++j) {
+            std::int32_t x = p[j].load(std::memory_order_acquire);
+            if (x >= 0) buf.push_back(x);
+        }
+    }
     const std::int32_t* list(int l, std::int32_t node, std::int32_t& n) {
-        if (!locks) return ix->neighbors(l, node, n);
-        std::lock_guard<std::mutex> g(lock_of(node));
-        const std::int32_t* p = ix->neighbors(l, node, n);
-        buf.assign(p, p + n);
+        if (locks) {
+            std::lock_guard<std::mutex> g(lock_of(node));
+            copy(l, node);
+        } else {
+            copy(l, node);
+        }
+        n = static_cast<std::int32_t>(buf.size());
         return buf.data();
     }
 };
@@ -226,10 +244,12 @@ std::vector<Cand> scored(const Index& ix, std::int32_t node, std::vector<std::in
 
 // Caller holds node's lock (if any).
 void write_list(Index& ix, int l, std::int32_t node, const std::vector<std::int32_t>& nb) {
+    // Slots first, then the count, both with release order (CONTRACT 12.2).
     std::size_t r = slot_row(ix, l, node);
-    std::copy(nb.begin(), nb.end(),
-              ix.links[l].begin() + static_cast<std::ptrdiff_t>(r * cap(ix, l)));
-    ix.counts[l][r] = static_cast<std::int32_t>(nb.size());
+    std::atomic<std::int32_t>* base = ix.links[static_cast<std::size_t>(l)].data() + r * cap(ix, l);
+    for (std::size_t j = 0; j < nb.size(); ++j) base[j].store(nb[j], std::memory_order_release);
+    ix.counts[static_cast<std::size_t>(l)][r].store(static_cast<std::int32_t>(nb.size()),
+                                                   std::memory_order_release);
 }
 
 // Writes node's own list on layer l, merged with edges that other threads
@@ -238,7 +258,7 @@ void set_own_list(Index& ix, Access& a, int l, std::int32_t node, std::vector<st
     std::unique_lock<std::mutex> g;
     if (a.locks) g = std::unique_lock<std::mutex>(a.lock_of(node));
     std::int32_t n;
-    const std::int32_t* cur = ix.neighbors(l, node, n);
+    const auto* cur = ix.neighbors(l, node, n);
     if (n == 0) {
         write_list(ix, l, node, sel);
         return;
@@ -260,12 +280,14 @@ void add_edge(Index& ix, Access& a, int l, std::int32_t from, std::int32_t to) {
     if (a.locks) g = std::unique_lock<std::mutex>(a.lock_of(from));
     std::size_t r = slot_row(ix, l, from);
     std::size_t slots = cap(ix, l);
-    std::int32_t& cnt = ix.counts[l][r];
-    std::int32_t* base = ix.links[l].data() + r * slots;
+    std::atomic<std::int32_t>& cnt_a = ix.counts[static_cast<std::size_t>(l)][r];
+    std::int32_t cnt = cnt_a.load(std::memory_order_relaxed);
+    std::atomic<std::int32_t>* base = ix.links[static_cast<std::size_t>(l)].data() + r * slots;
     for (std::int32_t j = 0; j < cnt; ++j)
-        if (base[j] == to) return;
+        if (base[j].load(std::memory_order_relaxed) == to) return;
     if (static_cast<std::size_t>(cnt) < slots) {
-        base[cnt++] = to;
+        base[cnt].store(to, std::memory_order_release);
+        cnt_a.store(cnt + 1, std::memory_order_release);
         return;
     }
     std::vector<std::int32_t> ids(base, base + cnt);
@@ -273,19 +295,15 @@ void add_edge(Index& ix, Access& a, int l, std::int32_t from, std::int32_t to) {
     write_list(ix, l, from, select_heuristic(ix, scored(ix, from, ids), slots));
 }
 
-struct Shared {
-    std::mutex ep_mu;  // guards entry and top
-};
-
-void insert(Index& ix, Access& a, Shared& sh, std::int32_t i, Visited& vis) {
+void insert_one(Index& ix, Access& a, std::int32_t i, Visited& vis) {
     const Matrix& v = *ix.vectors;
     const float* q = v.row(static_cast<std::size_t>(i));
     int li = ix.level[static_cast<std::size_t>(i)];
 
     std::unique_lock<std::mutex> ep_lock;
-    if (a.locks) ep_lock = std::unique_lock<std::mutex>(sh.ep_mu);
-    std::int32_t entry = ix.entry;
-    int top = ix.top;
+    if (a.locks) ep_lock = std::unique_lock<std::mutex>(*ix.ep_mu);
+    std::int32_t entry = ix.entry.load();
+    int top = ix.top.load();
     // A node that raises the top layer keeps the lock for its whole insert.
     if (ep_lock.owns_lock() && li <= top) ep_lock.unlock();
     if (entry < 0) {
@@ -310,18 +328,18 @@ void insert(Index& ix, Access& a, Shared& sh, std::int32_t i, Visited& vis) {
         for (std::int32_t e : nb) add_edge(ix, a, l, e, i);
         eps = std::move(w);
     }
-    if (li > top) {
+    if (li > top) {  // still under ep_mu (kept above)
         ix.top = li;
-        ix.entry = i;
+        ix.entry = i;  // published after i's lists are linked
     }
 }
 
 std::vector<std::int32_t> in_degree0(const Index& ix) {
-    const std::size_t n = ix.vectors->rows;
+    const std::size_t n = ix.n_live.load();
     std::vector<std::int32_t> indeg(n, 0);
     for (std::size_t i = 0; i < n; ++i) {
         std::int32_t c;
-        const std::int32_t* nb = ix.neighbors(0, static_cast<std::int32_t>(i), c);
+        const auto* nb = ix.neighbors(0, static_cast<std::int32_t>(i), c);
         for (std::int32_t j = 0; j < c; ++j) ++indeg[static_cast<std::size_t>(nb[j])];
     }
     std::vector<std::int32_t> zero;
@@ -332,13 +350,13 @@ std::vector<std::int32_t> in_degree0(const Index& ix) {
 }
 
 std::vector<char> reachable0(const Index& ix) {
-    const std::size_t n = ix.vectors->rows;
+    const std::size_t n = ix.n_live.load();
     std::vector<char> seen(n, 0);
     std::vector<std::int32_t> queue{ix.entry};
     seen[static_cast<std::size_t>(ix.entry)] = 1;
     for (std::size_t h = 0; h < queue.size(); ++h) {
         std::int32_t c;
-        const std::int32_t* nb = ix.neighbors(0, queue[h], c);
+        const auto* nb = ix.neighbors(0, queue[h], c);
         for (std::int32_t j = 0; j < c; ++j)
             if (!seen[static_cast<std::size_t>(nb[j])]) {
                 seen[static_cast<std::size_t>(nb[j])] = 1;
@@ -355,7 +373,7 @@ using Protected = std::map<std::int32_t, std::vector<std::int32_t>>;
 // the repair added earlier are protected; the heuristic picks the rest.
 bool repair_edge(Index& ix, Protected& prot, std::int32_t u, std::int32_t vtx) {
     std::int32_t cu;
-    const std::int32_t* nu = ix.neighbors(0, u, cu);
+    const auto* nu = ix.neighbors(0, u, cu);
     std::vector<std::int32_t> ids(nu, nu + cu);
     if (std::find(ids.begin(), ids.end(), vtx) != ids.end()) return false;
     std::vector<std::int32_t>& keep = prot[u];
@@ -396,7 +414,7 @@ void repair(Index& ix) {
         if (pass == 0) ix.zero_in_before_repair = zero.size();
         for (std::int32_t vtx : zero) {
             std::int32_t c;
-            const std::int32_t* nb = ix.neighbors(0, vtx, c);
+            const auto* nb = ix.neighbors(0, vtx, c);
             std::int32_t u = -1;
             if (c > 0) {
                 u = scored(ix, vtx, std::vector<std::int32_t>(nb, nb + c)).front().id;
@@ -419,7 +437,7 @@ void repair(Index& ix) {
             for (const Cand& x : search_from_entry(ix, vtx, vis)) {
                 if (x.id == vtx) continue;
                 if (u < 0) u = x.id;
-                if (static_cast<std::size_t>(ix.counts[0][static_cast<std::size_t>(x.id)]) < ix.m0) {
+                if (static_cast<std::size_t>(ix.counts[0][static_cast<std::size_t>(x.id)].load()) < ix.m0) {
                     u_free = x.id;
                     break;
                 }
@@ -446,14 +464,14 @@ std::vector<std::uint8_t> draw_levels(std::size_t n, std::size_t m, std::uint64_
 }
 
 std::size_t unreachable_layer0(const Index& ix) {
-    const std::size_t n = ix.vectors->rows;
+    const std::size_t n = ix.n_live.load();
     if (ix.entry < 0) return n;
     std::vector<char> seen(n, 0);
     std::vector<std::int32_t> queue{ix.entry};
     seen[static_cast<std::size_t>(ix.entry)] = 1;
     for (std::size_t h = 0; h < queue.size(); ++h) {
         std::int32_t c;
-        const std::int32_t* nb = ix.neighbors(0, queue[h], c);
+        const auto* nb = ix.neighbors(0, queue[h], c);
         for (std::int32_t j = 0; j < c; ++j)
             if (!seen[static_cast<std::size_t>(nb[j])]) {
                 seen[static_cast<std::size_t>(nb[j])] = 1;
@@ -478,47 +496,50 @@ Index build(Matrix& vectors, const Params& params, const BuildContext& ctx) {
     ix.m0 = 2 * ix.m;
     ix.ef_construct = static_cast<std::size_t>(efc);
     ix.threads = std::max(1, ctx.threads);
-    const std::size_t n = vectors.rows;
+    const std::size_t n_all = vectors.rows;  // storage and levels for every row
+    const std::size_t n = ctx.build_rows > 0 ? std::min(ctx.build_rows, n_all) : n_all;
 
     auto t0 = std::chrono::steady_clock::now();
-    ix.level = draw_levels(n, ix.m, ctx.seed);
+    ix.level = draw_levels(n_all, ix.m, ctx.seed);  // one stream, row order, all rows
     int max_level = 0;
-    ix.ord1.assign(n, -1);
-    for (std::size_t i = 0; i < n; ++i) {
+    ix.ord1.assign(n_all, -1);
+    for (std::size_t i = 0; i < n_all; ++i) {
         max_level = std::max(max_level, static_cast<int>(ix.level[i]));
         if (ix.level[i] >= 1) ix.ord1[i] = static_cast<std::int32_t>(ix.n_upper++);
     }
     ix.links.resize(static_cast<std::size_t>(max_level) + 1);
     ix.counts.resize(static_cast<std::size_t>(max_level) + 1);
-    ix.links[0].assign(n * ix.m0, -1);
-    ix.counts[0].assign(n, 0);
+    ix.links[0].assign(n_all * ix.m0, -1);
+    ix.counts[0].assign(n_all, 0);
     for (int l = 1; l <= max_level; ++l) {
         ix.links[l].assign(ix.n_upper * ix.m, -1);
         ix.counts[l].assign(ix.n_upper, 0);
     }
 
-    Shared sh;
+    ix.locks.reset(new std::mutex[kStripes]);  // kept for insert()
+    ix.ep_mu = std::make_unique<std::mutex>();
+    std::mutex* locks = ix.locks.get();
+    ix.n_live = n;
     if (ix.threads == 1 || n < 2) {
         Access a{&ix, nullptr, {}};
         Visited vis;
-        for (std::size_t i = 0; i < n; ++i) insert(ix, a, sh, static_cast<std::int32_t>(i), vis);
+        for (std::size_t i = 0; i < n; ++i) insert_one(ix, a, static_cast<std::int32_t>(i), vis);
     } else {
-        std::unique_ptr<std::mutex[]> locks(new std::mutex[kStripes]);
         {
-            Access a{&ix, locks.get(), {}};
+            Access a{&ix, locks, {}};
             Visited vis;
-            insert(ix, a, sh, 0, vis);  // row 0 sets the first entry point
+            insert_one(ix, a, 0, vis);  // row 0 sets the first entry point
         }
         std::atomic<std::size_t> next{1};
         std::vector<std::thread> pool;
         for (int t = 0; t < ix.threads; ++t)
             pool.emplace_back([&] {
-                Access a{&ix, locks.get(), {}};
+                Access a{&ix, locks, {}};
                 Visited vis;
                 // Chunks of 64 consecutive rows keep near-duplicates in order.
                 for (std::size_t c0 = next.fetch_add(kChunk); c0 < n; c0 = next.fetch_add(kChunk))
                     for (std::size_t i = c0; i < std::min(n, c0 + kChunk); ++i)
-                        insert(ix, a, sh, static_cast<std::int32_t>(i), vis);
+                        insert_one(ix, a, static_cast<std::int32_t>(i), vis);
             });
         for (auto& th : pool) th.join();
     }
@@ -536,17 +557,19 @@ SearchResult search(const Index& ix, const float* query, std::size_t k, const Pa
     r.ids.assign(k, -1);
     r.scores.assign(k, -std::numeric_limits<float>::infinity());
     r.distance_computations = 0;
-    if (ix.entry < 0 || k == 0) return r;
+    const std::int32_t entry = ix.entry.load();  // top = level[entry], read no second value
+    if (entry < 0 || k == 0) return r;
     long long ef_p = params.get_int("ef");
     if (ef_p < 1) throw ParamError("hnsw: ef must be >= 1");
     std::size_t ef = std::max(static_cast<std::size_t>(ef_p), k);
 
     const Matrix& v = *ix.vectors;
-    Access a{&ix, nullptr, {}};
+    thread_local Access a{nullptr, nullptr, {}};  // per-thread scratch, no shared lock
+    a.ix = &ix;
     std::int64_t dc = 0;
-    Cand cur{dot(query, v.row(static_cast<std::size_t>(ix.entry)), v.dim), ix.entry};
+    Cand cur{dot(query, v.row(static_cast<std::size_t>(entry)), v.dim), entry};
     ++dc;
-    for (int l = ix.top; l >= 1; --l) cur = greedy(a, query, cur, l, dc);
+    for (int l = ix.level[static_cast<std::size_t>(entry)]; l >= 1; --l) cur = greedy(a, query, cur, l, dc);
     thread_local Visited vis;
     const FilterMask* f = get_filter(ix.data_dir, params, v.rows);
     std::int64_t expanded = 0;
@@ -567,7 +590,7 @@ std::size_t index_bytes(const Index& ix) {
     std::size_t edges = 0, counts = 0;
     for (const auto& c : ix.counts) {
         counts += c.size() * sizeof(std::int32_t);
-        for (std::int32_t x : c) edges += static_cast<std::size_t>(x);
+        for (std::size_t i = 0; i < c.size(); ++i) edges += static_cast<std::size_t>(c[i].load());
     }
     return edges * sizeof(std::int32_t) +
            ix.level.size() * (sizeof(std::uint8_t) + sizeof(std::int32_t)) + counts;
@@ -584,11 +607,33 @@ std::map<std::string, double> extra(const Index& ix) {
     e["repair_passes"] = static_cast<double>(ix.repair_passes);
     e["build_threads"] = ix.threads;
     std::vector<std::size_t> per(ix.links.size(), 0);
-    for (std::uint8_t lv : ix.level)
-        for (std::size_t l = 0; l <= lv && l < per.size(); ++l) ++per[l];
+    for (std::size_t i = 0; i < ix.n_live.load(); ++i)
+        for (std::size_t l = 0, lv = ix.level[i]; l <= lv && l < per.size(); ++l) ++per[l];
     for (std::size_t l = 0; l < per.size(); ++l)
         e["nodes_layer_" + std::to_string(l)] = static_cast<double>(per[l]);
     return e;
+}
+
+void insert(Index& ix, const std::vector<std::int64_t>& ids, const Matrix& rows) {
+    if (rows.rows != ids.size() || rows.dim != ix.vectors->dim)
+        throw std::runtime_error("hnsw insert: ids and rows differ in shape");
+    Matrix& v = *ix.vectors;
+    Access a{&ix, ix.locks.get(), {}};
+    thread_local Visited vis;
+    for (std::size_t j = 0; j < ids.size(); ++j) {
+        std::int64_t id = ids[j];
+        if (id < static_cast<std::int64_t>(ix.n_live.load()) || static_cast<std::size_t>(id) >= v.rows)
+            throw std::runtime_error("hnsw insert: row " + std::to_string(id) + " is not free");
+        // The vector is written before any edge to the node exists.
+        std::copy(rows.row(j), rows.row(j) + v.dim, v.row(static_cast<std::size_t>(id)));
+        insert_one(ix, a, static_cast<std::int32_t>(id), vis);
+        std::size_t live = ix.n_live.load();
+        if (static_cast<std::size_t>(id) + 1 > live) ix.n_live.store(static_cast<std::size_t>(id) + 1);
+    }
+}
+
+void repair_after_inserts(Index& ix) {
+    if (ix.entry.load() >= 0) repair(ix);
 }
 
 }  // namespace vro::hnsw

@@ -6,6 +6,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -16,6 +17,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include "common.hpp"
@@ -85,7 +87,11 @@ const std::map<std::string, IndexSpec>& index_specs() {
           {{"nprobe", "8", PType::kInt, {}}, {"rerank", "0", PType::kInt, {}}}}},
         {"hnsw",
          {{{"m", "16", PType::kInt, {}}, {"ef_construct", "100", PType::kInt, {}}},
-          {{"ef", "64", PType::kInt, {}}, {"filter", "none", PType::kString, kFilters}}}},
+          {{"ef", "64", PType::kInt, {}},
+           {"filter", "none", PType::kString, kFilters},
+           // CONTRACT 12.2: set by bench on the pass after inserts; no default,
+           // so the JSON of other runs is unchanged.
+           {"phase", "", PType::kString, {"after_inserts"}}}}},
         {"diskann",
          {{{"r", "64", PType::kInt, {}},
            {"l_build", "100", PType::kInt, {}},
@@ -150,6 +156,7 @@ void fill_defaults(const std::vector<ParamSpec>& specs, Params& p) {
 json params_to_json(const std::vector<ParamSpec>& specs, const Params& p) {
     json out = json::object();
     for (const auto& s : specs) {
+        if (!p.has(s.key)) continue;  // optional key with no default (hnsw phase)
         if (s.type == PType::kInt) out[s.key] = p.get_int(s.key);
         else if (s.type == PType::kFloat) out[s.key] = p.get_double(s.key);
         else out[s.key] = p.get_string(s.key);
@@ -166,6 +173,9 @@ struct Args {
     std::uint64_t seed = 42;
     std::size_t warmup = 100;
     std::size_t limit = 0;
+    int clients = 1;           // CONTRACT 12.1
+    double duration = 0.0;     // seconds; 0 = one pass (or 20 s in a load run)
+    double insert_rate = 0.0;  // rows per second; CONTRACT 12.2
     std::vector<std::string> build;
     std::vector<std::string> search;
 };
@@ -175,6 +185,14 @@ long long parse_int_flag(const std::string& flag, const std::string& value, long
     long long v = std::strtoll(value.c_str(), &end, 10);
     if (value.empty() || *end != '\0' || v < min)
         throw UsageError(flag + " needs an integer >= " + std::to_string(min) + ", got: " + value);
+    return v;
+}
+
+double parse_num_flag(const std::string& flag, const std::string& value) {
+    char* end = nullptr;
+    double v = std::strtod(value.c_str(), &end);
+    if (value.empty() || *end != '\0' || !(v >= 0.0) || std::isinf(v))
+        throw UsageError(flag + " needs a number >= 0, got: " + value);
     return v;
 }
 
@@ -194,12 +212,20 @@ Args parse_args(int argc, char** argv) {
         else if (flag == "--seed") a.seed = static_cast<std::uint64_t>(parse_int_flag(flag, v, 0));
         else if (flag == "--warmup") a.warmup = static_cast<std::size_t>(parse_int_flag(flag, v, 0));
         else if (flag == "--limit") a.limit = static_cast<std::size_t>(parse_int_flag(flag, v, 1));
+        else if (flag == "--clients") a.clients = static_cast<int>(parse_int_flag(flag, v, 1));
+        else if (flag == "--duration") a.duration = parse_num_flag(flag, v);
+        else if (flag == "--insert-rate") a.insert_rate = parse_num_flag(flag, v);
         else throw UsageError("unknown option: " + flag);
     }
     if (a.index.empty()) throw UsageError("missing --index");
     if (a.data.empty()) throw UsageError("missing --data");
     if (a.out.empty()) throw UsageError("missing --out");
     if (!index_specs().count(a.index)) throw UsageError("unknown index: " + a.index);
+    bool load = a.clients > 1 || a.duration > 0.0 || a.insert_rate > 0.0;
+    if (load && a.index != "hnsw")
+        throw UsageError("--clients, --duration, --insert-rate: only hnsw supports load runs, not " +
+                         a.index);
+    if (load && a.duration == 0.0) a.duration = 20.0;  // CONTRACT 12.1 default
     if (a.threads == 0) a.threads = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
     return a;
 }
@@ -212,6 +238,11 @@ struct AnyIndex {
     virtual SearchResult search(const float* q, std::size_t k, const Params& p) const = 0;
     virtual std::size_t bytes() const = 0;
     virtual std::map<std::string, double> extra() const = 0;
+    // CONTRACT 12.2. Only hnsw implements these; the others throw.
+    virtual void insert(const std::vector<std::int64_t>&, const Matrix&) {
+        throw UsageError("insert is supported only by hnsw");
+    }
+    virtual void finish_inserts() { throw UsageError("insert is supported only by hnsw"); }
 };
 
 template <typename Idx, SearchResult (*Search)(const Idx&, const float*, std::size_t, const Params&),
@@ -224,6 +255,14 @@ struct Wrapped : AnyIndex {
     }
     std::size_t bytes() const override { return Bytes(idx); }
     std::map<std::string, double> extra() const override { return Extra(idx); }
+    void insert(const std::vector<std::int64_t>& ids, const Matrix& rows) override {
+        if constexpr (std::is_same_v<Idx, hnsw::Index>) hnsw::insert(idx, ids, rows);
+        else AnyIndex::insert(ids, rows);
+    }
+    void finish_inserts() override {
+        if constexpr (std::is_same_v<Idx, hnsw::Index>) hnsw::repair_after_inserts(idx);
+        else AnyIndex::finish_inserts();
+    }
     Idx idx;
 };
 
@@ -345,6 +384,157 @@ json run_search(const AnyIndex& index, const Matrix& queries, std::size_t k, con
     return out;
 }
 
+// ---------- Load runs (CONTRACT 12) ----------
+
+double cpu_seconds() {
+    rusage ru{};
+    getrusage(RUSAGE_SELF, &ru);
+    auto tv = [](const timeval& t) {
+        return static_cast<double>(t.tv_sec) + static_cast<double>(t.tv_usec) / 1e6;
+    };
+    return tv(ru.ru_utime) + tv(ru.ru_stime);
+}
+
+double median(std::vector<double> v) {
+    if (v.empty()) return 0.0;
+    std::sort(v.begin(), v.end());
+    std::size_t h = v.size() / 2;
+    return v.size() % 2 ? v[h] : 0.5 * (v[h - 1] + v[h]);
+}
+
+// Rows that the inserter adds, and what it measured.
+struct InsertJob {
+    std::vector<std::int64_t> ids;  // row IDs, in order
+    Matrix rows;                    // their vectors, same order
+    double rate = 0.0;              // rows per second
+    std::size_t inserted = 0;
+    std::vector<double> batch_ms;
+};
+
+constexpr std::size_t kInsertBatch = 100;
+
+// One load run: C closed-loop workers for duration_s seconds; with job != nullptr,
+// one inserter thread at job->rate during the loop. Worker 0 finishes its first
+// pass over the queries also if the time is up, so ids and scores are complete.
+json run_load(AnyIndex& index, const Matrix& queries, std::size_t k, const Params& p,
+              const std::vector<ParamSpec>& specs, int clients, double duration_s,
+              InsertJob* job) {
+    using clock = std::chrono::steady_clock;
+    const std::size_t q = queries.rows;
+    std::vector<std::vector<double>> lat(static_cast<std::size_t>(clients));
+    std::vector<std::size_t> errors(static_cast<std::size_t>(clients), 0);
+    std::vector<SearchResult> first(q);
+    std::atomic<bool> stop{false};
+    std::atomic<bool> insert_failed{false};
+    std::string insert_error;
+
+    double cpu0 = cpu_seconds();
+    const auto t0 = clock::now();
+    const auto t_end = t0 + std::chrono::duration_cast<clock::duration>(
+                                std::chrono::duration<double>(duration_s));
+    std::vector<std::thread> workers;
+    for (int w = 0; w < clients; ++w)
+        workers.emplace_back([&, w] {
+            auto& my_lat = lat[static_cast<std::size_t>(w)];
+            my_lat.reserve(1 << 16);
+            for (std::size_t n = 0;; ++n) {
+                std::size_t i = n % q;
+                bool first_pass = w == 0 && n < q;
+                if (!first_pass && clock::now() >= t_end) break;
+                auto ts = clock::now();
+                try {
+                    SearchResult r = index.search(queries.row(i), k, p);
+                    my_lat.push_back(seconds_since(ts) * 1000.0);
+                    if (first_pass) first[i] = std::move(r);
+                } catch (const std::exception&) {
+                    ++errors[static_cast<std::size_t>(w)];
+                }
+            }
+        });
+    std::thread inserter;
+    if (job)
+        inserter = std::thread([&] {
+            std::size_t done = 0;
+            for (std::size_t b = 0; done < job->ids.size() && !stop.load(); ++b) {
+                auto due = t0 + std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(
+                                    static_cast<double>(b * kInsertBatch) / job->rate));
+                if (due >= t_end) break;
+                std::this_thread::sleep_until(due);
+                if (stop.load() || clock::now() >= t_end) break;
+                std::size_t cnt = std::min(kInsertBatch, job->ids.size() - done);
+                std::vector<std::int64_t> ids(job->ids.begin() + static_cast<std::ptrdiff_t>(done),
+                                              job->ids.begin() + static_cast<std::ptrdiff_t>(done + cnt));
+                Matrix rows;
+                rows.dim = job->rows.dim;
+                rows.rows = cnt;
+                rows.data.assign(job->rows.row(done), job->rows.row(done) + cnt * rows.dim);
+                auto ts = clock::now();
+                try {
+                    index.insert(ids, rows);
+                } catch (const std::exception& e) {
+                    insert_error = e.what();
+                    insert_failed = true;
+                    break;
+                }
+                job->batch_ms.push_back(seconds_since(ts) * 1000.0);
+                done += cnt;
+            }
+            job->inserted = done;
+        });
+    for (auto& t : workers) t.join();
+    double wall = seconds_since(t0);
+    double cpu = cpu_seconds() - cpu0;
+    stop = true;
+    if (inserter.joinable()) inserter.join();
+    if (insert_failed) throw std::runtime_error("insert failed: " + insert_error);
+
+    std::vector<double> all;
+    std::size_t err = 0;
+    for (std::size_t w = 0; w < lat.size(); ++w) {
+        all.insert(all.end(), lat[w].begin(), lat[w].end());
+        err += errors[w];
+    }
+    const std::size_t done = all.size();
+
+    json ids = json::array(), scores = json::array();
+    double dist_sum = 0.0;
+    bool counted = true;
+    std::map<std::string, double> counter_sums;
+    for (const auto& r : first) {
+        ids.push_back(r.ids);
+        json row = json::array();
+        for (float s : r.scores) row.push_back(score_to_json(s));
+        scores.push_back(std::move(row));
+        if (r.distance_computations < 0) counted = false;
+        dist_sum += static_cast<double>(r.distance_computations);
+        for (const auto& [key, v] : r.counters) counter_sums[key] += v;
+    }
+    const double qd = static_cast<double>(q);
+    json extra = json::object();  // first-pass counters (mean per query), then load fields
+    for (const auto& [key, sum] : counter_sums) extra[key] = sum / qd;
+    extra["errors"] = err;
+    extra["cpu_pct"] = cpu / wall * 100.0;
+    extra["clients"] = clients;
+    extra["duration_s"] = duration_s;
+    extra["queries_done"] = done;
+    if (job) {
+        extra["inserted_rows"] = job->inserted;
+        extra["insert_p50_ms"] = median(job->batch_ms);
+        extra["insert_rate"] = job->rate;
+    }
+
+    json out;
+    out["search_params"] = params_to_json(specs, p);
+    out["ids"] = std::move(ids);
+    out["scores"] = std::move(scores);
+    out["latency_ms"] = std::move(all);
+    out["total_s"] = wall;
+    out["qps"] = static_cast<double>(done) / wall;
+    out["distance_computations"] = counted ? json(dist_sum / qd) : json(nullptr);
+    out["extra"] = std::move(extra);
+    return out;
+}
+
 // ---------- Main flow ----------
 
 int run(int argc, char** argv) {
@@ -367,13 +557,32 @@ int run(int argc, char** argv) {
     Matrix queries = npy::read_f32(args.data + "/queries.npy");
     if (queries.dim != vectors.dim) throw std::runtime_error("queries and vectors differ in dim");
     std::size_t n = vectors.rows, dim = vectors.dim;
+    const bool load = args.clients > 1 || args.duration > 0.0;
+
+    // CONTRACT 12.2: build on the first 90% of the rows; the inserter adds the
+    // rest. The corpus Matrix keeps room for all n rows (hnsw pre-allocates its
+    // graph for n); the tail vectors move to the insert job and are zeroed in
+    // the corpus until insert() copies them back.
+    std::unique_ptr<InsertJob> job;
+    std::size_t build_rows = 0;
+    if (args.insert_rate > 0.0) {
+        build_rows = n * 9 / 10;
+        job = std::make_unique<InsertJob>();
+        job->rate = args.insert_rate;
+        job->rows.dim = dim;
+        job->rows.rows = n - build_rows;
+        job->rows.data.assign(vectors.row(build_rows), vectors.row(0) + n * dim);
+        std::fill(vectors.row(build_rows), vectors.row(0) + n * dim, 0.0f);
+        for (std::size_t i = build_rows; i < n; ++i) job->ids.push_back(static_cast<std::int64_t>(i));
+    }
     if (args.index == "ivf" && !build_params.has("train_size")) {
         auto nlist = static_cast<std::size_t>(build_params.get_int("nlist"));
         build_params.values["train_size"] = std::to_string(default_train_size(n, nlist));
     }
 
     BuildContext ctx{args.threads, args.seed, args.out, args.data};
-    std::cerr << "building " << args.index << " on " << n << " rows\n";
+    ctx.build_rows = build_rows;
+    std::cerr << "building " << args.index << " on " << (build_rows ? build_rows : n) << " rows\n";
     std::unique_ptr<AnyIndex> index = build_index(args.index, vectors, build_params, ctx);
     BuildTimes times = index->times();
 
@@ -400,13 +609,38 @@ int run(int argc, char** argv) {
     for (const auto& p : search_sets) {
         get_filter(args.data, p, n);  // load the mask before the timed pass (cached)
         std::cerr << "searching " << search_sets.size() << " set(s)\n";
-        searches.push_back(run_search(*index, queries, args.k, p, spec.search));
+        if (!load) {
+            searches.push_back(run_search(*index, queries, args.k, p, spec.search));
+            continue;
+        }
+        // Inserts run during the first search setting's loop only.
+        InsertJob* j = searches.empty() ? job.get() : nullptr;
+        searches.push_back(run_load(*index, queries, args.k, p, spec.search, args.clients,
+                                    args.duration, j));
+    }
+    if (job) {
+        index->finish_inserts();  // repair pass, once (CONTRACT 12.2)
+        Params after = search_sets.front();
+        after.values["phase"] = "after_inserts";
+        json s = run_search(*index, queries, args.k, after, spec.search);
+        s["extra"]["inserted_rows"] = job->inserted;
+        s["extra"]["insert_p50_ms"] = median(job->batch_ms);
+        searches.push_back(std::move(s));
     }
     doc["searches"] = std::move(searches);
     doc["machine"] = machine_info();
 
     json extra = json::object();
     for (const auto& [key, v] : index->extra()) extra[key] = v;
+    if (load) {
+        extra["clients"] = args.clients;
+        extra["duration_s"] = args.duration;
+    }
+    if (job) {
+        extra["build_rows"] = build_rows;
+        extra["inserted_rows"] = job->inserted;
+        extra["insert_p50_ms"] = median(job->batch_ms);
+    }
     doc["extra"] = std::move(extra);
 
     std::ofstream out(args.out);

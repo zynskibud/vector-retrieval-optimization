@@ -61,7 +61,7 @@ void test_graph(const vro::hnsw::Index& ix) {
         for (std::size_t i = 0; i < n; ++i) {
             if (ix.level[i] < l) continue;
             std::int32_t c;
-            const std::int32_t* nb = ix.neighbors(static_cast<int>(l), static_cast<std::int32_t>(i), c);
+            const auto* nb = ix.neighbors(static_cast<int>(l), static_cast<std::int32_t>(i), c);
             CHECK(c >= 0 && static_cast<std::size_t>(c) <= lim);
             for (std::int32_t j = 0; j < c; ++j) {
                 if (nb[j] < 0 || static_cast<std::size_t>(nb[j]) >= n || ix.level[nb[j]] < l ||
