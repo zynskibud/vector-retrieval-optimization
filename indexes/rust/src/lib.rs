@@ -64,10 +64,104 @@ pub trait AnnIndex: Send + Sync {
     fn supports_concurrency(&self) -> bool {
         false
     }
+    /// Marks every row `i` with `mask[i]` as deleted (CONTRACT 13.3: a tombstone).
+    /// `mask` holds one value per corpus row. Only flat, ivf, hnsw support it.
+    fn delete(&mut self, _mask: &[bool]) -> Result<(), String> {
+        Err("this index does not support deletes".into())
+    }
+    /// Replaces the vectors of rows `ids` (row-major `vectors`) under the same IDs
+    /// (CONTRACT 13.3). Only flat, ivf, hnsw support it.
+    fn update(&mut self, _ids: &[i64], _vectors: &[f32]) -> Result<(), String> {
+        Err("this index does not support updates".into())
+    }
+    /// Compaction of CONTRACT 13.3: drops the tombstoned rows (flat, ivf) or rebuilds
+    /// the graph from the live rows (hnsw).
+    fn compact(&mut self) -> Result<(), String> {
+        Err("this index does not support compaction".into())
+    }
+    /// The in-place repair of `--compact-mode repair` (CONTRACT 13.3). Only hnsw has one.
+    fn compact_repair(&mut self) -> Result<(), String> {
+        Err("this index has no in-place repair; use --compact-mode rebuild".into())
+    }
     /// Build-time keys for the top-level `"extra"` object of the output JSON.
     fn extra(&self) -> serde_json::Map<String, serde_json::Value> {
         serde_json::Map::new()
     }
+}
+
+/// The tombstone bit set of CONTRACT 13.3: bit i is set when row i is deleted.
+/// It holds one bit per corpus row, so it takes N/8 bytes.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Tombstones {
+    bits: Vec<u64>,
+    rows: usize,
+    deleted: usize,
+}
+
+impl Tombstones {
+    /// A bit set for `rows` rows with the bits of `mask` set (`mask.len()` must equal `rows`).
+    pub fn from_mask(mask: &[bool]) -> Self {
+        let mut t = Self {
+            bits: vec![0; mask.len().div_ceil(64)],
+            rows: mask.len(),
+            deleted: 0,
+        };
+        for (i, _) in mask.iter().enumerate().filter(|(_, &d)| d) {
+            t.bits[i / 64] |= 1 << (i % 64);
+            t.deleted += 1;
+        }
+        t
+    }
+    /// True when row `i` is deleted.
+    #[inline]
+    pub fn is_deleted(&self, i: usize) -> bool {
+        (self.bits[i / 64] >> (i % 64)) & 1 == 1
+    }
+    /// Number of deleted rows.
+    pub fn deleted(&self) -> usize {
+        self.deleted
+    }
+    /// Number of rows the bit set covers.
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+    /// Memory of the bit set: N/8 bytes, rounded up.
+    pub fn bytes(&self) -> u64 {
+        self.rows.div_ceil(8) as u64
+    }
+    /// One bool per row: true when the row is deleted.
+    pub fn to_mask(&self) -> Vec<bool> {
+        (0..self.rows).map(|i| self.is_deleted(i)).collect()
+    }
+}
+
+/// The delete change sets of CONTRACT 13.1.
+pub const DELETE_NAMES: [&str; 3] = ["del10", "del30", "del50"];
+/// The update change sets of CONTRACT 13.1.
+pub const UPDATE_NAMES: [&str; 1] = ["upd10"];
+/// Indexes that accept `--delete`, `--update`, and `--compact` (CONTRACT 13).
+pub const CHANGE_INDEXES: [&str; 3] = ["flat", "ivf", "hnsw"];
+
+/// Checks the arguments of [`AnnIndex::update`]: IDs in `0..rows`, no repeat,
+/// and `ids.len() * dim` values.
+pub fn check_update(ids: &[i64], vectors: &[f32], rows: usize, dim: usize) -> Result<(), String> {
+    if vectors.len() != ids.len() * dim {
+        return Err(format!(
+            "update: {} values for {} rows of dim {dim}",
+            vectors.len(),
+            ids.len()
+        ));
+    }
+    let mut seen = vec![false; rows];
+    for &id in ids {
+        if id < 0 || id as usize >= rows {
+            return Err(format!("update: row {id} is not in 0..{rows}"));
+        }
+        if std::mem::replace(&mut seen[id as usize], true) {
+            return Err(format!("update: row {id} appears twice"));
+        }
+    }
+    Ok(())
 }
 
 /// The index names of CONTRACT section 2, in order.

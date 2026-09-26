@@ -50,6 +50,25 @@ pub fn read_i64(path: &Path, max_rows: Option<usize>) -> Result<Array2<i64>, Str
     })
 }
 
+/// Reads a `<i8` (int64) 1-D array, for example `update_upd10_ids.npy`.
+pub fn read_i64_1d(path: &Path) -> Result<Vec<i64>, String> {
+    let err = |msg: String| format!("{}: {msg}", path.display());
+    let file = File::open(path).map_err(|e| err(e.to_string()))?;
+    let mut reader = BufReader::new(file);
+    let header = read_header(&mut reader).map_err(err)?;
+    if header.descr != "<i8" {
+        return Err(err(format!("descr is '{}', expected '<i8'", header.descr)));
+    }
+    let rows = match header.shape[..] {
+        [r] => r,
+        _ => return Err(err(format!("shape {:?} is not 1-D", header.shape))),
+    };
+    reader
+        .seek(SeekFrom::Start(header.data_offset))
+        .map_err(|e| err(e.to_string()))?;
+    read_values(&mut reader, rows, |b: &[u8; 8]| i64::from_le_bytes(*b)).map_err(err)
+}
+
 /// Reads a `|b1` (bool) 1-D array, one byte per value, for example `filter_top10.npy`.
 /// `max_rows` limits the values read (`--limit`). Any nonzero byte is `true`.
 pub fn read_bool(path: &Path, max_rows: Option<usize>) -> Result<Vec<bool>, String> {

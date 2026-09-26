@@ -9,11 +9,22 @@
 //!
 //! Filter (CONTRACT 11.3): scan the `nprobe` lists as before and skip each row that
 //! fails the mask. `distance_computations` = nlist + scored (passing) rows.
+//!
+//! Changes (CONTRACT 13.3): delete sets bits in a tombstone bit set, and the scan skips
+//! tombstoned rows in the probed lists (not scored, not counted). Update overwrites the
+//! row's vector, assigns it to its best center, and rebuilds the CSR lists once for the
+//! whole batch (one O(N) counting pass), so the ID moves to its new list. Compact
+//! rebuilds the CSR lists without the tombstoned IDs and drops the bit set. The lists
+//! keep the row IDs, so the corpus array is kept as it is (it is not part of
+//! `index_bytes`); the centers are not retrained.
 
 use crate::distance::{dot, TopK};
 use crate::kmeans::{best_center, kmeans, Assign, KmeansOptions};
 use crate::params::default_train_size;
-use crate::{AnnIndex, BuildTimes, FilterMasks, Matrix, ParamValue::*, Params, SearchResult};
+use crate::{
+    check_update, AnnIndex, BuildTimes, FilterMasks, Matrix, ParamValue::*, Params, SearchResult,
+    Tombstones,
+};
 use rayon::prelude::*;
 use std::time::Instant;
 
@@ -41,6 +52,32 @@ pub struct IvfIndex {
     offsets: Vec<i32>,
     times: BuildTimes,
     filters: FilterMasks,
+    /// Deleted rows (CONTRACT 13.3), before compaction.
+    tombstones: Option<Tombstones>,
+}
+
+/// CSR lists from one label per row: rows in ascending ID order within each list.
+/// Rows with `skip(i)` true are left out.
+fn csr(labels: &[usize], nlist: usize, skip: impl Fn(usize) -> bool) -> (Vec<i32>, Vec<i32>) {
+    let mut counts = vec![0usize; nlist];
+    for (i, &c) in labels.iter().enumerate() {
+        if !skip(i) {
+            counts[c] += 1;
+        }
+    }
+    let mut offsets = vec![0i32; nlist + 1];
+    for c in 0..nlist {
+        offsets[c + 1] = offsets[c] + counts[c] as i32;
+    }
+    let mut cursor: Vec<usize> = offsets[..nlist].iter().map(|&o| o as usize).collect();
+    let mut ids = vec![0i32; offsets[nlist] as usize];
+    for (i, &c) in labels.iter().enumerate() {
+        if !skip(i) {
+            ids[cursor[c]] = i as i32;
+            cursor[c] += 1;
+        }
+    }
+    (ids, offsets)
 }
 
 impl IvfIndex {
@@ -56,6 +93,63 @@ impl IvfIndex {
     }
     pub fn offsets(&self) -> &[i32] {
         &self.offsets
+    }
+
+    /// List of every row in the lists, from the CSR layout (rows not in a list: `usize::MAX`).
+    fn labels(&self) -> Vec<usize> {
+        let mut labels = vec![usize::MAX; self.vectors.rows];
+        for c in 0..self.nlist {
+            let (lo, hi) = (self.offsets[c] as usize, self.offsets[c + 1] as usize);
+            for &id in &self.ids[lo..hi] {
+                labels[id as usize] = c;
+            }
+        }
+        labels
+    }
+
+    /// Marks the rows with `mask[i]` true as deleted.
+    pub fn delete(&mut self, mask: &[bool]) -> Result<(), String> {
+        let n = self.vectors.rows;
+        if mask.len() != n {
+            return Err(format!("delete mask has {} rows, the corpus has {n}", mask.len()));
+        }
+        let mut all = self.tombstones.as_ref().map_or(vec![false; n], Tombstones::to_mask);
+        all.iter_mut().zip(mask).for_each(|(a, &m)| *a |= m);
+        self.tombstones = Some(Tombstones::from_mask(&all));
+        Ok(())
+    }
+
+    /// Overwrites the vectors of rows `ids` and moves each ID to the list of its new center.
+    pub fn update(&mut self, ids: &[i64], vectors: &[f32]) -> Result<(), String> {
+        let dim = self.vectors.cols;
+        check_update(ids, vectors, self.vectors.rows, dim)?;
+        let mut labels = self.labels();
+        for (j, &id) in ids.iter().enumerate() {
+            let id = id as usize;
+            let v = &vectors[j * dim..(j + 1) * dim];
+            self.vectors.data[id * dim..(id + 1) * dim].copy_from_slice(v);
+            if labels[id] != usize::MAX {
+                labels[id] = best_center(v, &self.centers, dim, Assign::Dot).0;
+            }
+        }
+        let (l, o) = csr(&labels, self.nlist, |i| labels[i] == usize::MAX);
+        self.ids = l;
+        self.offsets = o;
+        Ok(())
+    }
+
+    /// Drops the tombstoned IDs from the lists and the bit set.
+    pub fn compact(&mut self) -> Result<(), String> {
+        let Some(t) = self.tombstones.take() else {
+            return Ok(());
+        };
+        let labels = self.labels();
+        let (l, o) = csr(&labels, self.nlist, |i| {
+            labels[i] == usize::MAX || t.is_deleted(i)
+        });
+        self.ids = l;
+        self.offsets = o;
+        Ok(())
     }
 }
 
@@ -100,21 +194,7 @@ pub fn build(
         .par_chunks_exact(dim)
         .map(|row| best_center(row, &centers, dim, Assign::Dot).0)
         .collect();
-    let mut counts = vec![0usize; nlist];
-    for &c in &labels {
-        counts[c] += 1;
-    }
-    let mut offsets = vec![0i32; nlist + 1];
-    for c in 0..nlist {
-        offsets[c + 1] = offsets[c] + counts[c] as i32;
-    }
-    // Rows go in ascending ID order within each list.
-    let mut cursor: Vec<usize> = offsets[..nlist].iter().map(|&o| o as usize).collect();
-    let mut ids = vec![0i32; n];
-    for (i, &c) in labels.iter().enumerate() {
-        ids[cursor[c]] = i as i32;
-        cursor[c] += 1;
-    }
+    let (ids, offsets) = csr(&labels, nlist, |_| false);
     let add_s = t1.elapsed().as_secs_f64();
 
     Ok(IvfIndex {
@@ -125,6 +205,7 @@ pub fn build(
         offsets,
         times: BuildTimes { train_s, add_s },
         filters: FilterMasks::default(),
+        tombstones: None,
     })
 }
 
@@ -139,6 +220,7 @@ pub fn search(
     let mask = index.filters.for_params(params)?;
     let pass = mask.as_ref().map(|m| m.pass.as_slice());
     let filter_rows = mask.as_ref().map(|m| m.rows);
+    let tomb = index.tombstones.as_ref();
 
     // Pick the nprobe best centers. Ties go to the lower center index.
     let mut probe = TopK::new(nprobe);
@@ -156,7 +238,9 @@ pub fn search(
         let c = c as usize;
         let (lo, hi) = (index.offsets[c] as usize, index.offsets[c + 1] as usize);
         for &id in &index.ids[lo..hi] {
-            if pass.is_some_and(|p| !p[id as usize]) {
+            if pass.is_some_and(|p| !p[id as usize])
+                || tomb.is_some_and(|t| t.is_deleted(id as usize))
+            {
                 continue;
             }
             scanned += 1;
@@ -178,10 +262,14 @@ pub fn search(
     })
 }
 
-/// Centers (nlist x dim x 4) + one int32 ID per row + (nlist + 1) int32 offsets.
+/// Centers (nlist x dim x 4) + one int32 ID per listed row + (nlist + 1) int32 offsets
+/// + the tombstone bit set (N/8 bytes) while it exists.
 pub fn index_bytes(index: &IvfIndex) -> u64 {
     let nlist = index.nlist as u64;
-    nlist * index.vectors.cols as u64 * 4 + index.ids.len() as u64 * 4 + (nlist + 1) * 4
+    nlist * index.vectors.cols as u64 * 4
+        + index.ids.len() as u64 * 4
+        + (nlist + 1) * 4
+        + index.tombstones.as_ref().map_or(0, Tombstones::bytes)
 }
 
 impl AnnIndex for IvfIndex {
@@ -196,6 +284,15 @@ impl AnnIndex for IvfIndex {
     }
     fn build_times(&self) -> BuildTimes {
         self.times
+    }
+    fn delete(&mut self, mask: &[bool]) -> Result<(), String> {
+        IvfIndex::delete(self, mask)
+    }
+    fn update(&mut self, ids: &[i64], vectors: &[f32]) -> Result<(), String> {
+        IvfIndex::update(self, ids, vectors)
+    }
+    fn compact(&mut self) -> Result<(), String> {
+        IvfIndex::compact(self)
     }
     fn extra(&self) -> serde_json::Map<String, serde_json::Value> {
         let mut m = serde_json::Map::new();

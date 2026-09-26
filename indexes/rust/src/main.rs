@@ -33,6 +33,11 @@ struct Args {
     clients: usize,
     duration: f64,
     insert_rate: f64,
+    /// Changes (CONTRACT 13.2): delete set, update set, compaction and its mode.
+    delete: Option<String>,
+    update: Option<String>,
+    compact: bool,
+    compact_mode: String,
 }
 
 impl Args {
@@ -72,6 +77,10 @@ fn parse_args(argv: &[String]) -> Result<Args, BenchError> {
         clients: 1,
         duration: 0.0,
         insert_rate: 0.0,
+        delete: None,
+        update: None,
+        compact: false,
+        compact_mode: "rebuild".into(),
     };
     let mut it = argv.iter();
     while let Some(flag) = it.next() {
@@ -94,6 +103,10 @@ fn parse_args(argv: &[String]) -> Result<Args, BenchError> {
             "--clients" => args.clients = parse_num(flag, &value()?)?,
             "--duration" => args.duration = parse_num(flag, &value()?)?,
             "--insert-rate" => args.insert_rate = parse_num(flag, &value()?)?,
+            "--delete" => args.delete = Some(value()?),
+            "--update" => args.update = Some(value()?),
+            "--compact" => args.compact = true,
+            "--compact-mode" => args.compact_mode = value()?,
             other => return Err(Usage(format!("unknown option: {other}"))),
         }
     }
@@ -124,7 +137,51 @@ fn parse_args(argv: &[String]) -> Result<Args, BenchError> {
             args.index
         )));
     }
+    check_change_args(&args)?;
     Ok(args)
+}
+
+/// Checks `--delete`, `--update`, `--compact`, `--compact-mode` (CONTRACT 13.2).
+fn check_change_args(args: &Args) -> Result<(), BenchError> {
+    let changes = args.delete.is_some() || args.update.is_some();
+    if !changes && !args.compact && args.compact_mode == "rebuild" {
+        return Ok(());
+    }
+    if !bench::CHANGE_INDEXES.contains(&args.index.as_str()) {
+        return Err(Usage(format!(
+            "--delete, --update and --compact need --index flat, ivf or hnsw (CONTRACT 13), not {}",
+            args.index
+        )));
+    }
+    if let Some(d) = &args.delete {
+        if !bench::DELETE_NAMES.contains(&d.as_str()) {
+            return Err(Usage(format!("unknown delete set: {d} (expected del10, del30 or del50)")));
+        }
+    }
+    if let Some(u) = &args.update {
+        if !bench::UPDATE_NAMES.contains(&u.as_str()) {
+            return Err(Usage(format!("unknown update set: {u} (expected upd10)")));
+        }
+    }
+    if args.delete.is_some() && args.update.is_some() {
+        return Err(Usage("--delete and --update are not combined in one run".into()));
+    }
+    if args.compact && !changes {
+        return Err(Usage("--compact needs --delete or --update".into()));
+    }
+    match args.compact_mode.as_str() {
+        "rebuild" => {}
+        "repair" if args.index == "hnsw" => {}
+        "repair" => return Err(Usage("--compact-mode repair exists only for hnsw".into())),
+        m => return Err(Usage(format!("unknown --compact-mode: {m} (expected rebuild or repair)"))),
+    }
+    if args.compact_mode != "rebuild" && !args.compact {
+        return Err(Usage("--compact-mode needs --compact".into()));
+    }
+    if args.load_run() {
+        return Err(Usage("changes are not combined with a load run".into()));
+    }
+    Ok(())
 }
 
 fn parse_num<T: std::str::FromStr>(flag: &str, text: &str) -> Result<T, BenchError> {
@@ -231,7 +288,11 @@ fn run(args: &Args) -> Result<(), BenchError> {
     // CONTRACT 12.2: with inserts, the build takes the first 90% of the rows.
     let build_rows = (args.insert_rate > 0.0).then(|| (n * 9 / 10).max(1));
     let tail = build_rows.map(|b| vectors.data[b * dim..].to_vec());
-    let mut index = build_index(args, vectors, &build_params, build_rows)?;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(args.threads)
+        .build()
+        .map_err(|e| Runtime(format!("cannot start thread pool: {e}")))?;
+    let mut index = build_index(args, &pool, vectors, &build_params, build_rows)?;
     index.set_filter_dir(&args.data);
     let times = index.build_times();
     let build = BuildReport {
@@ -242,8 +303,10 @@ fn run(args: &Args) -> Result<(), BenchError> {
         index_bytes: index.index_bytes(),
     };
 
-    warm_up(index.as_ref(), &queries, args, &search_sets[0])?;
     let mut top_extra = index.extra();
+    let mut search_sets = search_sets;
+    apply_changes(args, &pool, index.as_mut(), n, &mut top_extra, &mut search_sets)?;
+    warm_up(index.as_ref(), &queries, args, &search_sets[0])?;
     let searches = if args.load_run() {
         let inserter = build_rows.zip(tail).map(|(first, rows)| Inserter {
             first,
@@ -326,17 +389,78 @@ fn search_sets(defaults: &Params, specs: &[String]) -> Result<Vec<Params>, Bench
         .collect()
 }
 
-/// Builds inside a rayon pool of `--threads` threads, so every parallel step uses it.
+/// Applies `--delete` or `--update`, then `--compact`, each timed (CONTRACT 13.2).
+/// Writes the times and sizes to `extra` and tags every search set with
+/// `deleted` / `updated` and `compacted`. Without change flags it does nothing.
+fn apply_changes(
+    args: &Args,
+    pool: &rayon::ThreadPool,
+    index: &mut dyn AnnIndex,
+    n: usize,
+    extra: &mut serde_json::Map<String, serde_json::Value>,
+    search_sets: &mut [Params],
+) -> Result<(), BenchError> {
+    if args.delete.is_none() && args.update.is_none() {
+        return Ok(());
+    }
+    let dir = Path::new(&args.data);
+    if let Some(name) = &args.delete {
+        let mask = npy::read_bool(&dir.join(format!("delete_{name}.npy")), Some(n)).map_err(Runtime)?;
+        if mask.len() != n {
+            return Err(Runtime(format!("delete_{name}.npy has {} rows, the corpus has {n}", mask.len())));
+        }
+        let t = Instant::now();
+        pool.install(|| index.delete(&mask)).map_err(Runtime)?;
+        extra.insert("delete_s".into(), t.elapsed().as_secs_f64().into());
+        extra.insert("deleted_rows".into(), mask.iter().filter(|&&d| d).count().into());
+    }
+    if let Some(name) = &args.update {
+        let ids = npy::read_i64_1d(&dir.join(format!("update_{name}_ids.npy"))).map_err(Runtime)?;
+        let vecs = npy::read_f32(&dir.join(format!("update_{name}_vectors.npy")), None).map_err(Runtime)?;
+        if vecs.rows != ids.len() {
+            return Err(Runtime(format!("update_{name}: {} IDs, {} vectors", ids.len(), vecs.rows)));
+        }
+        // With --limit, only the IDs inside the first n rows apply.
+        let keep: Vec<usize> = (0..ids.len()).filter(|&j| (ids[j] as usize) < n).collect();
+        let sel_ids: Vec<i64> = keep.iter().map(|&j| ids[j]).collect();
+        let sel_vecs: Vec<f32> = keep.iter().flat_map(|&j| vecs.row(j).iter().copied()).collect();
+        let t = Instant::now();
+        pool.install(|| index.update(&sel_ids, &sel_vecs)).map_err(Runtime)?;
+        extra.insert("update_s".into(), t.elapsed().as_secs_f64().into());
+        extra.insert("updated_rows".into(), sel_ids.len().into());
+    }
+    extra.insert("index_bytes_before_compact".into(), index.index_bytes().into());
+    if args.compact {
+        let t = Instant::now();
+        pool.install(|| match args.compact_mode.as_str() {
+            "repair" => index.compact_repair(),
+            _ => index.compact(),
+        })
+        .map_err(Runtime)?;
+        extra.insert("compact_s".into(), t.elapsed().as_secs_f64().into());
+        extra.insert("compact_mode".into(), args.compact_mode.clone().into());
+        extra.insert("index_bytes_after".into(), index.index_bytes().into());
+    }
+    for p in search_sets.iter_mut() {
+        if let Some(d) = &args.delete {
+            p.insert("deleted", ParamValue::Str(d.clone()));
+        }
+        if let Some(u) = &args.update {
+            p.insert("updated", ParamValue::Str(u.clone()));
+        }
+        p.insert("compacted", ParamValue::Int(args.compact as i64));
+    }
+    Ok(())
+}
+
+/// Builds inside the rayon pool of `--threads` threads, so every parallel step uses it.
 fn build_index(
     args: &Args,
+    pool: &rayon::ThreadPool,
     vectors: Matrix,
     params: &Params,
     build_rows: Option<usize>,
 ) -> Result<Box<dyn AnnIndex>, BenchError> {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(args.threads)
-        .build()
-        .map_err(|e| Runtime(format!("cannot start thread pool: {e}")))?;
     let ctx = BuildContext {
         out_path: args.out.clone(),
     };

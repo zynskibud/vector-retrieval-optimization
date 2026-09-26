@@ -30,10 +30,36 @@
 //! visited node still goes to the candidate heap (under the usual admission rule) and
 //! is expanded. The stop rule and ef are unchanged, so a low selectivity ends the walk
 //! with fewer than k results; no brute-force fallback. `extra.visited` = nodes expanded.
+//!
+//! Changes (CONTRACT 13.3):
+//! - Delete = tombstone bit set. A tombstoned node is still expanded and its edges are
+//!   followed, but it never enters the result list (the same rule as a failing filter).
+//! - Update: overwrite the vector, drop the node's out-edges on every layer, remove it
+//!   from the lists of its old neighbors (a scan over those lists), and run Algorithm 1
+//!   again for the node with its existing level. During that insert the node itself is
+//!   left out of every neighbor list read, so it cannot select itself; if the node is the
+//!   entry point, the descent starts from its old neighbor on its highest non-empty layer.
+//!   After the batch, the repair pass of CONTRACT 6.6 runs once.
+//! - Compact, rebuild mode (the default): build a new graph from the live rows only, in
+//!   row order, with the same m, ef_construct, seed and threads (levels are drawn again
+//!   for the live rows in row order). A position -> row ID map (4 bytes per live row)
+//!   turns positions back into row IDs; positions keep row order, so ties still go to
+//!   the lower row ID. The bit set is dropped.
+//! - Compact, repair mode (`--compact-mode repair`), in place: (1) on every layer, each
+//!   live node whose list holds a tombstoned node gets a new list, chosen with the
+//!   heuristic (up to the layer cap) from its live neighbors plus the live neighbors of
+//!   its tombstoned neighbors; (2) the lists of the tombstoned nodes are cleared, so no
+//!   edge leads to or from them; (3) if the entry point is tombstoned, the live node with
+//!   the highest level (lowest row on a tie) becomes the entry point; (4) the repair pass
+//!   of CONTRACT 6.6 runs over the live nodes. The tombstoned nodes keep their slots and
+//!   the bit set stays, so memory shrinks only by the dropped edges.
 
 use crate::distance::dot;
 use crate::splitmix::SplitMix64;
-use crate::{AnnIndex, BuildTimes, FilterMasks, Matrix, ParamValue::*, Params, SearchResult};
+use crate::{
+    check_update, AnnIndex, BuildTimes, FilterMasks, Matrix, ParamValue::*, Params, SearchResult,
+    Tombstones,
+};
 use rayon::prelude::*;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
@@ -62,23 +88,23 @@ const LOCK_STRIPES: usize = 1 << 16;
 const ABSENT: u32 = u32::MAX;
 
 /// Search-layer on layer 0 for queries (Algorithm 2 with a filter, CONTRACT 11.3).
-/// A node enters `results` only if `pass` is `None` or `pass[node]` is true. Every
+/// A node enters `results` only if `ok(node)` is true (it passes the filter and is not
+/// tombstoned, CONTRACT 13.3). Every
 /// visited node with a score better than the worst result (or any score while the
 /// result heap holds fewer than `ef`) enters `candidates` and is later expanded.
 /// Stop when the best candidate is worse than the worst result and the result heap
-/// is full. With `pass = None` this is the same walk as [`search_layer`].
+/// is full. With `ok` always true this is the same walk as [`search_layer`].
 /// Returns up to `ef` passing nodes, best first, and the number of expanded nodes.
-fn search_layer0<F: Fn(u32, &mut Vec<u32>)>(
+fn search_layer0<F: Fn(u32, &mut Vec<u32>), P: Fn(u32) -> bool>(
     query: &[f32],
     vectors: &Matrix,
     entry: Cand,
     ef: usize,
-    pass: Option<&[bool]>,
+    ok: P,
     neighbors: F,
     s: &mut Scratch,
     dist_count: &mut u64,
 ) -> (Vec<Cand>, u64) {
-    let ok = |id: u32| pass.is_none_or(|p| p[id as usize]);
     s.next_generation();
     let generation = s.generation;
     s.candidates.clear();
@@ -352,6 +378,14 @@ pub struct HnswIndex {
     filters: FilterMasks,
     /// Serializes calls to [`HnswIndex::insert`], so rows go in strictly in row order.
     insert_lock: Mutex<()>,
+    /// Seed of the build, reused by the compaction rebuild.
+    seed: u64,
+    /// Corpus rows (row IDs are 0..rows), also after a compaction rebuild.
+    rows: usize,
+    /// Deleted nodes (CONTRACT 13.3).
+    tombstones: Option<Tombstones>,
+    /// After a compaction rebuild: row ID of each node.
+    row_ids: Option<Vec<u32>>,
 }
 
 /// Levels of CONTRACT 6.6: one SplitMix64 seeded `seed`, one `next_f64` per row, in row order.
@@ -440,9 +474,22 @@ impl Graph {
 
     /// Algorithm 1 for row `i`.
     fn insert(&self, i: u32, s: &mut Scratch) {
+        self.insert_with(i, s, false, None);
+    }
+
+    /// Algorithm 1 for row `i`. With `skip_self`, node `i` is removed from every
+    /// neighbor list that the insert reads (update, CONTRACT 13.3). `start` replaces
+    /// the entry point and top layer as the start of the descent.
+    fn insert_with(&self, i: u32, s: &mut Scratch, skip_self: bool, start: Option<(u32, usize)>) {
         let level = self.levels[i as usize] as usize;
         let guard = self.entry.lock().unwrap_or_else(|e| e.into_inner());
-        let (ep, top) = *guard;
+        let (ep, top) = start.unwrap_or(*guard);
+        let read = |bl: &Layer, n: u32, o: &mut Vec<u32>| {
+            bl.read(n, o);
+            if skip_self {
+                o.retain(|&x| x != i);
+            }
+        };
         // A node that raises the top layer holds the entry lock for its whole insert.
         let hold = if level > top {
             Some(guard)
@@ -458,7 +505,7 @@ impl Graph {
         }];
         for layer in (level + 1..=top).rev() {
             let bl = &self.layers[layer];
-            let w = search_layer(q, &self.vectors, &cur, 1, |n, o| bl.read(n, o), s, &mut dc);
+            let w = search_layer(q, &self.vectors, &cur, 1, |n, o| read(bl, n, o), s, &mut dc);
             cur.truncate(0);
             cur.push(w[0]);
         }
@@ -470,7 +517,7 @@ impl Graph {
                 &self.vectors,
                 &cur,
                 self.ef_construct,
-                |n, o| bl.read(n, o),
+                |n, o| read(bl, n, o),
                 s,
                 &mut dc,
             );
@@ -559,7 +606,9 @@ impl Graph {
     /// (nearest first) with a free slot, else from the nearest result. Edges added
     /// by the repair are never pruned. Repeat while step B found a node, at most 3
     /// passes. Returns (edges added by step A, edges added by step B).
-    fn repair(&self, entry: u32) -> (u64, u64) {
+    /// Nodes with `dead[v]` true (compaction repair mode) are skipped.
+    fn repair(&self, entry: u32, dead: Option<&[bool]>) -> (u64, u64) {
+        let is_dead = |v: u32| dead.is_some_and(|d| d[v as usize]);
         let l0 = &self.layers[0];
         let n = self.active.load(AtOrd::Acquire);
         let mut s = Scratch::new(self.vectors.rows);
@@ -575,7 +624,7 @@ impl Graph {
                     indeg[u as usize] += 1;
                 }
             }
-            for v in (0..n as u32).filter(|&v| indeg[v as usize] == 0 && v != entry) {
+            for v in (0..n as u32).filter(|&v| indeg[v as usize] == 0 && v != entry && !is_dead(v)) {
                 let q = self.vectors.row(v as usize);
                 l0.read(v, &mut buf);
                 let best = buf
@@ -593,7 +642,9 @@ impl Graph {
             }
             // Step B.
             let seen = self.reach(entry);
-            let unreached: Vec<u32> = (0..n as u32).filter(|&v| !seen[v as usize]).collect();
+            let unreached: Vec<u32> = (0..n as u32)
+                .filter(|&v| !seen[v as usize] && !is_dead(v))
+                .collect();
             if unreached.is_empty() {
                 break;
             }
@@ -710,7 +761,7 @@ pub fn build_partial(
     }
     let (entry, _) = graph.entry_top();
     let unreachable_before_repair = graph.unreachable(entry);
-    let (repair_added, repair_added_unreachable) = graph.repair(entry);
+    let (repair_added, repair_added_unreachable) = graph.repair(entry, None);
     let add_s = start.elapsed().as_secs_f64();
     Ok(HnswIndex {
         graph,
@@ -724,6 +775,10 @@ pub fn build_partial(
         },
         filters: FilterMasks::default(),
         insert_lock: Mutex::new(()),
+        seed,
+        rows: n,
+        tombstones: None,
+        row_ids: None,
     })
 }
 
@@ -742,6 +797,13 @@ pub fn search(
     let mask = index.filters.for_params(params)?;
     let pass = mask.as_ref().map(|m| m.pass.as_slice());
     let filter_rows = mask.as_ref().map(|m| m.rows);
+    let tomb = index.tombstones.as_ref();
+    let row_ids = index.row_ids.as_deref();
+    let row_id = |node: u32| row_ids.map_or(node, |r| r[node as usize]);
+    let ok = |node: u32| {
+        !tomb.is_some_and(|t| t.is_deleted(node as usize))
+            && pass.is_none_or(|p| p[row_id(node) as usize])
+    };
     let mut dc = 1u64;
     let (ep, top) = g.entry_top();
     let (w, visited) = with_scratch(g.vectors.rows, |s| {
@@ -769,13 +831,13 @@ pub fn search(
             &g.vectors,
             cur[0],
             ef,
-            pass,
+            ok,
             |nd, o| l0.read_relaxed(nd, o),
             s,
             &mut dc,
         )
     });
-    let mut ids: Vec<i64> = w.iter().take(k).map(|c| c.id as i64).collect();
+    let mut ids: Vec<i64> = w.iter().take(k).map(|c| row_id(c.id) as i64).collect();
     let mut scores: Vec<f32> = w.iter().take(k).map(|c| c.score).collect();
     ids.resize(k, -1);
     scores.resize(k, f32::NEG_INFINITY);
@@ -794,7 +856,7 @@ pub fn search(
 impl HnswIndex {
     /// Sets the directory that holds `filter_<name>.npy` (CONTRACT 11).
     pub fn set_filter_dir(&mut self, dir: &str) {
-        self.filters = FilterMasks::new(dir, self.graph.vectors.rows);
+        self.filters = FilterMasks::new(dir, self.rows);
     }
     /// Adds rows to the graph while queries run (CONTRACT 12.2). `ids` must be the next
     /// rows in row order (starting at [`HnswIndex::active_rows`]), and `vectors` their
@@ -841,7 +903,164 @@ impl HnswIndex {
     pub fn repair(&self) -> (u64, u64) {
         let _order = self.insert_lock.lock().unwrap_or_else(|e| e.into_inner());
         let (entry, _) = self.graph.entry_top();
-        self.graph.repair(entry)
+        self.graph.repair(entry, None)
+    }
+
+    /// Marks the nodes with `mask[i]` true as deleted (CONTRACT 13.3).
+    pub fn delete(&mut self, mask: &[bool]) -> Result<(), String> {
+        if self.row_ids.is_some() {
+            return Err("hnsw: delete after a compaction rebuild is not supported".into());
+        }
+        if mask.len() != self.rows {
+            return Err(format!("delete mask has {} rows, the corpus has {}", mask.len(), self.rows));
+        }
+        let mut all = self.tombstones.as_ref().map_or(vec![false; self.rows], Tombstones::to_mask);
+        all.iter_mut().zip(mask).for_each(|(a, &m)| *a |= m);
+        self.tombstones = Some(Tombstones::from_mask(&all));
+        Ok(())
+    }
+
+    /// Replaces the vectors of rows `ids` and re-inserts each node with its level
+    /// (CONTRACT 13.3), then runs the repair pass once. Returns (step A, step B) edges.
+    pub fn update(&mut self, ids: &[i64], vectors: &[f32]) -> Result<(u64, u64), String> {
+        if self.row_ids.is_some() {
+            return Err("hnsw: update after a compaction rebuild is not supported".into());
+        }
+        let dim = self.graph.vectors.cols;
+        let active = self.graph.active.load(AtOrd::Acquire);
+        check_update(ids, vectors, active, dim)?;
+        let mut s = Scratch::new(self.graph.vectors.rows);
+        let mut buf = Vec::new();
+        for (j, &id) in ids.iter().enumerate() {
+            let i = id as u32;
+            let row = id as usize;
+            self.graph.vectors.data[row * dim..(row + 1) * dim]
+                .copy_from_slice(&vectors[j * dim..(j + 1) * dim]);
+            let g = &self.graph;
+            let level = g.levels[row] as usize;
+            // Drop the out-edges, and remove i from the lists of its old neighbors.
+            let mut start = None;
+            for layer in (0..=level).rev() {
+                let l = &g.layers[layer];
+                let mut old = Vec::new();
+                l.read(i, &mut old);
+                l.write(i, &[]);
+                for &nb in &old {
+                    let _g = g.lock(nb);
+                    l.read(nb, &mut buf);
+                    if buf.contains(&i) {
+                        buf.retain(|&x| x != i);
+                        l.write(nb, &buf);
+                    }
+                }
+                if start.is_none() {
+                    start = old.first().map(|&nb| (nb, layer));
+                }
+            }
+            let (ep, _) = g.entry_top();
+            let start = if ep == i { start } else { None };
+            if ep == i && start.is_none() {
+                continue; // The only node of the graph: nothing to link.
+            }
+            g.insert_with(i, &mut s, true, start);
+        }
+        let (entry, _) = self.graph.entry_top();
+        Ok(self.graph.repair(entry, None))
+    }
+
+    /// Compaction, rebuild mode (CONTRACT 13.3): a new graph from the live rows, with
+    /// the same parameters, seed, and threads. Call it inside the build's thread pool.
+    pub fn compact(&mut self) -> Result<(), String> {
+        if self.row_ids.is_some() {
+            return Ok(());
+        }
+        let g = &self.graph;
+        let n = g.active.load(AtOrd::Acquire);
+        let dim = g.vectors.cols;
+        let tomb = self.tombstones.as_ref();
+        let live: Vec<u32> = (0..n as u32)
+            .filter(|&i| !tomb.is_some_and(|t| t.is_deleted(i as usize)))
+            .collect();
+        let mut data = Vec::with_capacity(live.len() * dim);
+        for &i in &live {
+            data.extend_from_slice(g.vectors.row(i as usize));
+        }
+        let vectors = Matrix {
+            data,
+            rows: live.len(),
+            cols: dim,
+        };
+        let params = Params::new()
+            .with("m", Int(g.m as i64))
+            .with("ef_construct", Int(g.ef_construct as i64));
+        let mut fresh = build(vectors, &params, self.build_threads, self.seed)?;
+        fresh.filters = std::mem::take(&mut self.filters);
+        fresh.rows = self.rows;
+        fresh.row_ids = Some(live);
+        fresh.times = self.times;
+        *self = fresh;
+        Ok(())
+    }
+
+    /// Compaction, repair mode: the in-place repair described in the module docs.
+    /// Returns (step A, step B) edges of the final repair pass.
+    pub fn compact_repair(&mut self) -> Result<(u64, u64), String> {
+        if self.row_ids.is_some() {
+            return Err("hnsw: repair after a compaction rebuild is not supported".into());
+        }
+        let Some(t) = self.tombstones.as_ref() else {
+            let (entry, _) = self.graph.entry_top();
+            return Ok(self.graph.repair(entry, None));
+        };
+        let g = &self.graph;
+        let n = g.active.load(AtOrd::Acquire);
+        let dead: Vec<bool> = (0..g.vectors.rows).map(|i| i < n && t.is_deleted(i)).collect();
+        let (mut cur, mut dl) = (Vec::new(), Vec::new());
+        for (layer, l) in g.layers.iter().enumerate() {
+            for v in (0..n as u32).filter(|&v| g.levels[v as usize] as usize >= layer && !dead[v as usize]) {
+                l.read(v, &mut cur);
+                if !cur.iter().any(|&u| dead[u as usize]) {
+                    continue;
+                }
+                let mut cand: Vec<u32> = cur.iter().copied().filter(|&u| !dead[u as usize]).collect();
+                for &d in cur.iter().filter(|&&u| dead[u as usize]) {
+                    l.read(d, &mut dl);
+                    for &u in &dl {
+                        if u != v && !dead[u as usize] && !cand.contains(&u) {
+                            cand.push(u);
+                        }
+                    }
+                }
+                let base = g.vectors.row(v as usize);
+                let mut scored: Vec<Cand> = cand
+                    .iter()
+                    .map(|&u| Cand {
+                        score: dot(base, g.vectors.row(u as usize)),
+                        id: u,
+                    })
+                    .collect();
+                scored.sort_unstable_by(|a, b| b.cmp(a));
+                let kept = select_heuristic(&g.vectors, &scored, l.cap);
+                l.write(v, &kept);
+            }
+        }
+        for (layer, l) in g.layers.iter().enumerate() {
+            for v in (0..n as u32).filter(|&v| g.levels[v as usize] as usize >= layer && dead[v as usize]) {
+                l.write(v, &[]);
+            }
+        }
+        let (ep, _) = g.entry_top();
+        if dead[ep as usize] {
+            let best = (0..n as u32)
+                .filter(|&v| !dead[v as usize])
+                .max_by_key(|&v| (g.levels[v as usize], Reverse(v)))
+                .ok_or("hnsw: every node is deleted")?;
+            let top = g.levels[best as usize] as usize;
+            *g.entry.lock().unwrap_or_else(|e| e.into_inner()) = (best, top);
+            g.entry_top.store(pack(best, top), AtOrd::Release);
+        }
+        let (entry, _) = g.entry_top();
+        Ok(g.repair(entry, Some(&dead)))
     }
     /// Level of every node, in row order (all N rows, inserted or not).
     pub fn levels(&self) -> &[u8] {
@@ -916,8 +1135,13 @@ impl HnswIndex {
 
 /// Edges x 4 bytes, plus levels (1 byte per node), counts (4 bytes per node per
 /// layer), and the node maps of layers >= 1 (4 bytes per corpus row per layer).
+/// With changes (CONTRACT 13): + the tombstone bit set (N/8 bytes), or + the
+/// position -> row ID map (4 bytes per live row) after a compaction rebuild.
 pub fn index_bytes(index: &HnswIndex) -> u64 {
-    index.edges() * 4 + index.bookkeeping_bytes()
+    index.edges() * 4
+        + index.bookkeeping_bytes()
+        + index.tombstones.as_ref().map_or(0, Tombstones::bytes)
+        + index.row_ids.as_ref().map_or(0, |r| r.len() as u64 * 4)
 }
 
 impl AnnIndex for HnswIndex {
@@ -938,6 +1162,18 @@ impl AnnIndex for HnswIndex {
     }
     fn repair(&self) -> Result<(u64, u64), String> {
         Ok(HnswIndex::repair(self))
+    }
+    fn delete(&mut self, mask: &[bool]) -> Result<(), String> {
+        HnswIndex::delete(self, mask)
+    }
+    fn update(&mut self, ids: &[i64], vectors: &[f32]) -> Result<(), String> {
+        HnswIndex::update(self, ids, vectors).map(|_| ())
+    }
+    fn compact(&mut self) -> Result<(), String> {
+        HnswIndex::compact(self)
+    }
+    fn compact_repair(&mut self) -> Result<(), String> {
+        HnswIndex::compact_repair(self).map(|_| ())
     }
     fn supports_concurrency(&self) -> bool {
         true
