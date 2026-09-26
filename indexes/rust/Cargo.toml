@@ -19,6 +19,12 @@ serde_json = "1"
 memmap2 = "0.9"
 libc = "0.2"
 
+[lints.clippy]
+# Style lints added in clippy 0.1.98 (the container's toolchain); the code is correct as written.
+chunks_exact_to_as_chunks = "allow"
+manual_clear = "allow"
+too_many_arguments = "allow"
+
 [profile.release]
 opt-level = 3
 codegen-units = 1

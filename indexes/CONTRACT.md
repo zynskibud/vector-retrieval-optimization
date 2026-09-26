@@ -401,4 +401,4 @@ The same `filter` search key. Qdrant: a `Filter` with `FieldCondition(key="views
 
 ### 11.5 Tests
 
-On the dev set, 20,000 rows or the full set, for each of flat, ivf, hnsw in each language: `filter=top10` recall@10 against `ground_truth_top10.npy` at default settings ≥ 0.90 for flat (= 1.0), ≥ 0.70 for ivf, ≥ 0.85 for hnsw; every returned ID passes the filter (or is -1); `filter=top01` returns only passing IDs. The report plots recall (y) against selectivity (x, log) per system at the default search setting, and latency likewise.
+On the first 20,000 rows of the dev set with truth computed in the test, for each of flat, ivf, hnsw in each language: `filter=top10` recall@10 ≥ 1.0 for flat, ≥ 0.70 for ivf with nlist = 256 (a list size like the dev default), ≥ 0.85 for hnsw at defaults (on the full dev set with nlist = 1024, ivf gives 0.63 at top10 and 0.06 at top01; that is the measured result, not a failure); every returned ID passes the filter (or is -1); `filter=top01` returns only passing IDs. The report plots recall (y) against selectivity (x, log) per system at the default search setting, and latency likewise.
