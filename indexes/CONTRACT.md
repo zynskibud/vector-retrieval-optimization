@@ -386,14 +386,14 @@ The predicate is always `views >= t` on the `views` column of `metadata.parquet`
 
 ### 11.2 Command line and output
 
-`--search` gets one more key for `flat`, `ivf`, and `hnsw`: `filter=none|top50|top10|top1|top01` (default `none`). It is a search-time parameter: one build, several filters. The output JSON carries it in `search_params.filter`, and the report scores each search run against the matching truth file. `distance_computations` counts as before; `extra` per search run reports `filter_rows` (rows that passed) and, for hnsw, `visited` (nodes expanded).
+`--search` gets one more key for `flat`, `ivf`, and `hnsw`: `filter=none|top50|top10|top1|top01` (default `none`). It is a search-time parameter: one build, several filters. The output JSON carries it in `search_params.filter`, and the report scores each search run against the matching truth file. `distance_computations` counts as before; `extra` per search run reports `filter_rows` (corpus rows that pass the filter, the same for every query; may be omitted when `filter=none`, and the report then uses N) and, for hnsw, `visited` (nodes expanded, mean per query).
 
 ### 11.3 Algorithms
 
 - **flat:** score only passing rows (the mask is a bool array; iterate all rows and skip failing ones, or gather passing rows first; say which). Recall is 1.0 by construction; it is the latency baseline.
 - **ivf:** scan the `nprobe` lists as before and skip rows that fail the filter. `distance_computations` counts only scored rows.
-- **hnsw:** search-layer on layer 0 as before, with one change: a node enters the **result** list only if it passes the filter; every visited node still enters the **candidate** list and is expanded, so the walk can cross failing regions. The stop rule is unchanged (stop when the best candidate is worse than the worst result, with the result list full at max(ef, k)). This is the hnswlib / FAISS `IDSelector` behavior. It degrades at low selectivity because the result list fills slowly and the walk ends early; that degradation is the measurement, do not add a fallback to brute force.
-- **pq, ivf_pq, diskann:** not in Phase 3 (they reject `filter` other than `none` with exit 2).
+- **hnsw:** search-layer on layer 0 as before, with one change: a node enters the **result** list only if it passes the filter; every visited node still enters the **candidate** list and is expanded, so the walk can cross failing regions. The stop rule is unchanged (stop when the best candidate is worse than the worst result, with the result list full at max(ef, k)). This is the hnswlib / FAISS `IDSelector` behavior. Because the walk stops only when the result list is full, at low selectivity it expands most of the graph before it finds max(ef, k) passing nodes: recall stays high, but latency grows toward a full scan (measured in Rust on dev: 85 ms at 0.1% selectivity against 11 ms for a flat scan). IVF fails the other way: the probed lists hold few passing rows, so recall collapses (0.06 at 0.1%). Both effects are the measurement; do not add a fallback to brute force or extra probes.
+- **pq, ivf_pq, diskann:** not in Phase 3. They have no `filter` key, so any `filter=` value exits 2 (unknown parameter); the runner never passes one to them.
 
 ### 11.4 Databases (tools/db)
 

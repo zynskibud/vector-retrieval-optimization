@@ -26,7 +26,8 @@ RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-arm64.tar.gz" | tar -C /
 
 # Rust (stable), shared install so every user of the image sees it
 RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path \
-    && rustup --version && cargo --version
+    && rustup component add clippy rustfmt \
+    && rustup --version && cargo --version && cargo clippy --version
 
 WORKDIR /work
 CMD ["bash"]
