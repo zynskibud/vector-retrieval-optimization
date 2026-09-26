@@ -133,6 +133,9 @@ fn inserts_during_search_match_static_build() {
     assert_eq!(num(load, "errors"), 0.0);
     assert_eq!(num(load, "insert_errors"), 0.0);
     assert_eq!(num(after, "inserted_rows"), 2000.0);
+    assert!(num(after, "inserted_during_loop") <= 2000.0);
+    assert!(num(after, "insert_tail_s") >= 0.0);
+    assert_eq!(v["extra"]["inserted_during_loop"], after["extra"]["inserted_during_loop"]);
     assert_eq!(v["extra"]["inserted_rows"], 2000.0);
     assert!(num(after, "insert_p50_ms") > 0.0);
     assert_eq!(num(after, "build_rows"), 18000.0);

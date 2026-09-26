@@ -257,6 +257,14 @@ fn run(args: &Args) -> Result<(), BenchError> {
             .map(|p| load_search(index.as_ref(), &queries, args, p.clone(), inserter.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
         if let Some(ins) = &inserter {
+            // Insert tail (CONTRACT 12.2): rows left when the loop ended go in now,
+            // untimed and unpaced, before the repair and the after-inserts pass.
+            let during_loop = ins.next.load(Ordering::Acquire) - ins.first;
+            let tail_start = Instant::now();
+            if ins.run(index.as_ref(), f64::INFINITY, &AtomicBool::new(false)) > 0 {
+                return Err(Runtime("insert tail failed".into()));
+            }
+            let insert_tail_s = tail_start.elapsed().as_secs_f64();
             let (a, b) = index.repair().map_err(Runtime)?;
             let mut params = search_sets[0].clone();
             params.insert("phase", ParamValue::Str("after_inserts".into()));
@@ -266,6 +274,8 @@ fn run(args: &Args) -> Result<(), BenchError> {
             let p50 = median(&mut batch_ms);
             for (key, v) in [
                 ("inserted_rows", inserted as f64),
+                ("inserted_during_loop", during_loop as f64),
+                ("insert_tail_s", insert_tail_s),
                 ("insert_p50_ms", p50),
                 ("insert_batches", batch_ms.len() as f64),
                 ("build_rows", ins.first as f64),
@@ -405,7 +415,7 @@ impl Inserter {
             if lo >= total {
                 break;
             }
-            // Batch j starts at j * 100 / rate seconds after the loop starts.
+            // Batch j starts at j * 100 / rate seconds after the start (rate = inf: at once).
             let due = start + Duration::from_secs_f64(batch as f64 * INSERT_BATCH as f64 / rate);
             let now = Instant::now();
             if now < due {
