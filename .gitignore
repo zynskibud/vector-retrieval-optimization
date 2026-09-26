@@ -10,3 +10,4 @@ __pycache__/
 indexes/go/bin/
 indexes/cpp/build/
 indexes/rust/target/
+/results/logs/
