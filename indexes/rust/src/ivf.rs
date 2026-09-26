@@ -6,11 +6,14 @@
 //! `train_size` rows. `add` assigns every corpus row to its best center in parallel and
 //! stores the lists in CSR layout: `ids` holds the row IDs grouped by list, and list `c`
 //! is `ids[offsets[c]..offsets[c + 1]]`.
+//!
+//! Filter (CONTRACT 11.3): scan the `nprobe` lists as before and skip each row that
+//! fails the mask. `distance_computations` = nlist + scored (passing) rows.
 
 use crate::distance::{dot, TopK};
 use crate::kmeans::{best_center, kmeans, Assign, KmeansOptions};
 use crate::params::default_train_size;
-use crate::{AnnIndex, BuildTimes, Matrix, ParamValue::*, Params, SearchResult};
+use crate::{AnnIndex, BuildTimes, FilterMasks, Matrix, ParamValue::*, Params, SearchResult};
 use rayon::prelude::*;
 use std::time::Instant;
 
@@ -22,7 +25,9 @@ pub fn build_defaults(n: usize) -> Params {
 }
 
 pub fn search_defaults() -> Params {
-    Params::new().with("nprobe", Int(8))
+    Params::new()
+        .with("nprobe", Int(8))
+        .with("filter", Str("none".into()))
 }
 
 pub struct IvfIndex {
@@ -35,9 +40,14 @@ pub struct IvfIndex {
     /// nlist + 1 offsets into `ids`. The last one equals N.
     offsets: Vec<i32>,
     times: BuildTimes,
+    filters: FilterMasks,
 }
 
 impl IvfIndex {
+    /// Sets the directory that holds `filter_<name>.npy` (CONTRACT 11).
+    pub fn set_filter_dir(&mut self, dir: &str) {
+        self.filters = FilterMasks::new(dir, self.vectors.rows);
+    }
     pub fn nlist(&self) -> usize {
         self.nlist
     }
@@ -114,6 +124,7 @@ pub fn build(
         ids,
         offsets,
         times: BuildTimes { train_s, add_s },
+        filters: FilterMasks::default(),
     })
 }
 
@@ -125,6 +136,9 @@ pub fn search(
 ) -> Result<SearchResult, String> {
     let nprobe = params.get_usize("nprobe")?.min(index.nlist);
     let dim = index.vectors.cols;
+    let mask = index.filters.for_params(params)?;
+    let pass = mask.as_ref().map(|m| m.pass.as_slice());
+    let filter_rows = mask.as_ref().map(|m| m.rows);
 
     // Pick the nprobe best centers. Ties go to the lower center index.
     let mut probe = TopK::new(nprobe);
@@ -141,8 +155,11 @@ pub fn search(
     for &c in lists.iter().filter(|&&c| c >= 0) {
         let c = c as usize;
         let (lo, hi) = (index.offsets[c] as usize, index.offsets[c + 1] as usize);
-        scanned += (hi - lo) as u64;
         for &id in &index.ids[lo..hi] {
+            if pass.is_some_and(|p| !p[id as usize]) {
+                continue;
+            }
+            scanned += 1;
             let s = dot(query, index.vectors.row(id as usize));
             if s >= top.threshold() {
                 top.push(id as i64, s);
@@ -154,7 +171,10 @@ pub fn search(
         ids,
         scores,
         distance_computations: Some(index.nlist as u64 + scanned),
-        counters: Default::default(),
+        counters: filter_rows
+            .map(|r| ("filter_rows".to_string(), r as f64))
+            .into_iter()
+            .collect(),
     })
 }
 
@@ -165,6 +185,9 @@ pub fn index_bytes(index: &IvfIndex) -> u64 {
 }
 
 impl AnnIndex for IvfIndex {
+    fn set_filter_dir(&mut self, dir: &str) {
+        IvfIndex::set_filter_dir(self, dir);
+    }
     fn search(&self, query: &[f32], k: usize, params: &Params) -> Result<SearchResult, String> {
         search(self, query, k, params)
     }

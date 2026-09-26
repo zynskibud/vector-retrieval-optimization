@@ -16,7 +16,9 @@ pub mod params;
 pub mod pq;
 pub mod splitmix;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 pub use npy::Matrix;
 pub use params::{ParamValue, Params};
@@ -46,6 +48,9 @@ pub trait AnnIndex: Send + Sync {
     fn search(&self, query: &[f32], k: usize, params: &Params) -> Result<SearchResult, String>;
     fn index_bytes(&self) -> u64;
     fn build_times(&self) -> BuildTimes;
+    /// Sets the data directory that holds `filter_<name>.npy` (CONTRACT 11).
+    /// Indexes without the `filter` search key ignore it.
+    fn set_filter_dir(&mut self, _dir: &str) {}
     /// Build-time keys for the top-level `"extra"` object of the output JSON.
     fn extra(&self) -> serde_json::Map<String, serde_json::Value> {
         serde_json::Map::new()
@@ -87,6 +92,85 @@ pub fn search_defaults(index: &str) -> Option<Params> {
 pub struct BuildContext {
     /// Path of the output JSON. DiskANN writes `<out>.diskann` next to it.
     pub out_path: String,
+}
+
+/// The filter names of CONTRACT 11.1. `none` means no filter.
+pub const FILTER_NAMES: [&str; 5] = ["none", "top50", "top10", "top1", "top01"];
+
+/// Checks a `filter` value against [`FILTER_NAMES`].
+pub fn check_filter_name(name: &str) -> Result<(), String> {
+    if FILTER_NAMES.contains(&name) {
+        Ok(())
+    } else {
+        Err(format!(
+            "unknown filter: {name} (expected one of {})",
+            FILTER_NAMES.join(", ")
+        ))
+    }
+}
+
+/// One filter mask: `pass[i]` is true when row i passes. `rows` counts the passing rows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Mask {
+    pub pass: Vec<bool>,
+    pub rows: usize,
+}
+
+/// Filter masks of CONTRACT 11, loaded from `<data_dir>/filter_<name>.npy` on first use
+/// and cached per name. Each mask holds one bool per corpus row (the first `n` rows).
+#[derive(Debug, Default)]
+pub struct FilterMasks {
+    dir: Option<PathBuf>,
+    n: usize,
+    cache: Mutex<HashMap<String, Arc<Mask>>>,
+}
+
+impl FilterMasks {
+    /// Masks for a corpus of `n` rows, read from `dir`.
+    pub fn new(dir: impl Into<PathBuf>, n: usize) -> Self {
+        Self {
+            dir: Some(dir.into()),
+            n,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The mask for the `filter` search parameter, or `None` for `none` or a missing key.
+    /// An unknown name, a missing file, or a short file is an error.
+    pub fn for_params(&self, params: &Params) -> Result<Option<Arc<Mask>>, String> {
+        if !params.contains("filter") {
+            return Ok(None);
+        }
+        self.get(params.get_str("filter")?)
+    }
+
+    /// The mask named `name`, or `None` for `none`.
+    pub fn get(&self, name: &str) -> Result<Option<Arc<Mask>>, String> {
+        check_filter_name(name)?;
+        if name == "none" {
+            return Ok(None);
+        }
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = cache.get(name) {
+            return Ok(Some(Arc::clone(m)));
+        }
+        let dir = self
+            .dir
+            .as_ref()
+            .ok_or_else(|| format!("filter={name} needs a data directory"))?;
+        let mask = npy::read_bool(&dir.join(format!("filter_{name}.npy")), Some(self.n))?;
+        if mask.len() != self.n {
+            return Err(format!(
+                "filter_{name}.npy has {} rows, the corpus has {}",
+                mask.len(),
+                self.n
+            ));
+        }
+        let rows = mask.iter().filter(|&&p| p).count();
+        let mask = Arc::new(Mask { pass: mask, rows });
+        cache.insert(name.to_string(), Arc::clone(&mask));
+        Ok(Some(mask))
+    }
 }
 
 /// Builds the named index. `params` must already hold every key, defaults filled in.

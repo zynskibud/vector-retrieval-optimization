@@ -16,10 +16,16 @@
 //! every node that BFS from the entry does not reach, an incoming edge.
 //! Parallel workers claim chunks of 64 consecutive rows.
 //! The new node selects m neighbors on every layer; 2m is only the layer-0 cap.
+//!
+//! Filter (CONTRACT 11.3): the upper-layer descent ignores the filter. On layer 0,
+//! [`search_layer0`] puts a node in the result heap only if it passes the mask; every
+//! visited node still goes to the candidate heap (under the usual admission rule) and
+//! is expanded. The stop rule and ef are unchanged, so a low selectivity ends the walk
+//! with fewer than k results; no brute-force fallback. `extra.visited` = nodes expanded.
 
 use crate::distance::dot;
 use crate::splitmix::SplitMix64;
-use crate::{AnnIndex, BuildTimes, Matrix, ParamValue::*, Params, SearchResult};
+use crate::{AnnIndex, BuildTimes, FilterMasks, Matrix, ParamValue::*, Params, SearchResult};
 use rayon::prelude::*;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
@@ -34,7 +40,9 @@ pub fn build_defaults(_n: usize) -> Params {
 }
 
 pub fn search_defaults() -> Params {
-    Params::new().with("ef", Int(64))
+    Params::new()
+        .with("ef", Int(64))
+        .with("filter", Str("none".into()))
 }
 
 /// Highest level a node can get. Only a draw of u = 0 or a tiny u reaches it.
@@ -43,6 +51,68 @@ const MAX_LEVEL: usize = 32;
 const LOCK_STRIPES: usize = 1 << 16;
 /// Marks "node not on this layer" in a layer's node map.
 const ABSENT: u32 = u32::MAX;
+
+/// Search-layer on layer 0 for queries (Algorithm 2 with a filter, CONTRACT 11.3).
+/// A node enters `results` only if `pass` is `None` or `pass[node]` is true. Every
+/// visited node with a score better than the worst result (or any score while the
+/// result heap holds fewer than `ef`) enters `candidates` and is later expanded.
+/// Stop when the best candidate is worse than the worst result and the result heap
+/// is full. With `pass = None` this is the same walk as [`search_layer`].
+/// Returns up to `ef` passing nodes, best first, and the number of expanded nodes.
+fn search_layer0<F: Fn(u32, &mut Vec<u32>)>(
+    query: &[f32],
+    vectors: &Matrix,
+    entry: Cand,
+    ef: usize,
+    pass: Option<&[bool]>,
+    neighbors: F,
+    s: &mut Scratch,
+    dist_count: &mut u64,
+) -> (Vec<Cand>, u64) {
+    let ok = |id: u32| pass.is_none_or(|p| p[id as usize]);
+    s.next_generation();
+    let generation = s.generation;
+    s.candidates.clear();
+    s.results.clear();
+    s.visited[entry.id as usize] = generation;
+    s.candidates.push(entry);
+    if ok(entry.id) {
+        s.results.push(Reverse(entry));
+    }
+    let mut expanded = 0u64;
+    let mut buf = std::mem::take(&mut s.neighbors);
+    while let Some(c) = s.candidates.pop() {
+        if s.results.len() >= ef && c < s.results.peek().expect("results full").0 {
+            break;
+        }
+        expanded += 1;
+        neighbors(c.id, &mut buf);
+        for &e in &buf {
+            let v = &mut s.visited[e as usize];
+            if *v == generation {
+                continue;
+            }
+            *v = generation;
+            let score = dot(query, vectors.row(e as usize));
+            *dist_count += 1;
+            let ce = Cand { score, id: e };
+            let full = s.results.len() >= ef;
+            if !full || ce > s.results.peek().expect("results full").0 {
+                s.candidates.push(ce);
+                if ok(e) {
+                    s.results.push(Reverse(ce));
+                    if s.results.len() > ef {
+                        s.results.pop();
+                    }
+                }
+            }
+        }
+    }
+    s.neighbors = buf;
+    let mut out: Vec<Cand> = s.results.drain().map(|r| r.0).collect();
+    out.sort_unstable_by(|a, b| b.cmp(a));
+    (out, expanded)
+}
 
 /// A scored node. Greater = better: higher score, or equal score and lower ID.
 #[derive(Debug, Clone, Copy)]
@@ -268,6 +338,7 @@ pub struct HnswIndex {
     build_threads: usize,
     times: BuildTimes,
     pool: Mutex<Vec<Scratch>>,
+    filters: FilterMasks,
 }
 
 /// Levels of CONTRACT 6.6: one SplitMix64 seeded `seed`, one `next_f64` per row, in row order.
@@ -619,6 +690,7 @@ pub fn build(
             add_s,
         },
         pool: Mutex::new(Vec::new()),
+        filters: FilterMasks::default(),
     })
 }
 
@@ -632,6 +704,9 @@ pub fn search(
 ) -> Result<SearchResult, String> {
     let ef = params.get_usize("ef")?.max(k).max(1);
     let n = index.vectors.rows;
+    let mask = index.filters.for_params(params)?;
+    let pass = mask.as_ref().map(|m| m.pass.as_slice());
+    let filter_rows = mask.as_ref().map(|m| m.rows);
     let mut s = index
         .pool
         .lock()
@@ -659,11 +734,12 @@ pub fn search(
         cur.push(w[0]);
     }
     let l0 = &index.layers[0];
-    let w = search_layer(
+    let (w, visited) = search_layer0(
         query,
         &index.vectors,
-        &cur,
+        cur[0],
         ef,
+        pass,
         |nd, o| l0.read(nd, o),
         &mut s,
         &mut dc,
@@ -677,11 +753,19 @@ pub fn search(
         ids,
         scores,
         distance_computations: Some(dc),
-        counters: Default::default(),
+        counters: filter_rows
+            .map(|r| ("filter_rows".to_string(), r as f64))
+            .into_iter()
+            .chain([("visited".to_string(), visited as f64)])
+            .collect(),
     })
 }
 
 impl HnswIndex {
+    /// Sets the directory that holds `filter_<name>.npy` (CONTRACT 11).
+    pub fn set_filter_dir(&mut self, dir: &str) {
+        self.filters = FilterMasks::new(dir, self.vectors.rows);
+    }
     /// Level of every node, in row order.
     pub fn levels(&self) -> &[u8] {
         &self.levels
@@ -742,6 +826,9 @@ pub fn index_bytes(index: &HnswIndex) -> u64 {
 }
 
 impl AnnIndex for HnswIndex {
+    fn set_filter_dir(&mut self, dir: &str) {
+        HnswIndex::set_filter_dir(self, dir);
+    }
     fn search(&self, query: &[f32], k: usize, params: &Params) -> Result<SearchResult, String> {
         search(self, query, k, params)
     }

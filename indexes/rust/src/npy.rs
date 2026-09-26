@@ -50,6 +50,27 @@ pub fn read_i64(path: &Path, max_rows: Option<usize>) -> Result<Array2<i64>, Str
     })
 }
 
+/// Reads a `|b1` (bool) 1-D array, one byte per value, for example `filter_top10.npy`.
+/// `max_rows` limits the values read (`--limit`). Any nonzero byte is `true`.
+pub fn read_bool(path: &Path, max_rows: Option<usize>) -> Result<Vec<bool>, String> {
+    let err = |msg: String| format!("{}: {msg}", path.display());
+    let file = File::open(path).map_err(|e| err(e.to_string()))?;
+    let mut reader = BufReader::new(file);
+    let header = read_header(&mut reader).map_err(err)?;
+    if header.descr != "|b1" {
+        return Err(err(format!("descr is '{}', expected '|b1'", header.descr)));
+    }
+    let total = match header.shape[..] {
+        [r] => r,
+        _ => return Err(err(format!("shape {:?} is not 1-D", header.shape))),
+    };
+    let rows = max_rows.map_or(total, |m| m.min(total));
+    reader
+        .seek(SeekFrom::Start(header.data_offset))
+        .map_err(|e| err(e.to_string()))?;
+    read_values(&mut reader, rows, |b: &[u8; 1]| b[0] != 0).map_err(err)
+}
+
 fn read_array<T, const W: usize>(
     path: &Path,
     descr: &str,

@@ -113,6 +113,11 @@ fn apply_params(defaults: &Params, specs: &[&str], kind: &str) -> Result<Params,
         if !defaults.contains(key) {
             return Err(Usage(format!("unknown {kind} parameter: {key}")));
         }
+        if kind == "search" && key == "filter" {
+            bench::check_filter_name(val).map_err(Usage)?;
+            params.insert(key, ParamValue::Str(val.to_string()));
+            continue;
+        }
         params.insert(key, ParamValue::parse(val));
     }
     Ok(params)
@@ -190,7 +195,8 @@ fn run(args: &Args) -> Result<(), BenchError> {
     let build_defaults = bench::build_defaults(&args.index, n).expect("index name checked");
     let build_params = apply_params(&build_defaults, &build_specs, "build")?;
 
-    let index = build_index(args, vectors, &build_params)?;
+    let mut index = build_index(args, vectors, &build_params)?;
+    index.set_filter_dir(&args.data);
     let times = index.build_times();
     let build = BuildReport {
         train_s: times.train_s,
