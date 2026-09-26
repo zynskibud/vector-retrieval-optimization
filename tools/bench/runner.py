@@ -52,6 +52,19 @@ SWEEPS = {
 }
 
 
+# Per-language overrides of SWEEPS (Phase 2): Qdrant's quantization is a dimension of its HNSW.
+SWEEPS_BY_LANGUAGE = {
+    "qdrant": {
+        "hnsw": {"build": {"m": [16], "ef_construct": [100], "quant": ["none", "scalar", "product", "binary"]},
+                 "search": {"ef": [16, 32, 64, 128, 256], "rescore": [0, 1]}},
+    },
+}
+
+
+def sweep_for(lang: str, name: str) -> dict:
+    return SWEEPS_BY_LANGUAGE.get(lang, {}).get(name, SWEEPS[name])
+
+
 def grid(spec: dict) -> list[dict]:
     keys = list(spec)
     return [dict(zip(keys, vals)) for vals in itertools.product(*spec.values())]
@@ -65,8 +78,9 @@ def cases(languages: list[str], indexes: list[str], data: Path) -> list[dict]:
     """One case per (language, index, build variant)."""
     out = []
     for lang, name in itertools.product(languages, indexes):
-        for bp in grid(SWEEPS[name]["build"]):
-            searches = grid(SWEEPS[name]["search"])
+        spec = sweep_for(lang, name)
+        for bp in grid(spec["build"]):
+            searches = grid(spec["search"])
             path = Path("results/raw") / data.name / f"{lang}-{name}-{params_hash(bp)}.json"
             cmd = PROGRAMS[lang] + ["--index", name, "--data", str(data), "--out", str(path)]
             if os.environ.get("VRO_THREADS"):  # the container is capped at fewer CPUs than it reports

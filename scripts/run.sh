@@ -10,6 +10,7 @@
 #                 (Python DiskANN 1 repeat: its build takes 30 minutes), then the report
 #   full-sweep    same on the full corpus (Python HNSW and DiskANN on the dev set, see
 #                 results/summary/OPEN-QUESTIONS.md); needs Docker at 16 GB and mem_limit 12g
+#   db-sweep      Phase 2: each database in turn (up, its supported indexes on the dev set, 3 repeats, down)
 #   test          make test (light, but it still takes the lock so it never overlaps a sweep)
 #
 # Steps: preflight (stop on FAIL), take the lock with owner
@@ -62,6 +63,9 @@ case "$JOB" in
     CMD="make bench ARGS='--data data/processed --languages rust,cpp,go,faiss --indexes flat,ivf,pq,hnsw,ivf_pq,diskann --repeat 3'
 && make bench ARGS='--data data/processed --languages python --indexes flat,ivf,pq,ivf_pq --repeat 3'
 && make report ARGS='--data data/processed'" ;;
+  db-sweep)
+    CMD="for db in qdrant pgvector milvus; do make db-up DB=\$db && make bench-db ARGS=\"--data data/processed/dev --languages \$db --indexes flat,ivf,pq,ivf_pq,hnsw,diskann --repeat 3\"; make db-down DB=\$db; done
+&& make report ARGS='--data data/processed/dev'" ;;
   test) CMD="make test" ;;
   "")   echo "usage: scripts/run.sh [--dry-run] <dev-sweep|full-sweep|test> | --stop" >&2; exit 2 ;;
   *)    echo "unknown job: $JOB" >&2; exit 2 ;;
