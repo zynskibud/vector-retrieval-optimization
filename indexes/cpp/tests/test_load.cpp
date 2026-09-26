@@ -121,6 +121,11 @@ int main(int argc, char** argv) {
         CHECK(after["extra"]["inserted_rows"] == 2000);
         CHECK(after["extra"].contains("insert_p50_ms"));
         CHECK(ins["extra"]["inserted_rows"] == 2000);
+        for (const char* key : {"inserted_during_loop", "insert_tail_s", "insert_p50_ms"})
+            CHECK(ins["extra"].contains(key) && after["extra"].contains(key));
+        CHECK(ins["searches"][0]["extra"]["inserted_rows"] == 2000);
+        std::cerr << "inserted_during_loop " << ins["extra"]["inserted_during_loop"]
+                  << ", insert_tail_s " << ins["extra"]["insert_tail_s"] << "\n";
         CHECK(ins["extra"]["build_rows"] == 18000);
         double r_after = recall(after["ids"], t);
         std::cerr << "static recall " << r_static << ", after-inserts recall " << r_after

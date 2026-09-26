@@ -407,11 +407,30 @@ struct InsertJob {
     std::vector<std::int64_t> ids;  // row IDs, in order
     Matrix rows;                    // their vectors, same order
     double rate = 0.0;              // rows per second
-    std::size_t inserted = 0;
-    std::vector<double> batch_ms;
+    std::size_t inserted = 0;       // all rows inserted (loop and tail)
+    std::size_t during_loop = 0;    // rows inserted before the loop ended
+    double tail_s = 0.0;            // untimed insert tail after the loop
+    std::vector<double> batch_ms;   // per batch, loop and tail
 };
 
 constexpr std::size_t kInsertBatch = 100;
+
+// Inserts one batch of up to 100 rows, starting at job.inserted.
+void insert_batch(AnyIndex& index, InsertJob& job) {
+    std::size_t done = job.inserted;
+    std::size_t cnt = std::min(kInsertBatch, job.ids.size() - done);
+    std::vector<std::int64_t> ids(job.ids.begin() + static_cast<std::ptrdiff_t>(done),
+                                  job.ids.begin() + static_cast<std::ptrdiff_t>(done + cnt));
+    Matrix rows;
+    rows.dim = job.rows.dim;
+    rows.rows = cnt;
+    rows.data.assign(job.rows.row(done), job.rows.row(done) + cnt * rows.dim);
+    auto ts = std::chrono::steady_clock::now();
+    index.insert(ids, rows);
+    job.batch_ms.push_back(seconds_since(ts) * 1000.0);
+    job.inserted = done + cnt;
+}
+
 
 // One load run: C closed-loop workers for duration_s seconds; with job != nullptr,
 // one inserter thread at job->rate during the loop. Worker 0 finishes its first
@@ -454,32 +473,21 @@ json run_load(AnyIndex& index, const Matrix& queries, std::size_t k, const Param
     std::thread inserter;
     if (job)
         inserter = std::thread([&] {
-            std::size_t done = 0;
-            for (std::size_t b = 0; done < job->ids.size() && !stop.load(); ++b) {
+            for (std::size_t b = 0; job->inserted < job->ids.size() && !stop.load(); ++b) {
                 auto due = t0 + std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(
                                     static_cast<double>(b * kInsertBatch) / job->rate));
                 if (due >= t_end) break;
                 std::this_thread::sleep_until(due);
                 if (stop.load() || clock::now() >= t_end) break;
-                std::size_t cnt = std::min(kInsertBatch, job->ids.size() - done);
-                std::vector<std::int64_t> ids(job->ids.begin() + static_cast<std::ptrdiff_t>(done),
-                                              job->ids.begin() + static_cast<std::ptrdiff_t>(done + cnt));
-                Matrix rows;
-                rows.dim = job->rows.dim;
-                rows.rows = cnt;
-                rows.data.assign(job->rows.row(done), job->rows.row(done) + cnt * rows.dim);
-                auto ts = clock::now();
                 try {
-                    index.insert(ids, rows);
+                    insert_batch(index, *job);
                 } catch (const std::exception& e) {
                     insert_error = e.what();
                     insert_failed = true;
                     break;
                 }
-                job->batch_ms.push_back(seconds_since(ts) * 1000.0);
-                done += cnt;
             }
-            job->inserted = done;
+            job->during_loop = job->inserted;
         });
     for (auto& t : workers) t.join();
     double wall = seconds_since(t0);
@@ -517,9 +525,8 @@ json run_load(AnyIndex& index, const Matrix& queries, std::size_t k, const Param
     extra["clients"] = clients;
     extra["duration_s"] = duration_s;
     extra["queries_done"] = done;
-    if (job) {
-        extra["inserted_rows"] = job->inserted;
-        extra["insert_p50_ms"] = median(job->batch_ms);
+    if (job) {  // the tail and the final values are added by run()
+        extra["inserted_during_loop"] = job->during_loop;
         extra["insert_rate"] = job->rate;
     }
 
@@ -619,11 +626,23 @@ int run(int argc, char** argv) {
                                     args.duration, j));
     }
     if (job) {
+        // CONTRACT 12.2: insert tail, untimed by the loop, until every row is in.
+        auto tt = std::chrono::steady_clock::now();
+        while (job->inserted < job->ids.size()) insert_batch(*index, *job);
+        job->tail_s = seconds_since(tt);
+        for (auto& s : searches) {
+            if (!s["extra"].contains("inserted_during_loop")) continue;
+            s["extra"]["inserted_rows"] = job->inserted;
+            s["extra"]["insert_tail_s"] = job->tail_s;
+            s["extra"]["insert_p50_ms"] = median(job->batch_ms);
+        }
         index->finish_inserts();  // repair pass, once (CONTRACT 12.2)
         Params after = search_sets.front();
         after.values["phase"] = "after_inserts";
         json s = run_search(*index, queries, args.k, after, spec.search);
         s["extra"]["inserted_rows"] = job->inserted;
+        s["extra"]["inserted_during_loop"] = job->during_loop;
+        s["extra"]["insert_tail_s"] = job->tail_s;
         s["extra"]["insert_p50_ms"] = median(job->batch_ms);
         searches.push_back(std::move(s));
     }
@@ -639,6 +658,8 @@ int run(int argc, char** argv) {
     if (job) {
         extra["build_rows"] = build_rows;
         extra["inserted_rows"] = job->inserted;
+        extra["inserted_during_loop"] = job->during_loop;
+        extra["insert_tail_s"] = job->tail_s;
         extra["insert_p50_ms"] = median(job->batch_ms);
     }
     doc["extra"] = std::move(extra);
