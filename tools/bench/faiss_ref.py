@@ -11,6 +11,11 @@ Mapping of contract params to FAISS:
 
 FAISS k-means and HNSW use their own RNG and their own level draw, not SplitMix64 (section 5),
 so recall differs slightly from the hand-built versions at the same params.
+Filters (CONTRACT section 11): flat, ivf, hnsw take --search filter=none|top50|top10|top1|top01.
+The mask filter_<name>.npy becomes a faiss.IDSelectorBatch of the passing row IDs, passed per
+query through SearchParameters (flat), SearchParametersIVF (nprobe + sel), or
+SearchParametersHNSW (efSearch + sel). FAISS HNSW with a selector keeps expanding failing nodes
+and admits only passing ones to the result, the behavior in section 11.3.
 FAISS returns squared distances for METRIC_L2; scores are the negative squared distance (6.4.1).
 
 Run: uv run python -m tools.bench.faiss_ref --index hnsw --data data/processed/dev --out X.json --search ef=64
@@ -37,13 +42,13 @@ BUILD_DEFAULTS = {
     "hnsw": {"m": 16, "ef_construct": 100},
 }
 SEARCH_DEFAULTS = {
-    "flat": {},
-    "ivf": {"nprobe": 8},
+    "flat": {"filter": "none"},
+    "ivf": {"nprobe": 8, "filter": "none"},
     "pq": {"rerank": 0},
     "ivf_pq": {"nprobe": 8, "rerank": 0},
-    "hnsw": {"ef": 64},
+    "hnsw": {"ef": 64, "filter": "none"},
 }
-STRING_PARAMS = {"metric": {"ip", "l2"}}
+STRING_PARAMS = {"metric": {"ip", "l2"}, "filter": {"none", "top50", "top10", "top1", "top01"}}
 
 
 def usage_error(msg: str) -> None:
@@ -112,10 +117,32 @@ def set_search_params(index, name: str, sp: dict, k: int) -> None:
         index.hnsw.efSearch = max(sp["ef"], k)
 
 
-def search_one(index, x: np.ndarray, q: np.ndarray, k: int, rerank: int, metric: str):
+def load_selector(data: Path, filt: str, n: int):
+    """(IDSelectorBatch of the rows that pass filter_<filt>.npy, passing row count), or (None, n) for none."""
+    if filt == "none":
+        return None, n
+    path = data / f"filter_{filt}.npy"
+    if not path.exists():
+        usage_error(f"{path} not found; run tools.data.filters first")
+    passing = np.flatnonzero(np.load(path)[:n]).astype(np.int64)
+    return faiss.IDSelectorBatch(passing), len(passing)
+
+
+def filter_params(name: str, sp: dict, k: int, sel):
+    """SearchParameters that carry the selector, or None without a filter."""
+    if sel is None:
+        return None
+    if name == "ivf":
+        return faiss.SearchParametersIVF(nprobe=sp["nprobe"], sel=sel)
+    if name == "hnsw":
+        return faiss.SearchParametersHNSW(efSearch=max(sp["ef"], k), sel=sel)
+    return faiss.SearchParameters(sel=sel)
+
+
+def search_one(index, x: np.ndarray, q: np.ndarray, k: int, rerank: int, metric: str, params=None):
     """One query. With rerank > 0, take rerank candidates, re-score with full vectors, keep top k."""
     kk = max(k, rerank)
-    dist, ids = index.search(q, kk)
+    dist, ids = index.search(q, kk, params=params) if params is not None else index.search(q, kk)
     if rerank <= 0:
         return ids[0, :k], dist[0, :k]
     cand = ids[0][ids[0] >= 0]
@@ -133,8 +160,10 @@ def reset_stats() -> None:
     faiss.cvar.hnsw_stats.reset()
 
 
-def distance_count(name: str, index, n: int, q: int, sp: dict, rerank: int) -> float:
-    if name in ("flat", "pq"):
+def distance_count(name: str, index, n: int, q: int, sp: dict, rerank: int, filter_rows: int) -> float:
+    if name == "flat":
+        return float(filter_rows)  # FAISS scores only rows the selector accepts
+    if name == "pq":
         return float(n + rerank)
     if name == "hnsw":
         return faiss.cvar.hnsw_stats.ndis / q
@@ -214,20 +243,24 @@ def main() -> None:
 
     faiss.omp_set_num_threads(1)
     metric = bp.get("metric", "ip")
+    selectors = {f: load_selector(args.data, f, n) for f in {sp.get("filter", "none") for sp in sps}}
     set_search_params(index, name, sps[0], args.k)
+    params0 = filter_params(name, sps[0], args.k, selectors[sps[0].get("filter", "none")][0])
     for i in range(min(args.warmup, len(queries))):
-        search_one(index, x, queries[i : i + 1], args.k, sps[0].get("rerank", 0), metric)
+        search_one(index, x, queries[i : i + 1], args.k, sps[0].get("rerank", 0), metric, params0)
 
     searches = []
     for sp in sps:
         set_search_params(index, name, sp, args.k)
         rerank = sp.get("rerank", 0)
+        sel, filter_rows = selectors[sp.get("filter", "none")]
+        params = filter_params(name, sp, args.k, sel)
         ids, scores, lat = [], [], []
         reset_stats()
         t_loop = time.perf_counter()
         for i in range(len(queries)):
             t0 = time.perf_counter()
-            r_ids, r_scores = search_one(index, x, queries[i : i + 1], args.k, rerank, metric)
+            r_ids, r_scores = search_one(index, x, queries[i : i + 1], args.k, rerank, metric, params)
             lat.append((time.perf_counter() - t0) * 1000)
             ids.append(r_ids)
             scores.append(r_scores)
@@ -240,8 +273,8 @@ def main() -> None:
         searches.append({
             "search_params": sp, "ids": ids.tolist(), "scores": [score_list(r) for r in scores],
             "latency_ms": lat, "total_s": total_s, "qps": len(queries) / total_s,
-            "distance_computations": distance_count(name, index, n, len(queries), sp, rerank),
-            "extra": {},
+            "distance_computations": distance_count(name, index, n, len(queries), sp, rerank, filter_rows),
+            "extra": {"filter_rows": filter_rows} if "filter" in sp else {},
         })
         print(f"search {sp}: p50 {np.median(lat):.3f} ms", file=sys.stderr)
 

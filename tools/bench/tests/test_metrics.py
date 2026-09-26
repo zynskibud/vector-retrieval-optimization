@@ -49,3 +49,39 @@ def test_faiss_flat_recall_is_one(tmp_path):
     x = np.load(DEV / "vectors.npy", mmap_mode="r")[:20000]
     gt = np.argsort(-(np.load(DEV / "queries.npy") @ np.asarray(x).T), axis=1)[:, :10]
     assert summarize(doc, gt)[0]["recall@10"] == 1.0
+
+
+def test_summarize_picks_truth_by_filter():
+    doc = make_doc()
+    unfiltered = doc["searches"][0]
+    filtered = {**unfiltered, "search_params": {**unfiltered["search_params"], "filter": "top10"}}
+    doc["searches"] = [unfiltered, filtered]
+    # The top10 truth equals the returned IDs' first two columns, so that run scores 1.0.
+    top10 = np.array([r[:2] for r in unfiltered["ids"]])
+    top10[top10 < 0] = 99
+    rows = summarize(doc, {"none": GT, "top10": top10}, k=2)
+    assert [r["filter"] for r in rows] == ["none", "top10"]
+    assert rows[0]["recall@2"] == pytest.approx(0.5)
+    assert rows[1]["recall@2"] == pytest.approx(5 / 6)  # one -1 in the doc never matches
+    with pytest.raises(ValueError):
+        summarize(doc, GT, k=2)  # a filtered run needs its own truth
+
+
+@pytest.mark.skipif(not (DEV / "filter_top10.npy").exists(), reason="dev filters missing")
+def test_faiss_flat_filter_recall_is_one(tmp_path):
+    n = 20000
+    out = tmp_path / "flat.json"
+    subprocess.run([sys.executable, "-m", "tools.bench.faiss_ref", "--index", "flat", "--data", str(DEV),
+                    "--out", str(out), "--limit", str(n), "--warmup", "10", "--search", "filter=top10"], check=True)
+    doc = json.loads(out.read_text())
+    assert validate(doc) == []
+    mask = np.load(DEV / "filter_top10.npy")[:n]
+    passing = np.flatnonzero(mask)
+    run = doc["searches"][0]
+    assert run["search_params"]["filter"] == "top10"
+    assert run["extra"]["filter_rows"] == len(passing)
+    ids = np.array(run["ids"])
+    assert mask[ids[ids >= 0]].all()
+    x = np.asarray(np.load(DEV / "vectors.npy", mmap_mode="r")[:n])[passing]
+    gt = passing[np.argsort(-(np.load(DEV / "queries.npy") @ x.T), axis=1)[:, :10]]
+    assert summarize(doc, {"top10": gt})[0]["recall@10"] == 1.0

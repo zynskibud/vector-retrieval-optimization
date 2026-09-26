@@ -40,23 +40,44 @@ UNSUPPORTED = {("faiss", "diskann"), ("qdrant", "ivf"), ("qdrant", "ivf_pq"), ("
 
 # Per index: build variants (each value list is swept, one build per combination)
 # and the search sweep (every combination is one --search inside the same build).
+# A "search" value can also be a list of such dicts: each is gridded on its own and the
+# grids are concatenated. Phase 3 (CONTRACT section 11) uses that for flat, ivf, hnsw:
+# the unfiltered sweep as before (no filter key, which means filter=none), then the four
+# filters at the default search setting only. So a filter adds 4 searches per build, not
+# 4 x the sweep.
+FILTERS = ["top50", "top10", "top1", "top01"]
+
+
+def with_filters(unfiltered: dict, default: dict) -> list[dict]:
+    return [unfiltered, {**{k: [v] for k, v in default.items()}, "filter": FILTERS}]
+
+
 SWEEPS = {
-    "flat": {"build": {}, "search": {}},
-    "ivf": {"build": {"nlist": [1024]}, "search": {"nprobe": [1, 4, 8, 16, 32, 64]}},
+    # flat has no search params: an empty search dict makes no --search flag, so its sweep is the filter itself.
+    "flat": {"build": {}, "search": {"filter": ["none"] + FILTERS}},
+    "ivf": {"build": {"nlist": [1024]}, "search": with_filters({"nprobe": [1, 4, 8, 16, 32, 64]}, {"nprobe": 8})},
     "pq": {"build": {"m": [48], "metric": ["ip", "l2"]}, "search": {"rerank": [0, 100]}},
     "ivf_pq": {"build": {"nlist": [1024], "m": [48], "metric": ["ip", "l2"]},
                "search": {"nprobe": [4, 8, 16, 32], "rerank": [0, 100]}},
-    "hnsw": {"build": {"m": [16], "ef_construct": [100]}, "search": {"ef": [16, 32, 64, 128, 256]}},
+    "hnsw": {"build": {"m": [16], "ef_construct": [100]}, "search": with_filters({"ef": [16, 32, 64, 128, 256]}, {"ef": 64})},
     "diskann": {"build": {"r": [64], "l_build": [100], "metric": ["ip", "l2"]},
                 "search": {"l": [50, 100, 200], "io": ["mmap", "nocache"]}},
 }
 
 
 # Per-language overrides of SWEEPS (Phase 2): Qdrant's quantization is a dimension of its HNSW.
+# pgvector (Phase 3): a B-tree on views (build views_index) and iterative scans (search
+# iterative) are dimensions of its filtered search (tools/db/README.md).
 SWEEPS_BY_LANGUAGE = {
     "qdrant": {
         "hnsw": {"build": {"m": [16], "ef_construct": [100], "quant": ["none", "scalar", "product", "binary"]},
-                 "search": {"ef": [16, 32, 64, 128, 256], "rescore": [0, 1]}},
+                 "search": with_filters({"ef": [16, 32, 64, 128, 256], "rescore": [0, 1]}, {"ef": 64, "rescore": 0})},
+    },
+    "pgvector": {
+        "ivf": {"build": {"nlist": [1024], "views_index": [0, 1]},
+                "search": [{"nprobe": [1, 4, 8, 16, 32, 64]}, {"nprobe": [8], "filter": FILTERS, "iterative": [0, 1]}]},
+        "hnsw": {"build": {"m": [16], "ef_construct": [100], "views_index": [0, 1]},
+                 "search": [{"ef": [16, 32, 64, 128, 256]}, {"ef": [64], "filter": FILTERS, "iterative": [0, 1]}]},
     },
 }
 
@@ -65,7 +86,10 @@ def sweep_for(lang: str, name: str) -> dict:
     return SWEEPS_BY_LANGUAGE.get(lang, {}).get(name, SWEEPS[name])
 
 
-def grid(spec: dict) -> list[dict]:
+def grid(spec: dict | list[dict]) -> list[dict]:
+    """All combinations of a {key: values} spec; a list of specs gives their grids concatenated."""
+    if isinstance(spec, list):
+        return [g for part in spec for g in grid(part)]
     keys = list(spec)
     return [dict(zip(keys, vals)) for vals in itertools.product(*spec.values())]
 

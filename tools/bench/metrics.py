@@ -3,6 +3,9 @@
 Recall is computed here only, never inside an index program (CLAUDE.md).
 """
 
+import json
+from pathlib import Path
+
 import numpy as np
 
 
@@ -27,16 +30,58 @@ def qps(latency_ms) -> float:
     return 1000.0 * len(latency_ms) / float(np.sum(latency_ms))
 
 
+def filter_of(run: dict) -> str:
+    """The filter name of one search run (CONTRACT section 11.2); "none" when absent."""
+    return str(run["search_params"].get("filter", "none"))
+
+
+def load_truths(data_dir) -> dict:
+    """{filter name: ground-truth array} for every truth file in data_dir.
+
+    "none" is ground_truth.npy; each name in filters.json is ground_truth_<name>.npy.
+    """
+    data_dir = Path(data_dir)
+    truths = {"none": np.load(data_dir / "ground_truth.npy")}
+    for name in load_filters(data_dir):
+        path = data_dir / f"ground_truth_{name}.npy"
+        if path.exists():
+            truths[name] = np.load(path)
+    return truths
+
+
+def load_filters(data_dir) -> dict:
+    """filters.json of data_dir, or {} when the data set has no filters."""
+    path = Path(data_dir) / "filters.json"
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def truth_for(ground_truth, filter_name: str):
+    """Pick the truth for one filter. ground_truth is one array (unfiltered runs only) or a dict from load_truths."""
+    if not isinstance(ground_truth, dict):
+        if filter_name != "none":
+            raise ValueError(f"run has filter={filter_name} but only the unfiltered truth was given")
+        return ground_truth
+    if filter_name not in ground_truth:
+        raise ValueError(f"no ground truth for filter={filter_name}; known: {sorted(ground_truth)}")
+    return ground_truth[filter_name]
+
+
 def summarize(doc: dict, ground_truth, k: int = 10) -> list[dict]:
-    """One row per search setting in doc. k is the recall cutoff (at most doc['k'])."""
+    """One row per search setting in doc. k is the recall cutoff (at most doc['k']).
+
+    ground_truth is one array (used for unfiltered runs) or {filter name: array}; each run is
+    scored against the truth of its search_params["filter"] (CONTRACT section 11.2).
+    """
     k = min(k, doc["k"])
     rows = []
     for run in doc["searches"]:
-        _, recall = recall_at_k(run["ids"], ground_truth, k)
+        filt = filter_of(run)
+        _, recall = recall_at_k(run["ids"], truth_for(ground_truth, filt), k)
         lat = latency_stats(run["latency_ms"])
         rows.append({
             "language": doc["language"], "index": doc["index"], "n": doc["n"],
             "build_params": doc["build_params"], "search_params": run["search_params"],
+            "filter": filt,
             f"recall@{k}": recall, "p50_ms": lat["p50_ms"], "p90_ms": lat["p90_ms"], "p99_ms": lat["p99_ms"],
             "mean_ms": lat["mean_ms"], "qps": run["qps"], "build_s": doc["build"]["total_s"],
             "peak_rss_mb": doc["build"]["peak_rss_mb"], "index_bytes": doc["build"]["index_bytes"],
