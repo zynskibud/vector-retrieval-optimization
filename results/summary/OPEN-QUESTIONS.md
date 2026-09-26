@@ -8,6 +8,12 @@ Decisions that need the human, the default the session took, and its effect. New
 - **Default taken:** unchanged. Lowering the container to 4 CPUs would also change the benchmark builds, which use `VRO_THREADS=6`; a separate test-only limit needs a second compose service.
 - **Effect:** a test run can take 6 cores for minutes while a GPU job runs. If that hurts the other projects, add a `bench-4` service with `cpus: 4` for tests.
 
+## 2026-09-26: Phase 5 design taken without human review
+
+- **Question:** how deletes, updates, and compaction are defined and measured.
+- **Default taken (CONTRACT section 13):** nested random delete sets of 10 / 30 / 50%, an update set of 10% with new vectors that are related to the old ones, per-set ground truth from `tools/data/changes.py`; tombstone deletes (hnswlib's markDelete: deleted nodes still take part in the walk), update = delete + re-insert under the same ID, compaction = rebuild from live rows for hnsw and array cleanup for flat and ivf; databases through delete / update / compact with VACUUM + REINDEX for pgvector and compact() for Milvus. Five Opus 5.5 agents. PQ, IVF_PQ, DiskANN stay out.
+- **Effect:** recall after deletes is measured against the truth over the remaining rows, so the numbers show graph damage, not the missing rows; the compaction cost shows as the rebuild time.
+
 ## 2026-09-26: Phase 4 design taken without human review
 
 - **Question:** how to measure concurrency for the hand-built indexes and the databases, and what "searches during inserts" means.

@@ -437,3 +437,47 @@ With `--clients 1` and no `--duration`, `bench` behaves exactly as before (one p
 ### 12.5 Tests
 
 For each language's hnsw and each database: `--clients 8 --duration 5` on 20,000 rows gives qps > 1-client qps, zero errors, and recall of the first pass ≥ the one-thread floor; `--clients 4 --duration 10 --insert-rate 2000` on 20,000 rows (build on 18,000) gives zero errors, `inserted_rows` = 2,000, and after-inserts recall within 0.01 of a static build on 20,000 rows. Tests must stop their database afterwards.
+
+## 13. Updates and deletes (Phase 5)
+
+Phase 5 measures what happens to an index after rows are deleted or replaced: recall against the new truth, latency, memory or disk, and the cost of a repair (compaction or rebuild). It applies to `flat`, `ivf`, `hnsw` in the four languages, and to every index of the three databases.
+
+### 13.1 The change sets
+
+`tools/data/changes.py` writes into the data directory, with a fixed seed:
+
+| File | Type | Meaning |
+|---|---|---|
+| `delete_del10.npy`, `delete_del30.npy`, `delete_del50.npy` | bool (N,) | row i is deleted (10%, 30%, 50% of rows, chosen uniformly at random; the sets are nested: del10 ⊂ del30 ⊂ del50) |
+| `ground_truth_del10.npy` etc. (+ `_scores`) | int64 (Q, 100) | exact top-100 among the rows that remain |
+| `update_upd10_ids.npy` | int64 (K,) | the 10% of rows that get a new vector (K = N/10, random, disjoint from nothing in particular) |
+| `update_upd10_vectors.npy` | float32 (K, 384) | the new vectors: `normalize(0.6 · old + 0.8 · r)` with r a random unit vector, so the new vector is related to the old one but ranks differently |
+| `ground_truth_upd10.npy` (+ `_scores`) | int64 (Q, 100) | exact top-100 over the corpus with those K rows replaced |
+| `changes.json` | | counts and the seed |
+
+### 13.2 Command line and output
+
+New `bench` flags, applied after the build and before the searches, each timed and reported in `extra`:
+
+- `--delete del10|del30|del50`: mark the rows deleted (`extra.delete_s`, `extra.deleted_rows`).
+- `--update upd10`: replace the K vectors under the same IDs (`extra.update_s`, `extra.updated_rows`). Not combined with `--delete` in one run.
+- `--compact`: after the delete or update, run the index's repair (`extra.compact_s`, and `extra.index_bytes_after`, `extra.disk_bytes_after` where they exist). Without it, the index serves searches with tombstones.
+
+The search runs carry `search_params.deleted = <name>`, `search_params.updated = <name>`, and `search_params.compacted = 0|1`, so the report picks the matching truth (`ground_truth_del30.npy`, `ground_truth_upd10.npy`). A returned ID that is deleted counts as wrong (the report checks it and reports `deleted_returned` per run).
+
+### 13.3 Algorithms
+
+- **Delete = tombstone.** A bit set of deleted rows. `flat`: skip tombstoned rows. `ivf`: skip tombstoned rows in the scanned lists. `hnsw`: a tombstoned node still takes part in the walk (it is expanded, and its edges are followed) but never enters the result list. That is hnswlib's `markDelete`. Recall is measured against the truth over the remaining rows.
+- **Update = delete + insert under the same ID.** `flat` and `ivf`: overwrite the vector (ivf: move the ID to the list of its new center). `hnsw`: overwrite the vector, drop the node's out-edges on every layer, remove it from its old neighbors' lists (a scan over those lists), and re-run the insert procedure for the node with its existing level; the repair pass afterwards. The node ID and level are unchanged.
+- **Compact / rebuild.** `flat` and `ivf`: drop tombstoned rows from the arrays and lists (`index_bytes_after` shrinks). `hnsw`: **rebuild** the graph from the live rows with the same parameters and PRNG (levels redrawn for the live rows in row order), which is what a database compaction does for a graph index; report the rebuild time as `compact_s`. A cheaper in-place repair is allowed as an extra mode `--compact-mode repair` and must be described.
+- **Memory.** `index_bytes` is reported before and after compaction; the tombstone bit set counts (N/8 bytes).
+
+### 13.4 Databases (tools/db)
+
+`delete(ids)`, `update(ids, vectors, meta_rows)`, `compact()`, plus `stats()` with `disk_bytes` before and after. Qdrant: delete points, upsert, and `update_collection` with the optimizer's `vacuum_min_vector_number` lowered plus a wait for green (Qdrant compacts on its own; report the segment count and disk before and after). pgvector: `DELETE`, `UPDATE`, then `VACUUM (ANALYZE) items` and `REINDEX INDEX` as the compaction (report `pg_relation_size` before and after; note that pgvector's HNSW keeps deleted tuples in the graph until `REINDEX`). Milvus: `delete(filter="id in [...]")`, `upsert`, `compact()` with a wait, `get_collection_stats` before and after.
+
+### 13.5 Report and tests
+
+`<index>-delete.png`: recall (y) against deleted fraction (x: 0, 0.1, 0.3, 0.5) at the default search setting, one line per system, solid before and dashed after compaction; and p50 likewise. A table of `compact_s`, `index_bytes` / `disk_bytes` before and after.
+
+Tests, on 20,000 rows with truth computed in the test: after `del30` no deleted ID is returned, and recall@10 against the remaining-rows truth is within 0.03 of the undeleted recall for flat (= 1.0), ivf, hnsw; after `upd10`, for 100 sampled updated rows a query equal to the row's new vector returns that row as the top-1; after `--compact`, recall is within 0.01 of a fresh build on the remaining rows and `index_bytes_after < index_bytes` for flat and ivf. The databases: the same checks, and `disk_bytes` reported before and after compaction.
