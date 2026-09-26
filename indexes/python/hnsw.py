@@ -48,10 +48,11 @@ import time
 
 import numpy as np
 
-from . import splitmix
+from . import filters, splitmix
 
 BUILD_PARAMS: dict = {"m": 16, "ef_construct": 100}
-SEARCH_PARAMS: dict = {"ef": 64}
+SEARCH_PARAMS: dict = {"ef": 64, "filter": "none"}
+DATA_DIR = None  # set by bench; filter_<name>.npy lives here (CONTRACT 11)
 
 
 def draw_levels(n: int, m: int, seed: int) -> np.ndarray:
@@ -149,10 +150,12 @@ class _Graph:
         heapq.heapify(res)
         while len(res) > ef:
             pop(res)
+        expanded = 0
         while cand:
             ns, c = pop(cand)
             if len(res) >= ef and -ns < res[0][0]:
                 break
+            expanded += 1
             nb = [e for e in self.neighbors(c, layer) if not visited[e]]
             if not nb:
                 continue
@@ -170,6 +173,61 @@ class _Graph:
                     heapq.heapreplace(res, (se, -e))
         for i in touched:
             visited[i] = 0
+        self.expanded = expanded
+        return [(s, -ni) for s, ni in res]
+
+    def search_layer_filtered(self, q, eps, ef, layer, allow):
+        """Search-layer with a filter (CONTRACT 11.3). allow: bool (N,).
+
+        A node enters the result heap only if allow[node]. Every scored node that is better than
+        the worst result (or any node while the result heap is not full) enters the candidate heap
+        and is expanded later, so the walk can cross failing regions. The stop rule is unchanged.
+        Sets self.expanded to the number of nodes popped and expanded.
+        """
+        visited = self.visited
+        touched = []
+        v = self.v
+        push, pop = heapq.heappush, heapq.heappop
+        cand = []
+        res = []
+        for s, i in eps:
+            if not visited[i]:
+                visited[i] = 1
+                touched.append(i)
+            cand.append((-s, i))
+            if allow[i]:
+                res.append((s, -i))
+        heapq.heapify(cand)
+        heapq.heapify(res)
+        while len(res) > ef:
+            pop(res)
+        expanded = 0
+        while cand:
+            ns, c = pop(cand)
+            if len(res) >= ef and -ns < res[0][0]:
+                break
+            expanded += 1
+            nb = [e for e in self.neighbors(c, layer) if not visited[e]]
+            if not nb:
+                continue
+            for e in nb:
+                visited[e] = 1
+            touched.extend(nb)
+            s = (v[nb] @ q).tolist()
+            self.dist += len(nb)
+            for e, se in zip(nb, s):
+                full = len(res) >= ef
+                if full and se <= res[0][0]:
+                    continue
+                push(cand, (-se, e))
+                if allow[e]:
+                    if full:
+                        heapq.heapreplace(res, (se, -e))
+                    else:
+                        push(res, (se, -e))
+        for i in touched:
+            visited[i] = 0
+        self.expanded = expanded
         return [(s, -ni) for s, ni in res]
 
     def select(self, scored, limit, keep=None):
@@ -382,7 +440,14 @@ def search(index: dict, query: np.ndarray, k: int, params: dict) -> tuple[np.nda
     g.dist = 1
     for layer in range(index["top"], 0, -1):
         ep, ep_s = g.greedy(query, ep, ep_s, layer)
-    w = g.search_layer(query, [(ep_s, ep)], ef, 0)
+    # The upper-layer descent above ignores the filter; only layer 0 applies it.
+    mask = filters.mask(DATA_DIR, params.get("filter", "none"), len(g.v))
+    if mask is None:
+        w = g.search_layer(query, [(ep_s, ep)], ef, 0)
+        index["search_extra"] = {"filter_rows": len(g.v), "visited": g.expanded}
+    else:
+        w = g.search_layer_filtered(query, [(ep_s, ep)], ef, 0, mask)
+        index["search_extra"] = {"filter_rows": filters.count(mask), "visited": g.expanded}
     w.sort(key=lambda t: (-t[0], t[1]))
     w = w[:k]
     out_ids[: len(w)] = [i for _, i in w]

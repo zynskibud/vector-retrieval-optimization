@@ -13,10 +13,11 @@ import time
 
 import numpy as np
 
-from . import distance, kmeans
+from . import distance, filters, kmeans
 
 BUILD_PARAMS: dict = {"nlist": 1024, "train_size": None, "iters": 20}
-SEARCH_PARAMS: dict = {"nprobe": 8}
+SEARCH_PARAMS: dict = {"nprobe": 8, "filter": "none"}
+DATA_DIR = None  # set by bench; filter_<name>.npy lives here (CONTRACT 11)
 
 
 def build(vectors: np.ndarray, params: dict, threads: int, seed: int) -> dict:
@@ -66,7 +67,11 @@ def search(index: dict, query: np.ndarray, k: int, params: dict) -> tuple[np.nda
     probe, _ = distance.top_k(center_scores, nprobe)
 
     ids = np.concatenate([list_ids[offsets[c] : offsets[c + 1]] for c in probe])
+    mask = filters.mask(DATA_DIR, params.get("filter", "none"), len(index["vectors"]))
+    if mask is not None:
+        ids = ids[mask[ids]]  # skip rows that fail the filter; only passing rows are scored
     index["distance_computations"] = nlist + len(ids)
+    index["search_extra"] = {"filter_rows": len(index["vectors"]) if mask is None else int(filters.count(mask))}
     return distance.top_k(distance.scores(query, index["vectors"][ids]), k, ids)
 
 

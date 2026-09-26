@@ -145,6 +145,12 @@ def run(args) -> dict:
 
     if hasattr(mod, "OUT_PATH"):  # diskann writes <out>.diskann next to the output JSON (CONTRACT 6.7)
         mod.OUT_PATH = args.out
+    if hasattr(mod, "DATA_DIR"):  # flat, ivf, hnsw read filter_<name>.npy from here (CONTRACT 11)
+        mod.DATA_DIR = args.data
+        from . import filters
+        for p in searches:  # a bad filter name is a usage error, found before the slow build
+            if str(p.get("filter", "none")) not in filters.NAMES:
+                raise UsageError(f"unknown filter {p['filter']!r}; known: {list(filters.NAMES)}")
     index = mod.build(vectors, build_params, args.threads, args.seed)
     build = {
         "train_s": index["train_s"],
