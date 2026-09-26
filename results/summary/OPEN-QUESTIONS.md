@@ -2,6 +2,12 @@
 
 Decisions that need the human, the default the session took, and its effect. Newest first. Remove an entry when the human decides.
 
+## 2026-09-26: Phase 2 design taken without human review
+
+- **Question:** the design of the database phase (services, client interface, what is measured, agents). CLAUDE.md asks for approval before a large change; PROTOCOL.md says to take a default and log it.
+- **Default taken:** Qdrant v1.19, pgvector 0.8.6 on Postgres 17, Milvus standalone (with etcd and MinIO), each as a compose service under a profile, on an internal Docker network with no external access, capped at 4 GB. One Python client module per database in `tools/db/` with the same four functions (load, build_index, search, stats). `tools/db/bench.py` uses the same command line and output JSON as the language benches with `language = qdrant | pgvector | milvus`, so the runner, schema check, and report work unchanged. Extra measurements: load time, server-side index build time, data-directory disk use, container memory. Search latency includes a localhost network round trip. Three Opus 5.5 agents, one per database, each stops its database after its tests.
+- **Effect:** the database results appear as more lines on the Phase 1 plots. The network round trip adds about 0.1 to 0.3 ms per query to every database number; the write-up must say so. If you want a different database set or client design, say so before the Phase 2 sweep runs.
+
 ## 2026-09-25: Full-corpus Python HNSW and DiskANN use the 100k subset
 
 - **Question:** the pure-Python builds take 30 to 60 minutes per run at 1.2M rows (HNSW sequential insert, DiskANN two Vamana passes), and each sweep needs several builds.

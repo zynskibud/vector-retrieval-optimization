@@ -3,7 +3,7 @@
 RUN   := docker compose run --rm bench
 SETUP := docker compose run --rm setup
 
-.PHONY: image setup build test bench report shell clean-raw
+.PHONY: image setup build test bench report shell clean-raw db-up db-down dbbench db-test bench-db
 
 image:
 	docker compose build
@@ -39,3 +39,18 @@ shell:
 ## delete the raw results volume (results/summary on the host is kept)
 clean-raw:
 	docker compose down -v --remove-orphans
+
+## Phase 2: one database at a time. e.g. make db-up DB=qdrant; make db-test DB=qdrant; make db-down DB=qdrant
+db-up:
+	docker compose --profile $(DB) up -d --wait
+db-down:
+	docker compose --profile $(DB) down
+## run the database bench (tools.db.bench) inside the container on the internal network
+## e.g. make dbbench ARGS="--db qdrant --index hnsw --data data/processed/dev --out results/raw/dev/qdrant-hnsw.json --search ef=64"
+dbbench:
+	docker compose --profile db run --rm dbbench uv run --frozen python -m tools.db.bench $(ARGS)
+## the runner for databases, inside dbbench: make bench-db ARGS="--data data/processed/dev --languages qdrant --indexes hnsw"
+bench-db:
+	docker compose --profile db run --rm dbbench uv run --frozen python -m tools.bench.runner $(ARGS)
+db-test:
+	docker compose --profile db run --rm dbbench uv run --frozen pytest tools/db/tests/test_$(DB).py -q

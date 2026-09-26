@@ -51,7 +51,94 @@ services:
   setup:
     <<: *bench
 
+  # Phase 2: the same bench image on the internal database network. No external
+  # access (the network is internal). Runs tools.db.bench against one database.
+  dbbench:
+    <<: *bench
+    profiles: [db]
+    networks: [dbnet]
+
+  # Phase 2 databases. One at a time. Each under a profile, so `make test` and the
+  # sweeps never start them. Data in named volumes, so backup/restore (Phase 7)
+  # can inspect them. Memory caps: 4 GB now, 8 GB for the full-corpus runs.
+  qdrant:
+    image: qdrant/qdrant:v1.19.1
+    profiles: [qdrant, db]
+    networks: [dbnet]
+    volumes:
+      - qdrant-data:/qdrant/storage
+      - qdrant-snapshots:/qdrant/snapshots
+    cpus: 4
+    mem_limit: 4g
+
+  pgvector:
+    image: pgvector/pgvector:0.8.6-pg17-trixie
+    profiles: [pgvector, db]
+    networks: [dbnet]
+    environment:
+      POSTGRES_USER: vro
+      POSTGRES_PASSWORD: vro
+      POSTGRES_DB: vro
+    command: >
+      postgres -c shared_buffers=1GB -c maintenance_work_mem=1GB
+               -c max_parallel_maintenance_workers=4 -c max_parallel_workers=4
+               -c max_wal_size=2GB
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    cpus: 4
+    mem_limit: 4g
+
+  milvus-etcd:
+    image: quay.io/coreos/etcd:v3.5.18
+    profiles: [milvus, db]
+    networks: [dbnet]
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command: etcd -advertise-client-urls=http://milvus-etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    volumes:
+      - milvus-etcd:/etcd
+    mem_limit: 512m
+
+  milvus-minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    profiles: [milvus, db]
+    networks: [dbnet]
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    command: minio server /minio_data
+    volumes:
+      - milvus-minio:/minio_data
+    mem_limit: 512m
+
+  milvus:
+    image: milvusdb/milvus:v3.0.2
+    profiles: [milvus, db]
+    networks: [dbnet]
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: milvus-etcd:2379
+      MINIO_ADDRESS: milvus-minio:9000
+    volumes:
+      - milvus-data:/var/lib/milvus
+    depends_on: [milvus-etcd, milvus-minio]
+    cpus: 4
+    mem_limit: 4g
+
+networks:
+  dbnet:
+    internal: true      # containers on it reach each other and nothing outside
+
 volumes:
+  qdrant-data:
+  qdrant-snapshots:
+  pg-data:
+  milvus-etcd:
+  milvus-minio:
+  milvus-data:
   raw:
   scratch:
   venv:

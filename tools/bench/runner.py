@@ -26,8 +26,17 @@ PROGRAMS = {
     "cpp": ["indexes/cpp/build/bench"],
     "rust": ["indexes/rust/target/release/bench"],
     "faiss": ["uv", "run", "python", "-m", "tools.bench.faiss_ref"],
+    # Phase 2 databases: run inside the dbbench container (make dbbench / make bench-db).
+    "qdrant": ["uv", "run", "python", "-m", "tools.db.bench", "--db", "qdrant"],
+    "pgvector": ["uv", "run", "python", "-m", "tools.db.bench", "--db", "pgvector"],
+    "milvus": ["uv", "run", "python", "-m", "tools.db.bench", "--db", "milvus"],
 }
-PYTHON_MODULES = {"python": Path("indexes/python/bench.py"), "faiss": Path("tools/bench/faiss_ref.py")}
+PYTHON_MODULES = {"python": Path("indexes/python/bench.py"), "faiss": Path("tools/bench/faiss_ref.py"),
+                  "qdrant": Path("tools/db/qdrant.py"), "pgvector": Path("tools/db/pgvector.py"),
+                  "milvus": Path("tools/db/milvus.py")}
+# (language, index) pairs that do not exist; the runner skips them.
+UNSUPPORTED = {("faiss", "diskann"), ("qdrant", "ivf"), ("qdrant", "ivf_pq"), ("qdrant", "diskann"),
+               ("pgvector", "pq"), ("pgvector", "ivf_pq"), ("pgvector", "diskann"), ("milvus", "pq")}
 
 # Per index: build variants (each value list is swept, one build per combination)
 # and the search sweep (every combination is one --search inside the same build).
@@ -153,8 +162,8 @@ def main() -> None:
             print(shlex.join(case["cmd"]))
         elif not program_exists(case["language"]):
             print(f"{case['out'].name}: skipped, bench program for {case['language']} not found ({shlex.join(PROGRAMS[case['language']])})")
-        elif case["language"] == "faiss" and case["index"] == "diskann":
-            print(f"{case['out'].name}: skipped, faiss has no diskann")
+        elif (case["language"], case["index"]) in UNSUPPORTED:
+            print(f"{case['out'].name}: skipped, {case['language']} has no {case['index']}")
         elif case["out"].exists() and not args.force:
             print(f"{case['out'].name}: exists, skipped (use --force)")
         else:
