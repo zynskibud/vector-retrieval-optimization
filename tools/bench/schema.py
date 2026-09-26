@@ -8,7 +8,7 @@ import json
 import sys
 from pathlib import Path
 
-LANGUAGES = {"python", "go", "cpp", "rust", "faiss"}  # faiss = the reference (tools/bench/faiss_ref.py)
+LANGUAGES = {"python", "go", "cpp", "rust", "faiss", "qdrant", "pgvector", "milvus"}  # faiss = the reference (tools/bench/faiss_ref.py)
 INDEXES = {"flat", "ivf", "pq", "ivf_pq", "hnsw", "diskann"}
 TOP_KEYS = {
     "contract_version": int, "language": str, "index": str, "data_dir": str, "n": int, "dim": int,

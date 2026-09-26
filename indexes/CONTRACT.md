@@ -71,7 +71,7 @@ One file per `bench` invocation. Keys and types are exact. Extra keys are allowe
 ```json
 {
   "contract_version": 1,
-  "language": "rust",                  // python | go | cpp | rust | faiss (the reference, tools/bench/faiss_ref.py)
+  "language": "rust",                  // python | go | cpp | rust | faiss (the reference) | qdrant | pgvector | milvus (Phase 2, tools/db/)
   "index": "hnsw",
   "data_dir": "data/processed",
   "n": 1211690,                        // corpus rows used (after --limit)

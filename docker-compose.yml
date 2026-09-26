@@ -47,10 +47,12 @@ services:
     <<: *bench
     build: .            # only this service builds the image; setup reuses it
     network_mode: none
+    profiles: [tools]   # so `docker compose --profile <db> up` never starts this one-shot service (run still works)
 
   # Network on, for the one-time dependency downloads (uv sync, cargo fetch).
   setup:
     <<: *bench
+    profiles: [tools]
 
   # Phase 2: the same bench image on the internal database network. No external
   # access (the network is internal). Runs tools.db.bench against one database.
@@ -86,6 +88,9 @@ services:
                -c max_wal_size=2GB
     volumes:
       - pg-data:/var/lib/postgresql/data
+    # A parallel index build keeps maintenance_work_mem (1GB) in dynamic shared
+    # memory under /dev/shm; Docker's default 64 MB fails with DiskFull.
+    shm_size: 1536m
     cpus: 4
     mem_limit: 4g
 
