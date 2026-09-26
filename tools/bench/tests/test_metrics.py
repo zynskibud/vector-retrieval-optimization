@@ -85,3 +85,25 @@ def test_faiss_flat_filter_recall_is_one(tmp_path):
     x = np.asarray(np.load(DEV / "vectors.npy", mmap_mode="r")[:n])[passing]
     gt = passing[np.argsort(-(np.load(DEV / "queries.npy") @ x.T), axis=1)[:, :10]]
     assert summarize(doc, {"top10": gt})[0]["recall@10"] == 1.0
+
+
+def test_summarize_load_fields(tmp_path):
+    from tools.bench.report import plot_load
+    import pandas as pd
+    from tools.bench.tests.test_schema import make_load_doc
+
+    doc = make_load_doc()
+    doc["searches"][0]["extra"].update({"insert_rate": 1000.0, "inserted_rows": 5})
+    gt = np.array([[0, 1], [2, 3], [4, 5]])
+    row = summarize(doc, gt, k=2)[0]
+    assert row["recall@2"] == 5 / 6  # from worker 0's first-pass ids
+    assert row["clients"] == 2 and row["cpu_pct"] == 150.0 and row["errors"] == 0 and row["insert_rate"] == 1000.0
+    assert row["p99_ms"] > 0 and row["phase"] == ""
+    plain = summarize(make_doc(), gt, k=2)[0]
+    assert np.isnan(plain["clients"]) and plain["insert_rate"] == 0
+    df = pd.DataFrame([
+        {"is_load": True, "filter": "none", "load_line": line, "clients": c, "qps": 100.0 * c, "p99_ms": 1.0 + c}
+        for line in ("rust", "rust +inserts") for c in (1, 2, 4)])
+    assert plot_load(df, "hnsw", "t", tmp_path / "hnsw-load.png")
+    assert (tmp_path / "hnsw-load.png").stat().st_size > 0
+    assert not plot_load(df.assign(is_load=False), "hnsw", "t", tmp_path / "x.png")

@@ -68,3 +68,43 @@ def test_machine_and_distance_computations():
     del doc["machine"]["cores"]
     del doc["searches"][0]["distance_computations"]
     assert len(validate(copy.deepcopy(doc))) == 2
+
+
+def make_load_doc() -> dict:
+    """make_doc with one load run (CONTRACT section 12.1): 5 latencies from 2 clients."""
+    doc = make_doc()
+    run = doc["searches"][0]
+    run["latency_ms"] = [0.1, 0.2, 0.3, 0.2, 0.1]
+    run["extra"] = {"errors": 0, "cpu_pct": 150.0, "clients": 2, "duration_s": 1, "queries_done": 5}
+    return doc
+
+
+def test_load_run_valid():
+    assert validate(make_load_doc()) == []
+
+
+def test_load_run_missing_keys():
+    doc = make_load_doc()
+    del doc["searches"][0]["extra"]["cpu_pct"]
+    del doc["searches"][0]["extra"]["errors"]
+    assert validate(doc) == ["searches[0].extra: missing key 'errors'", "searches[0].extra: missing key 'cpu_pct'"]
+
+
+def test_load_run_latency_must_match_queries_done():
+    doc = make_load_doc()
+    doc["searches"][0]["extra"]["queries_done"] = 6
+    assert "queries_done" in validate(doc)[0]
+
+
+def test_non_load_run_still_needs_q_latencies():
+    doc = make_doc()
+    doc["searches"][0]["latency_ms"] = [0.1, 0.2, 0.3, 0.4]
+    assert validate(doc) == ["searches[0].latency_ms: expected 3 values, got 4"]
+
+
+def test_phase():
+    doc = make_doc()
+    doc["searches"][0]["search_params"]["phase"] = "after_inserts"
+    assert validate(doc) == []
+    doc["searches"][0]["search_params"]["phase"] = "during"
+    assert "phase" in validate(doc)[0]

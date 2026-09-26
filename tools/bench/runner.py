@@ -4,6 +4,13 @@ Cases never run in parallel: latency numbers depend on an idle CPU.
 Outputs: results/raw/<data-name>/<language>-<index>-<hash of build params>.json
 
 Run: uv run python -m tools.bench.runner --data data/processed/dev --languages faiss --indexes flat,ivf,hnsw [--repeat 3] [--dry-run]
+
+Load mode (Phase 4, CONTRACT section 12): --load sweeps --clients over LOAD_CLIENTS at the default
+search setting, plus one run with --clients 8 --insert-rate 1000, --duration 20, repeat 1.
+Languages run hnsw only; databases run all their supported indexes through tools.load.bench.
+Outputs: results/raw/<data-name>/load-<system>-<index>-c<C>[-ins<R>].json
+  uv run python -m tools.bench.runner --load --data data/processed/dev --languages rust,cpp,go,python
+  uv run python -m tools.bench.runner --load --data data/processed/dev --languages qdrant   (in dbbench)
 """
 
 import argparse
@@ -82,6 +89,36 @@ SWEEPS_BY_LANGUAGE = {
 }
 
 
+# Phase 4 load mode.
+LOAD_CLIENTS = [1, 2, 4, 8, 16, 32, 64]
+LOAD_INSERT = {"clients": 8, "insert_rate": 1000}
+LOAD_LANGUAGES = ("python", "go", "cpp", "rust")  # their bench takes --clients, --duration, --insert-rate
+LOAD_PROGRAMS = {db: ["uv", "run", "python", "-m", "tools.load.bench", "--db", db] for db in ("qdrant", "pgvector", "milvus")}
+# Databases: every supported index (tools/db/base.py SUPPORTED); languages: hnsw only.
+LOAD_INDEXES = {"qdrant": ["flat", "pq", "hnsw"], "pgvector": ["flat", "ivf", "hnsw"],
+                "milvus": ["flat", "ivf", "ivf_pq", "hnsw", "diskann"]}
+
+
+def load_cases(languages: list[str], indexes: list[str], data: Path, duration: float) -> list[dict]:
+    """One case per (system, index, clients), plus one insert run per (system, index)."""
+    out = []
+    for lang in languages:
+        for name in [i for i in LOAD_INDEXES.get(lang, ["hnsw"]) if i in indexes]:
+            prog = LOAD_PROGRAMS.get(lang, PROGRAMS[lang])
+            runs = [(c, 0) for c in LOAD_CLIENTS] + [(LOAD_INSERT["clients"], LOAD_INSERT["insert_rate"])]
+            for c, rate in runs:
+                tag = f"c{c}" + (f"-ins{rate}" if rate else "")
+                path = Path("results/raw") / data.name / f"load-{lang}-{name}-{tag}.json"
+                cmd = prog + ["--index", name, "--data", str(data), "--out", str(path),
+                              "--clients", str(c), "--duration", str(duration)]
+                if rate:
+                    cmd += ["--insert-rate", str(rate)]
+                if os.environ.get("VRO_THREADS") and lang not in LOAD_PROGRAMS:
+                    cmd += ["--threads", os.environ["VRO_THREADS"]]
+                out.append({"language": lang, "index": name, "out": path, "cmd": cmd})
+    return out
+
+
 def sweep_for(lang: str, name: str) -> dict:
     return SWEEPS_BY_LANGUAGE.get(lang, {}).get(name, SWEEPS[name])
 
@@ -134,7 +171,7 @@ def mean_p50(doc: dict) -> float:
     return statistics.mean(statistics.median(s["latency_ms"]) for s in doc["searches"])
 
 
-def run_case(case: dict, timeout: float | None, repeat: int) -> None:
+def run_case(case: dict, timeout: float | None, repeat: int) -> int | str:
     """Run a case `repeat` times as separate processes and keep the run with the median p50.
 
     macOS moves a process between performance and efficiency cores, so one run can be
@@ -153,7 +190,8 @@ def run_case(case: dict, timeout: float | None, repeat: int) -> None:
             err = out.with_suffix(".stderr.txt")
             err.write_text(stderr)
             print(f"{out.name}: exit {code} on run {i} in {time.perf_counter() - t0:.1f}s, stderr saved to {err}", flush=True)
-            return
+            case["stderr"] = stderr
+            return code
         doc = json.loads(tmp.read_text())
         runs.append((mean_p50(doc), doc))
         tmp.unlink()
@@ -166,6 +204,7 @@ def run_case(case: dict, timeout: float | None, repeat: int) -> None:
     print(f"{out.name}: exit 0 in {time.perf_counter() - t0:.1f}s{spread}", flush=True)
     for e in validate(doc):
         print(f"  schema: {e}")
+    return 0
 
 
 def wait_for_idle(max_load: float, patience_s: float = 180.0) -> float:
@@ -184,19 +223,31 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", type=Path, default=Path("data/processed/dev"))
     ap.add_argument("--languages", default="python,go,cpp,rust,faiss")
-    ap.add_argument("--indexes", default=",".join(SWEEPS))
+    ap.add_argument("--indexes", default=None, help="default: all (load mode: hnsw for languages, all supported for databases)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--timeout", type=float, default=None)
     ap.add_argument("--repeat", type=int, default=3, help="runs per case; the median-p50 run is kept")
+    ap.add_argument("--load", action="store_true", help="Phase 4: clients sweep plus one insert run (repeat 1)")
+    ap.add_argument("--duration", type=float, default=20.0, help="load mode: seconds per run")
     ap.add_argument("--max-load", type=float, default=2.0, help="wait (up to 3 min) while the 1-minute load average is above this")
     args = ap.parse_args()
-    languages, indexes = args.languages.split(","), args.indexes.split(",")
+    languages, indexes = args.languages.split(","), (args.indexes or ",".join(SWEEPS)).split(",")
     for bad in [l for l in languages if l not in PROGRAMS] + [i for i in indexes if i not in SWEEPS]:
         sys.exit(f"unknown language or index: {bad}")
+    if args.load:
+        bad = [l for l in languages if l not in LOAD_LANGUAGES and l not in LOAD_PROGRAMS]
+        if bad:
+            sys.exit(f"load mode has no {bad}; known: {list(LOAD_LANGUAGES) + list(LOAD_PROGRAMS)}")
+        todo, repeat = load_cases(languages, indexes, args.data, args.duration), 1
+    else:
+        todo, repeat = cases(languages, indexes, args.data), args.repeat
 
-    for case in cases(languages, indexes, args.data):
-        if args.dry_run:
+    no_load: set[str] = set()  # languages whose bench rejected --clients (exit 2)
+    for case in todo:
+        if case["language"] in no_load:
+            print(f"{case['out'].name}: skipped, {case['language']} bench has no --clients")
+        elif args.dry_run:
             print(shlex.join(case["cmd"]))
         elif not program_exists(case["language"]):
             print(f"{case['out'].name}: skipped, bench program for {case['language']} not found ({shlex.join(PROGRAMS[case['language']])})")
@@ -206,7 +257,11 @@ def main() -> None:
             print(f"{case['out'].name}: exists, skipped (use --force)")
         else:
             case["load1"] = wait_for_idle(args.max_load)
-            run_case(case, args.timeout, args.repeat)
+            code = run_case(case, args.timeout, repeat)
+            if args.load and code == 2 and case["language"] in LOAD_LANGUAGES:
+                last = (case.get("stderr") or "").strip().splitlines()[-1:] or ["(no stderr)"]
+                print(f"  {case['language']}: bench exits 2 on --clients ({last[0]}); skipping its other load runs")
+                no_load.add(case["language"])
 
 
 if __name__ == "__main__":

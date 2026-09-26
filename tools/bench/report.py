@@ -2,7 +2,8 @@
 
 Writes results/summary/<data-name>/: results.csv, results.md, <index>.png, and for each index
 with filtered runs (CONTRACT section 11) <index>-filter.png: recall@10 and p50 latency against
-the filter's selectivity, one line per system, at the default search setting.
+the filter's selectivity, one line per system, at the default search setting; and for each index
+with load runs (extra.clients, CONTRACT section 12) <index>-load.png: QPS and p99 against clients.
 
 Run: uv run python -m tools.bench.report --data data/processed/dev
 """
@@ -61,6 +62,8 @@ def load_rows(raw: Path, gt, filters: dict | None = None) -> pd.DataFrame:
             r["sweep"] = r["search_params"].get(SWEEP_KEY.get(r["index"], ""), "")
             r["build_params"], r["search_params"] = fmt_params(r["build_params"]), fmt_params(r["search_params"])
             r["file"] = path.name
+            r["is_load"] = not pd.isna(r["clients"])
+            r["load_line"] = r["language"] + (" +inserts" if r["insert_rate"] else "")
             rows.append(r)
     return pd.DataFrame(rows)
 
@@ -116,6 +119,35 @@ def plot_filter(df: pd.DataFrame, index: str, title: str, out: Path) -> bool:
     return True
 
 
+def plot_load(df: pd.DataFrame, index: str, title: str, out: Path) -> bool:
+    """QPS and p99 against clients (log x), one line per system; runs with inserts are their own
+    line ("+inserts"). Returns False (and writes nothing) when the index has no load run."""
+    g = df[df["is_load"] & (df["filter"] == "none")]
+    if g.empty:
+        return False
+    fig, (ax_q, ax_p) = plt.subplots(1, 2, figsize=(13, 5))
+    for line, h in g.groupby("load_line"):
+        h = h.groupby("clients", as_index=False)[["qps", "p99_ms"]].median().sort_values("clients")
+        style = "--" if line.endswith("+inserts") else "-"
+        ax_q.plot(h["clients"], h["qps"], style, marker="o", label=line)
+        ax_p.plot(h["clients"], h["p99_ms"], style, marker="o", label=line)
+    ticks = sorted(g["clients"].unique())
+    for ax, ylab in ((ax_q, "queries per second (all clients)"), (ax_p, "p99 latency (ms, log scale)")):
+        ax.set_xscale("log", base=2)
+        ax.set_xticks(ticks, [str(int(t)) for t in ticks])
+        ax.minorticks_off()
+        ax.set_xlabel("concurrent clients (log scale)")
+        ax.set_ylabel(ylab)
+        ax.grid(True, alpha=0.3)
+    ax_p.set_yscale("log")
+    ax_q.legend(fontsize=8)
+    fig.suptitle(f"{index} under load: {title}  (default search setting; databases include the client round trip)")
+    fig.tight_layout()
+    fig.savefig(out, dpi=120)
+    plt.close(fig)
+    return True
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", type=Path, default=Path("data/processed/dev"))
@@ -127,7 +159,7 @@ def main() -> None:
         raise SystemExit(f"no JSON files in {raw}")
     out.mkdir(parents=True, exist_ok=True)
     cols = ["index", "language", "build_params", "search_params", "filter", "selectivity", "recall@10", "p50_ms", "p50_spread", "p90_ms",
-            "p99_ms", "qps", "build_s", "peak_rss_mb", "index_bytes", "distance_computations"]
+            "p99_ms", "qps", "clients", "insert_rate", "phase", "cpu_pct", "errors", "build_s", "peak_rss_mb", "index_bytes", "distance_computations"]
     df = df.sort_values(["index", "recall@10", "p50_ms"], ascending=[True, False, True])
     df[cols + ["n", "file"]].to_csv(out / "results.csv", index=False)
 
@@ -135,8 +167,12 @@ def main() -> None:
     for index, g in df.groupby("index"):
         md += [f"## {index}", "", md_table(g[cols[1:]]), ""]
         # The latency-recall plot keeps the unfiltered runs only, as before Phase 3.
-        plot(g[g["filter"] == "none"], index, f"{name}, n = {g['n'].iloc[0]:,}", out / f"{index}.png")
-        plot_filter(g, index, f"{name}, n = {g['n'].iloc[0]:,}", out / f"{index}-filter.png")
+        static = g[~g["is_load"] & (g["phase"] == "")]
+        if not static.empty:
+            plot(static[static["filter"] == "none"], index, f"{name}, n = {g['n'].iloc[0]:,}",
+                 out / f"{index}.png")
+        plot_filter(static, index, f"{name}, n = {g['n'].iloc[0]:,}", out / f"{index}-filter.png")
+        plot_load(g, index, f"{name}, n = {g['n'].iloc[0]:,}", out / f"{index}-load.png")
     (out / "results.md").write_text("\n".join(md))
     for f in sorted(out.iterdir()):
         print(f)

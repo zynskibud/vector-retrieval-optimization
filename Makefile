@@ -3,7 +3,7 @@
 RUN   := docker compose run --rm bench
 SETUP := docker compose run --rm setup
 
-.PHONY: image setup build test bench report shell clean-raw db-up db-down dbbench db-test bench-db
+.PHONY: image setup build test bench report shell clean-raw db-up db-down dbbench db-test bench-db load load-db
 
 image:
 	docker compose build
@@ -54,3 +54,11 @@ bench-db:
 	docker compose --profile db run --rm dbbench uv run --frozen python -m tools.bench.runner $(ARGS)
 db-test:
 	docker compose --profile db run --rm dbbench uv run --frozen pytest tools/db/tests/test_$(DB).py -q
+
+## Phase 4 load sweep (CONTRACT section 12): the runner in load mode. Two targets:
+## languages inside bench:   make load ARGS="--data data/processed/dev --languages python,go,cpp,rust"
+## databases inside dbbench: make load-db ARGS="--data data/processed/dev --languages qdrant"  (after make db-up DB=qdrant)
+load:
+	$(RUN) uv run --frozen python -m tools.bench.runner --load $(ARGS)
+load-db:
+	docker compose --profile db run --rm dbbench uv run --frozen python -m tools.bench.runner --load $(ARGS)

@@ -18,6 +18,9 @@ TOP_KEYS = {
 BUILD_KEYS = {"train_s": float, "add_s": float, "total_s": float, "peak_rss_mb": float, "index_bytes": int}
 SEARCH_KEYS = {"search_params": dict, "ids": list, "scores": list, "latency_ms": list, "total_s": float, "qps": float, "extra": dict}
 MACHINE_KEYS = {"os": str, "arch": str, "cpu": str, "cores": int}
+# A load run (CONTRACT section 12.1) has extra.clients; it then needs these keys in extra.
+LOAD_KEYS = {"errors": int, "cpu_pct": float, "clients": int, "duration_s": float, "queries_done": int}
+PHASES = {"after_inserts"}  # search_params.phase (CONTRACT section 12.2)
 
 
 def _is(value, typ) -> bool:
@@ -94,9 +97,26 @@ def validate(doc) -> list[str]:
                                 lambda v: _is(v, int) and -1 <= v < n, f"int in [-1, {n})")
         errors += _check_matrix(run.get("scores"), q, k, f"{where}.scores",
                                 lambda v: v is None or _is(v, float), "float or null")
+        extra = run.get("extra") if isinstance(run.get("extra"), dict) else {}
+        is_load = "clients" in extra
+        if is_load:
+            errors += _check_keys(extra, LOAD_KEYS, f"{where}.extra")
+            if _is(extra.get("clients"), int) and extra["clients"] < 1:
+                errors.append(f"{where}.extra.clients: expected >= 1, got {extra['clients']}")
+        sp = run.get("search_params")
+        if isinstance(sp, dict) and "phase" in sp and sp["phase"] not in PHASES:
+            errors.append(f"{where}.search_params.phase: expected one of {sorted(PHASES)}, got {sp['phase']!r}")
         lat = run.get("latency_ms")
         if isinstance(lat, list):
-            if len(lat) != q:
+            if is_load:
+                # All latencies of all workers: any count; it must match queries_done.
+                if not lat:
+                    errors.append(f"{where}.latency_ms: a load run needs at least one value")
+                elif _is(extra.get("queries_done"), int) and len(lat) != extra["queries_done"]:
+                    errors.append(f"{where}.latency_ms: {len(lat)} values, but extra.queries_done = {extra['queries_done']}")
+                elif not all(_is(v, float) and v >= 0 for v in lat):
+                    errors.append(f"{where}.latency_ms: every value must be a number >= 0")
+            elif len(lat) != q:
                 errors.append(f"{where}.latency_ms: expected {q} values, got {len(lat)}")
             elif not all(_is(v, float) and v >= 0 for v in lat):
                 errors.append(f"{where}.latency_ms: every value must be a number >= 0")

@@ -88,8 +88,21 @@ def summarize(doc: dict, ground_truth, k: int = 10) -> list[dict]:
             "distance_computations": run["distance_computations"],
             # Spread of the runner's repeat runs (mean p50 over the search settings per run).
             "p50_spread": _spread(doc.get("extra", {}).get("runner", {}).get("p50_ms_runs")),
+            # Phase 4 (CONTRACT section 12): load runs have extra.clients; recall is from worker 0's first pass.
+            **load_fields(run),
         })
     return rows
+
+
+def load_fields(run: dict) -> dict:
+    """clients, cpu_pct, errors, insert_rate, phase of one search run; NaN / "" when absent."""
+    ex = run.get("extra", {})
+    nan = float("nan")
+    return {
+        "clients": ex.get("clients", nan), "cpu_pct": ex.get("cpu_pct", nan), "errors": ex.get("errors", nan),
+        "insert_rate": ex.get("insert_rate", 0) or 0, "inserted_rows": ex.get("inserted_rows", nan),
+        "phase": str(run["search_params"].get("phase", "")),
+    }
 
 
 def _spread(p50_runs) -> str:
