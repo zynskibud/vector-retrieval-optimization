@@ -366,3 +366,39 @@ Recall for reporting is computed only by `tools/bench/`. Tests use it only as an
 4. Run one full `bench` invocation on the dev set with the default parameters and one sweep. Attach the output JSON path.
 5. Report: files changed, test output, any deviation from this contract and why.
 6. Do not commit. The main session commits.
+
+## 11. Metadata filtering (Phase 3)
+
+A filtered search returns only rows that pass a predicate on the metadata, ranked by score among those rows. Phase 3 measures how recall and latency change with the predicate's **selectivity**, the fraction of rows that pass.
+
+### 11.1 The filters
+
+The predicate is always `views >= t` on the `views` column of `metadata.parquet` (page views; float). `tools/data/filters.py` picks `t` per data set so that the selectivity is 0.5, 0.1, 0.01, and 0.001, and writes into the data directory:
+
+| File | Type | Meaning |
+|---|---|---|
+| `filters.json` | `{"top50": {"views_min": t, "selectivity": s, "rows": n}, "top10": ..., "top1": ..., "top01": ...}` | the thresholds |
+| `filter_<name>.npy` | bool (N,) | row i passes the filter |
+| `ground_truth_<name>.npy` | int64 (Q, 100) | exact top-100 among passing rows, best first |
+| `ground_truth_<name>_scores.npy` | float32 (Q, 100) | their scores |
+
+`bench` reads `filter_<name>.npy`; it never reads the truth files. A query with fewer than k passing rows in reach pads with -1.
+
+### 11.2 Command line and output
+
+`--search` gets one more key for `flat`, `ivf`, and `hnsw`: `filter=none|top50|top10|top1|top01` (default `none`). It is a search-time parameter: one build, several filters. The output JSON carries it in `search_params.filter`, and the report scores each search run against the matching truth file. `distance_computations` counts as before; `extra` per search run reports `filter_rows` (rows that passed) and, for hnsw, `visited` (nodes expanded).
+
+### 11.3 Algorithms
+
+- **flat:** score only passing rows (the mask is a bool array; iterate all rows and skip failing ones, or gather passing rows first; say which). Recall is 1.0 by construction; it is the latency baseline.
+- **ivf:** scan the `nprobe` lists as before and skip rows that fail the filter. `distance_computations` counts only scored rows.
+- **hnsw:** search-layer on layer 0 as before, with one change: a node enters the **result** list only if it passes the filter; every visited node still enters the **candidate** list and is expanded, so the walk can cross failing regions. The stop rule is unchanged (stop when the best candidate is worse than the worst result, with the result list full at max(ef, k)). This is the hnswlib / FAISS `IDSelector` behavior. It degrades at low selectivity because the result list fills slowly and the walk ends early; that degradation is the measurement, do not add a fallback to brute force.
+- **pq, ivf_pq, diskann:** not in Phase 3 (they reject `filter` other than `none` with exit 2).
+
+### 11.4 Databases (tools/db)
+
+The same `filter` search key. Qdrant: a `Filter` with `FieldCondition(key="views", range=Range(gte=t))`; create a payload index on `views` at load. pgvector: `WHERE views >= t`; run with and without a B-tree index on `views` (`--build views_index=0|1`), and with `hnsw.iterative_scan = relaxed_order` on, which is pgvector's answer to low selectivity (`--search iterative=0|1`). Milvus: `filter="views >= t"`. Each client reads the threshold from `filters.json`.
+
+### 11.5 Tests
+
+On the dev set, 20,000 rows or the full set, for each of flat, ivf, hnsw in each language: `filter=top10` recall@10 against `ground_truth_top10.npy` at default settings ≥ 0.90 for flat (= 1.0), ≥ 0.70 for ivf, ≥ 0.85 for hnsw; every returned ID passes the filter (or is -1); `filter=top01` returns only passing IDs. The report plots recall (y) against selectivity (x, log) per system at the default search setting, and latency likewise.

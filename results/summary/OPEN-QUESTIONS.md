@@ -2,6 +2,12 @@
 
 Decisions that need the human, the default the session took, and its effect. Newest first. Remove an entry when the human decides.
 
+## 2026-09-26: Phase 3 design taken without human review
+
+- **Question:** what "metadata filtering" measures and how the filter reaches each index.
+- **Default taken (CONTRACT section 11):** one predicate, `views >= t`, with t chosen for selectivity 0.5, 0.1, 0.01, 0.001; masks and per-filter ground truth produced by `tools/data/filters.py`; a search-time key `filter=` on flat, ivf, hnsw in all four languages and in the three databases; hnsw uses the hnswlib rule (only passing nodes enter the result list, all visited nodes are expanded), with no brute-force fallback, so the low-selectivity degradation is visible; pgvector also runs with a B-tree index on `views` and with `iterative_scan`. Five Opus 5.5 agents: one per language, one for tools and the database clients.
+- **Effect:** filtering is measured on 3 index types, not 6. PQ, IVF_PQ, and DiskANN skip Phase 3 (they can be added later with the same key).
+
 ## 2026-09-26: Phase 2 design taken without human review
 
 - **Question:** the design of the database phase (services, client interface, what is measured, agents). CLAUDE.md asks for approval before a large change; PROTOCOL.md says to take a default and log it.
