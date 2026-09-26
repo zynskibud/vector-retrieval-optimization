@@ -18,6 +18,7 @@ import platform
 import resource
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -110,6 +111,87 @@ def run_search(mod, index, queries: np.ndarray, k: int, params: dict) -> dict:
     }
 
 
+def cpu_seconds() -> float:
+    ru = resource.getrusage(resource.RUSAGE_SELF)
+    return ru.ru_utime + ru.ru_stime
+
+
+def run_load(mod, index, queries, k, params, clients, duration, inserter=None) -> dict:
+    """Load run (CONTRACT 12.1): `clients` threads, closed loop over the queries for `duration`
+    seconds (0 = one pass each). Worker 0's first pass supplies ids and scores; worker 0
+    finishes that pass even after the deadline (the other workers stop at the deadline).
+
+    `inserter`, if given, is a callable(deadline) run in one more thread during the loop.
+    """
+    q = len(queries)
+    ids = np.full((q, k), -1, dtype=np.int64)
+    scores = np.full((q, k), -np.inf, dtype=np.float32)
+    lat: list[list[float]] = [[] for _ in range(clients)]
+    errors = [0] * clients
+    start = threading.Barrier(clients + 1 + (inserter is not None))
+    box = {}
+
+    def worker(w):
+        mine = lat[w]
+        start.wait()
+        deadline = box["deadline"]
+        first = w == 0
+        while True:
+            for i in range(q):
+                # Worker 0 always finishes its first pass (it supplies ids and scores), so
+                # the loop can run past `duration`; the wall time used for qps includes that.
+                if duration > 0 and not first and time.perf_counter() >= deadline:
+                    return
+                t0 = time.perf_counter()
+                try:
+                    row_ids, row_scores = mod.search(index, queries[i], k, params)
+                except Exception:
+                    errors[w] += 1
+                    continue
+                mine.append((time.perf_counter() - t0) * 1000.0)
+                if first:
+                    ids[i], scores[i] = row_ids, row_scores
+            first = False
+            if duration <= 0:
+                return
+
+    def run_inserter():
+        start.wait()
+        inserter(box["deadline"])
+
+    threads = [threading.Thread(target=worker, args=(w,)) for w in range(clients)]
+    if inserter is not None:
+        threads.append(threading.Thread(target=run_inserter))
+    for t in threads:
+        t.start()
+    cpu0 = cpu_seconds()
+    t_start = time.perf_counter()
+    box["deadline"] = t_start + duration
+    start.wait()
+    for t in threads:
+        t.join()
+    total = time.perf_counter() - t_start
+    cpu = cpu_seconds() - cpu0
+    latency = [x for w in lat for x in w]
+    done = len(latency)
+    return {
+        "search_params": params,
+        "ids": ids.tolist(),
+        "scores": [[None if math.isinf(s) else s for s in row] for row in scores.tolist()],
+        "latency_ms": latency,
+        "total_s": total,
+        "qps": done / total,
+        "distance_computations": None,  # a per-query counter shared by threads is not kept
+        "extra": {
+            "errors": sum(errors),
+            "cpu_pct": cpu / total * 100.0,
+            "clients": clients,
+            "duration_s": duration,
+            "queries_done": done,
+        },
+    }
+
+
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(prog="bench")
     ap.add_argument("--index", required=True)
@@ -122,6 +204,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--warmup", type=int, default=100)
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--clients", type=int, default=1)
+    ap.add_argument("--duration", type=float, default=0.0)
+    ap.add_argument("--insert-rate", type=float, default=0.0)
     return ap.parse_args(argv)
 
 
@@ -135,8 +220,61 @@ def resolve_params(args):
     return mod, build_params, searches or [dict(mod.SEARCH_PARAMS)]
 
 
+def run_load_all(mod, index, vectors, queries, args, searches, n_build) -> list:
+    """One load run per search setting. With inserts, the inserter runs during the first
+    setting's loop only; then the repair pass and a one-thread after-inserts pass."""
+    n = len(vectors)
+    stats = {"rows": 0, "batch_ms": []}
+
+    def inserter(deadline):
+        rate = args.insert_rate
+        t0 = time.perf_counter()
+        row = n_build
+        while row < n:
+            due = t0 + (row - n_build) / rate  # paced: batch j starts at t0 + 100 j / R
+            now = time.perf_counter()
+            if now >= deadline:
+                return
+            if due > now:
+                time.sleep(min(due - now, deadline - now))
+                continue
+            batch = list(range(row, min(row + 100, n)))
+            b0 = time.perf_counter()
+            mod.insert(index, batch, vectors[batch[0] : batch[-1] + 1])
+            stats["batch_ms"].append((time.perf_counter() - b0) * 1000.0)
+            row = batch[-1] + 1
+            stats["rows"] = row - n_build
+
+    results = []
+    for j, p in enumerate(searches):
+        ins = inserter if (n_build is not None and j == 0) else None
+        results.append(run_load(mod, index, queries, args.k, p, args.clients, args.duration, ins))
+    if n_build is not None:
+        t0 = time.perf_counter()
+        added_a, added_b = mod.repair(index)
+        repair_s = time.perf_counter() - t0
+        final = run_search(mod, index, queries, args.k, {**searches[0], "phase": "after_inserts"})
+        final["extra"].update({
+            "inserted_rows": stats["rows"],
+            "insert_p50_ms": float(np.median(stats["batch_ms"])) if stats["batch_ms"] else None,
+            "insert_batches": len(stats["batch_ms"]),
+            "repair_added": added_a,
+            "repair_added_unreachable": added_b,
+            "repair_s": repair_s,
+        })
+        results[0]["extra"].update({"inserted_rows": stats["rows"],
+                                    "insert_p50_ms": final["extra"]["insert_p50_ms"]})
+        results.append(final)
+    return results
+
+
 def run(args) -> dict:
     mod, build_params, searches = resolve_params(args)  # validate before the slow load
+    load = args.clients != 1 or args.duration > 0 or args.insert_rate > 0
+    if args.clients < 1 or args.duration < 0 or args.insert_rate < 0:
+        raise UsageError("need --clients >= 1, --duration >= 0, --insert-rate >= 0")
+    if load and not hasattr(mod, "insert"):
+        raise UsageError(f"--clients/--duration/--insert-rate: only hnsw supports load runs, not {args.index}")
     vectors = read_npy(args.data / "vectors.npy", args.limit)
     queries = read_npy(args.data / "queries.npy")
     n, dim = vectors.shape
@@ -151,7 +289,11 @@ def run(args) -> dict:
         for p in searches:  # a bad filter name is a usage error, found before the slow build
             if str(p.get("filter", "none")) not in filters.NAMES:
                 raise UsageError(f"unknown filter {p['filter']!r}; known: {list(filters.NAMES)}")
-    index = mod.build(vectors, build_params, args.threads, args.seed)
+    n_build = n - n // 10 if args.insert_rate > 0 else None  # CONTRACT 12.2: build on the first 90%
+    if n_build is None:
+        index = mod.build(vectors, build_params, args.threads, args.seed)
+    else:
+        index = mod.build(vectors, build_params, args.threads, args.seed, n_build=n_build)
     build = {
         "train_s": index["train_s"],
         "add_s": index["add_s"],
@@ -161,7 +303,10 @@ def run(args) -> dict:
     }
     for i in range(min(args.warmup, len(queries))):
         mod.search(index, queries[i], args.k, searches[0])
-    results = [run_search(mod, index, queries, args.k, p) for p in searches]
+    if not load:
+        results = [run_search(mod, index, queries, args.k, p) for p in searches]
+    else:
+        results = run_load_all(mod, index, vectors, queries, args, searches, n_build)
     return {
         "contract_version": 1,
         "language": "python",
