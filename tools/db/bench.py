@@ -108,9 +108,12 @@ def run(args) -> dict:
         raise UsageError(f"unknown index {args.index!r}; known: {sorted(base.BUILD_DEFAULTS)}")
     if args.index not in base.SUPPORTED[args.db]:
         raise UsageError(f"{args.db} has no {args.index}")
-    build_params = parse_pairs(args.build, base.BUILD_DEFAULTS[args.index], "build")
-    searches = [parse_pairs([s], base.SEARCH_DEFAULTS[args.index], "search") for s in args.search]
-    searches = searches or [dict(base.SEARCH_DEFAULTS[args.index])]
+    build_params = parse_pairs(args.build, base.build_defaults(args.db, args.index), "build")
+    searches = [parse_pairs([s], base.search_defaults(args.db, args.index), "search") for s in args.search]
+    searches = searches or [base.search_defaults(args.db, args.index)]
+    for sp in searches:
+        if str(sp.get("filter", "none")) not in base.FILTER_NAMES:
+            raise UsageError(f"unknown filter {sp['filter']!r}; known: {base.FILTER_NAMES}")
 
     vectors = np.load(args.data / "vectors.npy", mmap_mode="r")
     if args.limit:
@@ -120,7 +123,12 @@ def run(args) -> dict:
     meta = pq.read_table(args.data / "metadata.parquet", columns=list(base.META_COLUMNS)).slice(0, len(vectors))
     n, dim = vectors.shape
 
+    # Rows that pass each filter among the loaded rows (CONTRACT section 11.2, extra.filter_rows).
+    filter_rows = {f: int(np.load(args.data / f"filter_{f}.npy")[:n].sum())
+                   for f in {str(sp.get("filter", "none")) for sp in searches} if f != "none"}
+
     client = base.get_client(args.db)
+    client.data_dir = args.data
     client.connect()
     try:
         client.reset()
@@ -130,6 +138,9 @@ def run(args) -> dict:
         for i in range(min(args.warmup, len(queries))):
             client.search(queries[i], args.k, searches[0])
         results = [run_search(client, queries, args.k, p) for p in searches]
+        for r in results:
+            if "filter" in r["search_params"]:
+                r["extra"]["filter_rows"] = filter_rows.get(str(r["search_params"]["filter"]), n)
     finally:
         client.close()
 

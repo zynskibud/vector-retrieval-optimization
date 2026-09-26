@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import importlib
+import json
 import time
+from pathlib import Path
 from typing import Protocol
 
 import numpy as np
@@ -31,19 +33,58 @@ BUILD_DEFAULTS = {
     "diskann": {"r": 64, "l_build": 100},
 }
 SEARCH_DEFAULTS = {
-    "flat": {},
-    "ivf": {"nprobe": 8},
+    "flat": {"filter": "none"},
+    "ivf": {"nprobe": 8, "filter": "none"},
     "pq": {"rerank": 0},
     "ivf_pq": {"nprobe": 8, "rerank": 0},
-    "hnsw": {"ef": 64, "rescore": 0},
+    "hnsw": {"ef": 64, "rescore": 0, "filter": "none"},
     "diskann": {"l": 100, "beam": 4},
 }
+
+# Per-database params on top of the defaults above (Phase 3, README "Filters"):
+# pgvector's B-tree on views (build) and iterative index scans (search).
+BUILD_EXTRA = {"pgvector": {"flat": {"views_index": 0}, "ivf": {"views_index": 0}, "hnsw": {"views_index": 0}}}
+SEARCH_EXTRA = {"pgvector": {"ivf": {"iterative": 0}, "hnsw": {"iterative": 0}}}
+
+FILTER_NAMES = ("none", "top50", "top10", "top1", "top01")
+
+
+def build_defaults(db: str, index: str) -> dict:
+    return {**BUILD_DEFAULTS[index], **BUILD_EXTRA.get(db, {}).get(index, {})}
+
+
+def search_defaults(db: str, index: str) -> dict:
+    return {**SEARCH_DEFAULTS[index], **SEARCH_EXTRA.get(db, {}).get(index, {})}
+
+
+def views_min(data_dir, name: str) -> float | None:
+    """The threshold t of filter `name` (views >= t) from <data_dir>/filters.json; None for "none".
+
+    Every client calls this with its `data_dir`, which bench.py sets before load.
+    """
+    if name == "none":
+        return None
+    if name not in FILTER_NAMES:
+        raise ValueError(f"unknown filter {name!r}; known: {FILTER_NAMES}")
+    if data_dir is None:
+        raise ValueError("filter needs the data directory: set client.data_dir first")
+    return float(_filters(str(data_dir))[name]["views_min"])
+
+
+_FILTERS_CACHE: dict[str, dict] = {}
+
+
+def _filters(data_dir: str) -> dict:
+    if data_dir not in _FILTERS_CACHE:
+        _FILTERS_CACHE[data_dir] = json.loads((Path(data_dir) / "filters.json").read_text())
+    return _FILTERS_CACHE[data_dir]
 
 
 class Client(Protocol):
     """One database. Host names are the compose service names: qdrant, pgvector, milvus."""
 
     name: str
+    data_dir: Path | None  # set by bench.py before load; the source of filters.json
 
     def connect(self) -> None: ...
     def reset(self) -> None: ...

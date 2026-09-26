@@ -17,6 +17,7 @@ import pytest
 from tools.bench import schema
 from tools.db import base
 from tools.db.pgvector import make_client
+from tools.db.tests import filtering
 
 DATA = Path("data/processed/dev")
 N = 20000
@@ -34,6 +35,7 @@ def setup():
     client.connect()
     client.reset()
     client.load(vectors, meta, 2000)
+    client.vectors = vectors  # for the filter tests
     yield client, queries, truth
     client.reset()
     client.close()
@@ -77,6 +79,18 @@ def test_hnsw(setup):
     print(f"hnsw m=16 ef_construct=100 ef=64 recall@10={r:.4f}")
     assert r >= 0.95
     client.conn.execute("DROP INDEX items_hnsw")
+
+
+@pytest.mark.parametrize("views_index,iterative", [(0, 0), (1, 0), (0, 1), (1, 1)])
+def test_hnsw_filter(setup, views_index, iterative):
+    client, queries, _ = setup
+    client.conn.execute("DROP INDEX IF EXISTS items_ivf, items_hnsw")
+    client.build_index("hnsw", {**base.BUILD_DEFAULTS["hnsw"], "views_index": views_index})
+    params = {"ef": 64, "filter": "top10", "iterative": iterative}
+    r = filtering.check(client, DATA, client.vectors, queries, params)
+    assert r >= 0.85, r
+    filtering.check(client, DATA, client.vectors, queries, {**params, "filter": "top01"})
+    client.conn.execute("DROP INDEX IF EXISTS items_hnsw, items_views")
 
 
 def test_bench_subprocess(setup, tmp_path):

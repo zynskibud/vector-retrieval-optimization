@@ -12,6 +12,9 @@ Index mapping:
   flat  hnsw m=0; search with exact=True.
   hnsw  hnsw m, ef_construct; quant none|scalar (int8)|product (x8, pq m=48)|binary.
   pq    product quantization, compression from m (384/m = 8 -> x8); hnsw stays m=0.
+Filters (Phase 3): load creates a float payload index on `views`, before the upserts, so the
+HNSW build sees it (Qdrant adds extra graph edges per payload-index value block). A search with
+filter=<name> passes Filter(must=[FieldCondition(views, Range(gte=t))]), t from filters.json.
 Search: hnsw_ef = ef; quantization rescore = bool(rescore or rerank). Scores are raw Dot.
 """
 
@@ -61,6 +64,7 @@ class QdrantDB:
         self.host = host
         self.client: QdrantClient | None = None
         self.index = "flat"
+        self.data_dir = None
 
     def connect(self) -> None:
         self.client = QdrantClient(host=self.host, port=6333, grpc_port=6334, prefer_grpc=True, timeout=600)
@@ -78,6 +82,7 @@ class QdrantDB:
             hnsw_config=m.HnswConfigDiff(m=0),
             optimizers_config=m.OptimizersConfigDiff(indexing_threshold=0),
         )
+        self.client.create_payload_index(COLLECTION, "views", field_schema=m.PayloadSchemaType.FLOAT, wait=True)
         cols = {c: meta.column(c).to_pylist() for c in base.META_COLUMNS}
         n = len(vectors)
         for s in range(0, n, batch):
@@ -132,8 +137,10 @@ class QdrantDB:
             exact=(self.index == "flat"),
             quantization=m.QuantizationSearchParams(rescore=rescore),
         )
+        t = base.views_min(self.data_dir, str(params.get("filter", "none")))
+        flt = None if t is None else m.Filter(must=[m.FieldCondition(key="views", range=m.Range(gte=t))])
         res = self.client.query_points(COLLECTION, query=query.tolist(), limit=k, search_params=sp,
-                                       with_payload=False).points
+                                       query_filter=flt, with_payload=False).points
         return [int(p.id) for p in res], [float(p.score) for p in res]
 
     def stats(self) -> dict:

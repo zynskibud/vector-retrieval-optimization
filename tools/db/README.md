@@ -22,6 +22,7 @@ Everything runs inside the `dbbench` container (`make dbbench ARGS=...`, `make d
 ```python
 class Client(Protocol):
     name: str                                    # "qdrant" | "pgvector" | "milvus"
+    data_dir: Path | None                        # set by bench.py (client.data_dir = args.data) before load; filters.json is read from it
     def connect(self) -> None: ...               # host names: qdrant, pgvector, milvus (compose service names)
     def reset(self) -> None: ...                 # drop the collection/table if it exists
     def load(self, vectors: np.ndarray, meta: pa.Table, batch: int) -> float:
@@ -61,9 +62,17 @@ CONTRACT section 3, with:
 | pq | m, nbits, rerank | `product` quantization (`compression` from m: 384/m = 8 → `x8`), `rescore = rerank > 0`, `always_ram` | — | — (no standalone PQ) |
 | ivf_pq | nlist, nprobe, m, nbits, rerank | — | — | `IVF_PQ` with `nlist`, `m`, `nbits`, search `nprobe` |
 | hnsw | m, ef_construct, ef | `hnsw_config.m`, `ef_construct`; search `hnsw_ef = ef` | `hnsw` with `m`, `ef_construction`; `SET hnsw.ef_search = ef` | `HNSW` with `M`, `efConstruction`; search `ef` |
+| filter (flat, ivf, hnsw) | filter = none\|top50\|top10\|top1\|top01 (search) | payload index on `views` (float, created at load); `Filter(must=[FieldCondition("views", Range(gte=t))])` | `WHERE views >= t`; build `views_index=0\|1` (B-tree on views); search `iterative=0\|1` (`SET LOCAL hnsw.iterative_scan` / `ivfflat.iterative_scan` = `relaxed_order` or `off`) | `views` is a FLOAT field; search `filter="views >= t"` |
 | diskann | r, l_build, l, beam | — | — | `DISKANN` (search `search_list = l`); `queryNode.enableDisk` and `common.diskIndex.enable` are set in `tools/db/milvus-config/user.yaml` |
 
 Qdrant extras (Phase 1's "scalar, product, binary quantization"): run `hnsw` with `--build quant=none|scalar|product|binary` and `--search rescore=0|1`; report them as index `hnsw` with those build params. The metric is always the dot product (`Dot` / `vector_ip_ops` / `IP`).
+
+## Filters (Phase 3, CONTRACT section 11)
+
+- The threshold `t` of each filter comes from `<data>/filters.json` through `base.views_min(client.data_dir, name)`. `bench.py` sets `client.data_dir = args.data` before `connect`; a test sets it before the first filtered search.
+- `searches[i].extra.filter_rows` = rows among the loaded rows that pass the filter (from `filter_<name>.npy`, so it is right with `--limit`). It is present when the search params carry `filter`.
+- pgvector only: `views_index` and `iterative` are extra params (`base.BUILD_EXTRA`, `base.SEARCH_EXTRA`). With `iterative=1` the rows can come back slightly out of order (`relaxed_order`), so the client re-sorts them by score.
+- Test: hnsw with `filter=top10` at ef=64 has recall@10 >= 0.85 against the exact filtered top-10 of the 20,000 loaded rows (`tests/filtering.py`), and every returned ID passes the filter; `top01` returns only passing IDs. pgvector runs the four combinations of `views_index` and `iterative`.
 
 ## Measurement
 

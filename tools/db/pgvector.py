@@ -20,6 +20,14 @@ a multi-core wall time.
 Scores: the `<#>` operator returns the negative inner product. The query negates it, so
 a higher score is better, as in CONTRACT section 3.
 
+Filters (Phase 3): filter=<name> adds `WHERE views >= t` (t from filters.json, sent as float8;
+views is real, so the comparison runs in double precision and matches the float32 mask).
+Build param views_index=1 adds a B-tree on views (the planner can then choose it over the
+vector index). Search param iterative=1 sets hnsw.iterative_scan / ivfflat.iterative_scan =
+relaxed_order for the transaction; the index scan then continues past ef_search / probes until
+k rows pass the filter (up to hnsw.max_scan_tuples, default 20,000). relaxed_order can return
+rows slightly out of order, so the client re-sorts by score. iterative=0 sets it off.
+
 Search: one prepared statement, binary protocol. The query vector goes as a binary
 pgvector value (int16 dim, int16 unused, dim big-endian float4).
 """
@@ -36,10 +44,16 @@ from psycopg.adapt import Dumper, PyFormat
 from psycopg.pq import Format
 from psycopg.types import TypeInfo
 
+from tools.db import base
+
 DIM = 384
 DSN = "host=pgvector port=5432 user=vro password=vro dbname=vro"
 SEARCH_SQL = (
     "SELECT id, (embedding <#> %(q)s) * -1 AS score FROM items "
+    "ORDER BY embedding <#> %(q)s LIMIT %(k)s"
+)
+FILTER_SQL = (
+    "SELECT id, (embedding <#> %(q)s) * -1 AS score FROM items WHERE views >= %(t)s "
     "ORDER BY embedding <#> %(q)s LIMIT %(k)s"
 )
 
@@ -65,6 +79,7 @@ class PgvectorClient:
         self.conn: psycopg.Connection | None = None
         self.index_name: str | None = None
         self._search_key: tuple | None = None
+        self.data_dir = None
 
     # -- connection -------------------------------------------------------
     def connect(self, timeout_s: float = 120.0) -> None:
@@ -128,9 +143,16 @@ class PgvectorClient:
         return time.perf_counter() - t0
 
     def build_index(self, index: str, params: dict) -> float:
+        """Vector index, plus (views_index=1) a B-tree on views. Seconds cover both."""
+        t0 = time.perf_counter()
+        self.conn.execute("DROP INDEX IF EXISTS items_views")
+        if int(params.get("views_index", 0)):
+            self.conn.execute("CREATE INDEX items_views ON items (views)")
+            self.conn.execute("ANALYZE items")
+        views_s = time.perf_counter() - t0
         if index == "flat":
             self.index_name = None
-            return 0.0
+            return views_s
         self.conn.execute("SET maintenance_work_mem = '1GB'")
         if index == "ivf":
             sql = f"CREATE INDEX items_ivf ON items USING ivfflat (embedding vector_ip_ops) WITH (lists = {int(params['nlist'])})"
@@ -147,7 +169,7 @@ class PgvectorClient:
         self.conn.execute(sql)
         dt = time.perf_counter() - t0
         self.index_name = name
-        return dt
+        return dt + views_s
 
     # -- search -----------------------------------------------------------
     def search(self, query: np.ndarray, k: int, params: dict) -> tuple[list[int], list[float]]:
@@ -157,8 +179,19 @@ class PgvectorClient:
                     cur.execute(f"SET LOCAL ivfflat.probes = {int(params['nprobe'])}")
                 if "ef" in params:
                     cur.execute(f"SET LOCAL hnsw.ef_search = {int(params['ef'])}")
-                cur.execute(SEARCH_SQL, {"q": Vec(query), "k": k}, prepare=True)
+                iterative = int(params.get("iterative", 0))
+                if "iterative" in params:
+                    mode = "relaxed_order" if iterative else "off"
+                    cur.execute(f"SET LOCAL hnsw.iterative_scan = {mode}")
+                    cur.execute(f"SET LOCAL ivfflat.iterative_scan = {mode}")
+                t = base.views_min(self.data_dir, str(params.get("filter", "none")))
+                if t is None:
+                    cur.execute(SEARCH_SQL, {"q": Vec(query), "k": k}, prepare=True)
+                else:
+                    cur.execute(FILTER_SQL, {"q": Vec(query), "k": k, "t": t}, prepare=True)
                 rows = cur.fetchall()
+        if iterative:
+            rows.sort(key=lambda r: (-r[1], r[0]))
         return [int(r[0]) for r in rows], [float(r[1]) for r in rows]
 
     # -- stats ------------------------------------------------------------

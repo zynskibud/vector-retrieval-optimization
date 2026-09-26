@@ -15,6 +15,7 @@ import pytest
 from tools.bench import schema
 from tools.db import base
 from tools.db.milvus import make_client
+from tools.db.tests import filtering
 
 DATA = Path("data/processed/dev")
 N = 20000
@@ -32,6 +33,7 @@ def setup():
     c.connect()
     c.reset()
     c.load(vectors, meta, 2000)
+    c.vectors = vectors  # for the filter test
     yield c, queries, truth
     c.reset()
     c.close()
@@ -71,6 +73,17 @@ def test_recall(setup, index, build, search, floor):
     r = recall(c, queries, truth, search)
     print(f"{index} recall@10 = {r:.4f}")
     assert r >= floor
+
+
+def test_hnsw_filter(setup):
+    c, queries, _ = setup
+    if c.index is not None:
+        c.client.release_collection("vro")
+        c.client.drop_index("vro", "embedding")
+    c.build_index("hnsw", base.BUILD_DEFAULTS["hnsw"])
+    r = filtering.check(c, DATA, c.vectors, queries, {"ef": 64, "filter": "top10"})
+    assert r >= 0.85, r
+    filtering.check(c, DATA, c.vectors, queries, {"ef": 64, "filter": "top01"})
 
 
 def test_bench_subprocess(setup):

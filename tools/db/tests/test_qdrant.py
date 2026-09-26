@@ -12,6 +12,7 @@ import pytest
 from tools.bench.schema import validate
 from tools.db import base
 from tools.db.qdrant import make_client
+from tools.db.tests import filtering
 
 DATA = Path("data/processed/dev")
 N = 20000
@@ -71,6 +72,14 @@ def test_hnsw_scalar_recall(client, data):
     setup_index(client, data, "hnsw", {"quant": "scalar"})
     r = recall(client, data[1], data[3], {"ef": 64, "rescore": 1})
     assert r >= 0.90, r
+
+
+def test_hnsw_filter(client, data):
+    setup_index(client, data, "hnsw", {})
+    vectors, queries = data[0], data[1]
+    r = filtering.check(client, DATA, vectors, queries, {"ef": 64, "rescore": 0, "filter": "top10"})
+    assert r >= 0.85, r
+    filtering.check(client, DATA, vectors, queries, {"ef": 64, "rescore": 0, "filter": "top01"})
 
 
 def test_bench_subprocess(client, tmp_path):

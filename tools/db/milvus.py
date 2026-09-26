@@ -3,6 +3,9 @@
 Server: Milvus standalone (compose service `milvus`, port 19530). Client: pymilvus MilvusClient.
 Metric: IP everywhere. IVF_PQ rerank: Milvus has no rerank option for IVF_PQ, so the client does
 it: fetch the top `rerank` IDs, read their vectors with `get`, sort by the exact dot product.
+Filters (Phase 3): `views` is a FLOAT field (float32, as in metadata.parquet; an INT64 field
+would truncate and move rows across the threshold). filter=<name> searches with
+filter="views >= t", t from filters.json. No scalar index on views (Milvus scans the field).
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ class MilvusDB:
         self.uri = uri
         self.client: MilvusClient | None = None
         self.index = None
+        self.data_dir = None
 
     def connect(self) -> None:
         self.client = MilvusClient(uri=self.uri, timeout=60)
@@ -41,7 +45,7 @@ class MilvusDB:
         schema = MilvusClient.create_schema(auto_id=False, enable_dynamic_field=False)
         schema.add_field("id", DataType.INT64, is_primary=True)
         schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=DIM)
-        schema.add_field("views", DataType.INT64)
+        schema.add_field("views", DataType.FLOAT)
         schema.add_field("title", DataType.VARCHAR, max_length=512)
         schema.add_field("wiki_id", DataType.INT64)
         schema.add_field("paragraph_id", DataType.INT64)
@@ -58,7 +62,7 @@ class MilvusDB:
                 {
                     "id": i,
                     "embedding": vectors[i].tolist(),
-                    "views": int(cols["views"][i] or 0),
+                    "views": float(cols["views"][i] or 0.0),
                     "title": (cols["title"][i] or "")[:512].encode("utf-8")[:512].decode("utf-8", "ignore"),
                     "wiki_id": int(cols["wiki_id"][i] or 0),
                     "paragraph_id": int(cols["paragraph_id"][i] or 0),
@@ -113,7 +117,9 @@ class MilvusDB:
         rerank = int(params.get("rerank", 0)) if self.index == "ivf_pq" else 0
         if rerank > k:
             limit = rerank
-        res = self.client.search(COLLECTION, data=[query.tolist()], anns_field="embedding", limit=limit,
+        t = base.views_min(self.data_dir, str(params.get("filter", "none")))
+        expr = "" if t is None else f"views >= {t!r}"
+        res = self.client.search(COLLECTION, data=[query.tolist()], anns_field="embedding", limit=limit, filter=expr,
                                  output_fields=[], search_params={"metric_type": "IP", "params": sp})
         hits = res[0]
         ids = [int(h["id"]) for h in hits]
