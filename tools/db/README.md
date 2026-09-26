@@ -61,7 +61,7 @@ CONTRACT section 3, with:
 | pq | m, nbits, rerank | `product` quantization (`compression` from m: 384/m = 8 → `x8`), `rescore = rerank > 0`, `always_ram` | — | — (no standalone PQ) |
 | ivf_pq | nlist, nprobe, m, nbits, rerank | — | — | `IVF_PQ` with `nlist`, `m`, `nbits`, search `nprobe` |
 | hnsw | m, ef_construct, ef | `hnsw_config.m`, `ef_construct`; search `hnsw_ef = ef` | `hnsw` with `m`, `ef_construction`; `SET hnsw.ef_search = ef` | `HNSW` with `M`, `efConstruction`; search `ef` |
-| diskann | r, l_build, l, beam | — | — | `DISKANN` (search `search_list = l`); requires `queryNode.enableDisk` |
+| diskann | r, l_build, l, beam | — | — | `DISKANN` (search `search_list = l`); `queryNode.enableDisk` and `common.diskIndex.enable` are set in `tools/db/milvus-config/user.yaml` |
 
 Qdrant extras (Phase 1's "scalar, product, binary quantization"): run `hnsw` with `--build quant=none|scalar|product|binary` and `--search rescore=0|1`; report them as index `hnsw` with those build params. The metric is always the dot product (`Dot` / `vector_ip_ops` / `IP`).
 

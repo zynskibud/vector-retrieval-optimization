@@ -1,0 +1,6 @@
+# Milvus user overrides (merged over milvus.yaml). DiskANN needs disk index enabled.
+queryNode:
+  enableDisk: true
+common:
+  diskIndex:
+    enable: true
