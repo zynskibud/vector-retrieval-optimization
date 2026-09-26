@@ -60,6 +60,8 @@ def cases(languages: list[str], indexes: list[str], data: Path) -> list[dict]:
             searches = grid(SWEEPS[name]["search"])
             path = Path("results/raw") / data.name / f"{lang}-{name}-{params_hash(bp)}.json"
             cmd = PROGRAMS[lang] + ["--index", name, "--data", str(data), "--out", str(path)]
+            if os.environ.get("VRO_THREADS"):  # the container is capped at fewer CPUs than it reports
+                cmd += ["--threads", os.environ["VRO_THREADS"]]
             cmd += [a for k, v in bp.items() for a in ("--build", f"{k}={v}")]
             cmd += [a for sp in searches if sp for a in ("--search", ",".join(f"{k}={v}" for k, v in sp.items()))]
             out.append({"language": lang, "index": name, "out": path, "cmd": cmd})

@@ -1,0 +1,8 @@
+.git
+.venv
+data
+results
+indexes/rust/target
+indexes/cpp/build
+indexes/go/bin
+__pycache__

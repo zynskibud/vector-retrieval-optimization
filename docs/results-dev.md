@@ -1,6 +1,6 @@
 # Results on the dev set, after Wave 2a
 
-Dev set: 100,000 corpus vectors, 1,000 queries, 384 dimensions, unit length. Machine: Apple M4, 10 cores, 24 GB. Search on one thread, 100 warm-up queries, 3 repeat runs per case, median-p50 run kept. Builds use 10 threads where the implementation supports it. Full tables: `results/summary/dev/results.md`. Plots: `results/summary/dev/<index>.png`.
+Dev set: 100,000 corpus vectors, 1,000 queries, 384 dimensions, unit length. Machine: Apple M4, 10 cores, 24 GB. Search on one thread, 100 warm-up queries, 3 repeat runs per case, median-p50 run kept. Builds use 10 threads where the implementation supports it. Full tables: `results/summary/dev-macos-native/results.md`. Plots: `results/summary/dev-macos-native/<index>.png`. These runs were on the macOS host before the project moved into the Docker container; the container runs (Linux VM, OpenBLAS, FAISS 1.12.0) go to `results/summary/dev/` and are not directly comparable.
 
 The runner waited for the load average to drop before each case, but seven cases ran with a load between 2.1 and 7.8 after the 3-minute wait, so some latencies carry extra noise. The `p50_spread` column shows the three runs.
 

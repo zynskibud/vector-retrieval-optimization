@@ -1,0 +1,64 @@
+# Isolated benchmark environment. Everything that builds, tests, or benchmarks
+# runs here, never on the host. See "Isolation" in CLAUDE.md and the Makefile.
+#
+#   make setup    one-time: build the image, install deps, build all four languages
+#   make test     all test suites
+#   make bench ARGS="--languages rust --indexes flat"
+#
+# The repository is read-only inside the container. Writable places:
+#   results/summary/   bind mount, the only host path the container can change
+#   results/raw, /scratch  named volumes (Linux ext4, so O_DIRECT works for DiskANN); TMPDIR=/scratch
+#   build outputs      named volumes over .venv and the indexes/*/ build dirs
+#   caches             named volumes for uv, cargo, go
+
+x-bench: &bench
+  image: vro-bench:latest
+  working_dir: /work
+  volumes:
+    - .:/work:ro
+    - ./results/summary:/work/results/summary
+    - raw:/work/results/raw
+    - scratch:/scratch
+    - venv:/work/.venv
+    - rust-target:/work/indexes/rust/target
+    - cpp-build:/work/indexes/cpp/build
+    - go-bin:/work/indexes/go/bin
+    - uv-cache:/root/.cache/uv
+    - cargo-registry:/usr/local/cargo/registry
+    - go-cache:/root/.cache/go-build
+    - go-mod:/root/go
+  environment:
+    TMPDIR: /scratch    # disk-backed (ext4 on the VM disk): DiskANN test files need real O_DIRECT reads, not tmpfs
+    VRO_THREADS: "6"    # build threads for the benches; must match `cpus` below
+  tmpfs:
+    - /tmp:size=1g
+  cpus: 6
+  mem_limit: 6g          # raise to 12g after Docker Desktop's memory is set to 16 GB
+  pids_limit: 512
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+services:
+  # No network: builds, tests, benchmarks.
+  bench:
+    <<: *bench
+    build: .            # only this service builds the image; setup reuses it
+    network_mode: none
+
+  # Network on, for the one-time dependency downloads (uv sync, cargo fetch).
+  setup:
+    <<: *bench
+
+volumes:
+  raw:
+  scratch:
+  venv:
+  rust-target:
+  cpp-build:
+  go-bin:
+  uv-cache:
+  cargo-registry:
+  go-cache:
+  go-mod:

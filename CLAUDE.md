@@ -82,8 +82,8 @@ These hold everywhere. Do not change them without approval from the user.
 ## Commands
 
 ```bash
-uv sync                                   # install the Python environment
-uv run python -m tools.data.prepare     # Phase 0: download and prepare data
+uv sync                                   # host: only for tools.data.* (download needs network)
+uv run python -m tools.data.prepare     # Phase 0: download and prepare data (host)
 uv run python -m tools.data.ground_truth
 uv run python -m tools.data.verify       # Phase 0 checks; must print 10 PASS lines
 uv run python -m tools.data.subset       # 100k-row dev dataset in data/processed/dev/
@@ -102,9 +102,45 @@ cmake -S indexes/cpp -B indexes/cpp/build -DCMAKE_BUILD_TYPE=Release && cmake --
 
 Add each new command here when it is created.
 
+## Isolation: everything runs in the container
+
+No toolchain runs on the host. Every build, test, benchmark, and report runs inside the Docker container defined in `docker-compose.yml`, through the `Makefile`:
+
+```bash
+make setup                      # one time: image, deps (with network), builds (without)
+make build                      # rebuild Go, C++, Rust after code changes
+make test                       # all suites; or run one, e.g.:
+docker compose run --rm bench uv run --frozen pytest indexes/python/tests/test_ivf.py -q
+docker compose run --rm bench sh -c 'cd indexes/rust && cargo test --release --test hnsw'
+docker compose run --rm bench sh -c 'cd indexes/go && go test -timeout 60m ./hnsw/'
+docker compose run --rm bench ctest --test-dir indexes/cpp/build -R '^hnsw$' --output-on-failure
+docker compose run --rm bench indexes/rust/target/release/bench --index flat --data data/processed/dev --out results/raw/dev/x.json
+make bench ARGS="--data data/processed/dev --languages rust,cpp --indexes flat --repeat 3"
+make report ARGS="--data data/processed/dev"
+```
+
+Rules:
+
+- The repository is mounted **read-only** in the container. Only `results/summary/` is writable on the host. Raw results go to the `raw` volume (`results/raw` inside the container), build outputs and `.venv` to named volumes, scratch to `/tmp` (tmpfs, 2 GB). Code that runs inside cannot change the repository.
+- The `bench` service has **no network**. The `setup` service has network and is used only for `uv sync` and `cargo fetch`.
+- Resource limits: 6 CPUs, `mem_limit` in `docker-compose.yml`. Benchmarks measure the Linux VM (Ubuntu 24.04 arm64): NumPy uses OpenBLAS, not Accelerate; FAISS is 1.12.0 (the last with a Linux arm64 wheel); DiskANN's `nocache` uses `O_DIRECT` on the `raw` volume. Numbers from the earlier host runs are kept under `results/summary/dev-macos-native/` and are not comparable.
+- Agents: use the commands above. Do not call `uv run`, `go`, `cargo`, `cmake`, or a bench binary on the host. If a container command fails because a dependency is missing, report it; do not install anything on the host.
+- Output files written inside the container that the host must see (result JSON for a report) are read through `make report` or `docker compose run --rm bench cat results/raw/...`.
+
+## Heavy jobs: the machine lock and the coordinator
+
+This machine is shared with two other projects. A coordinator session sequences heavy jobs through `../.coord/PROTOCOL.md` (read it). A benchmark timing run is a heavy job: it needs the whole machine idle, so it runs alone.
+
+- Every timing run starts through `scripts/run.sh <job>` and never by hand. The script runs `scripts/preflight.sh`, takes `../.coord/heavy.lock` with owner `vector-retrieval <job> <ISO time>`, runs the job detached under `caffeinate -i`, logs to `results/logs/`, and releases the lock when the job ends or is stopped (`scripts/run.sh --stop`).
+- Start a timing run only after the coordinator sends `GO <job>`. Report to the coordinator when a job starts, ends, or fails, with the log path.
+- Tests and builds are light work: run them without the lock, but never while a timing run holds it.
+- Any container this project starts outside a timing run stays under 4 GB and is stopped before a sweep.
+- `scripts/status.sh` shows the lock, running containers, the newest log, and the result counts.
+- Decisions that need the human, with the default taken, go in `results/summary/OPEN-QUESTIONS.md`.
+
 ## Machine limits
 
-- Apple M4, 24 GB RAM, about 44 GB free disk. Docker Desktop gives containers about 7.6 GB of RAM.
+- Apple M4, 24 GB RAM, about 48 GB free disk. Docker Desktop's VM memory must be set to 16 GB in Docker Desktop > Settings > Resources for the full-corpus runs (8 GB is enough for the dev set).
 - Run one database container at a time.
 - Delete old data before a large download. Check free disk with `df -h ~` first.
 
