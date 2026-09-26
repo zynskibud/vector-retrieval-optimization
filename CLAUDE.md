@@ -130,11 +130,11 @@ Rules:
 
 ## Heavy jobs: the machine lock and the coordinator
 
-This machine is shared with two other projects. A coordinator session sequences heavy jobs through `../.coord/PROTOCOL.md` (read it). A benchmark timing run is a heavy job: it needs the whole machine idle, so it runs alone.
+This machine is shared with two other projects. A coordinator session schedules jobs by resource class through `../.coord/PROTOCOL.md` (read it; `../.coord/STATUS.md` names the coordinator). A benchmark timing run is class TIMING: it runs alone on the machine under `../.coord/timing.lock`, with the GPU lock (`gpu.lock`, old name `heavy.lock`) free and the load under 2.
 
-- Every timing run starts through `scripts/run.sh <job>` and never by hand. The script runs `scripts/preflight.sh`, takes `../.coord/heavy.lock` with owner `vector-retrieval <job> <ISO time>`, runs the job detached under `caffeinate -i`, logs to `results/logs/`, and releases the lock when the job ends or is stopped (`scripts/run.sh --stop`).
+- Every timing run starts through `scripts/run.sh <job>` and never by hand. The script runs `scripts/preflight.sh`, takes `../.coord/timing.lock` with owner `vector-retrieval <job> <ISO time>`, runs the job detached under `caffeinate -i`, logs to `results/logs/`, and releases the lock when the job ends or is stopped (`scripts/run.sh --stop`).
 - Start a timing run only after the coordinator sends `GO <job>`. Report to the coordinator when a job starts, ends, or fails, with the log path.
-- Tests and builds are light work: run them without the lock, but never while a timing run holds it.
+- Tests and builds are CPU-BULK or LIGHT work: run them without a lock, never while a timing run holds `timing.lock`.
 - Any container this project starts outside a timing run stays under 4 GB and is stopped before a sweep.
 - `scripts/status.sh` shows the lock, running containers, the newest log, and the result counts.
 - Decisions that need the human, with the default taken, go in `results/summary/OPEN-QUESTIONS.md`.

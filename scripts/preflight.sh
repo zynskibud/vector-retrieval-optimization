@@ -11,7 +11,8 @@ set -u
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AI_ENGINEERING_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
-LOCK_DIR="$AI_ENGINEERING_ROOT/.coord/heavy.lock"
+LOCK_DIR="$AI_ENGINEERING_ROOT/.coord/timing.lock"
+GPU_LOCKS="$AI_ENGINEERING_ROOT/.coord/gpu.lock $AI_ENGINEERING_ROOT/.coord/heavy.lock"
 DISK_FAIL_GB=15
 LOAD_WARN=2
 HARD_FAIL=0
@@ -40,23 +41,28 @@ else
   fail "disk free ${free_gb:-?} GB, under $DISK_FAIL_GB GB"
 fi
 
-# Coordinator lock: one heavy job on the machine at a time.
+# Coordinator locks: TIMING runs alone (timing.lock) and needs the GPU lock free (gpu.lock, old name heavy.lock).
 if [ -d "$LOCK_DIR" ]; then
   owner="$(cat "$LOCK_DIR/owner" 2>/dev/null || echo unknown)"
   case "$owner" in
     "vector-retrieval "*)
       pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
       if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-        fail "lock held by this project's running job: $owner (pid $pid)"
+        fail "timing lock held by this project's running job: $owner (pid $pid)"
       else
-        warn "stale lock from this project: $owner; scripts/run.sh removes it"
+        warn "stale timing lock from this project: $owner; scripts/run.sh removes it"
       fi
       ;;
-    *) fail "lock held by another project: $owner" ;;
+    *) fail "timing lock held by another project: $owner" ;;
   esac
 else
-  ok "no heavy lock"
+  ok "no timing lock"
 fi
+for g in $GPU_LOCKS; do
+  if [ -d "$g" ]; then
+    fail "GPU lock held ($(basename "$g")): $(cat "$g/owner" 2>/dev/null || echo unknown); a TIMING job needs it free"
+  fi
+done
 
 # Docker daemon, VM size, image, and no benchmark container already running.
 if docker info >/dev/null 2>&1; then

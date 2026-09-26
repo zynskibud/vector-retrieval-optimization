@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run one heavy job under the coordinator's lock, detached, with the lid-sleep
+# Run one TIMING job under the coordinator's timing lock, detached, with the lid-sleep
 # guard. Every benchmark sweep on this machine starts through this script.
 #
 # Usage: scripts/run.sh [--dry-run] <job>
@@ -11,6 +11,8 @@
 #   full-sweep    same on the full corpus (Python HNSW and DiskANN on the dev set, see
 #                 results/summary/OPEN-QUESTIONS.md); needs Docker at 16 GB and mem_limit 12g
 #   db-sweep      Phase 2: each database in turn (up, its supported indexes on the dev set, 3 repeats, down)
+#   load-sweep    Phase 4 (TIMING): hnsw in python, go, cpp, rust under 1..64 clients and one
+#                 insert run (make load), then each database in turn (up, make load-db, down), then the report
 #   test          make test (light, but it still takes the lock so it never overlaps a sweep)
 #
 # Steps: preflight (stop on FAIL), take the lock with owner
@@ -19,13 +21,13 @@
 # (SIGTERM/SIGINT; a SIGKILL leaves a stale lock that preflight reports and
 # the next run.sh removes). Output goes to results/logs/<job>-<time>.log.
 #
-# Only start a heavy job after the coordinator sends "GO <job>".
+# Only start a TIMING job after the coordinator sends "GO <job>".
 
 set -u
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AI_ENGINEERING_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
-LOCK_DIR="$AI_ENGINEERING_ROOT/.coord/heavy.lock"
+LOCK_DIR="$AI_ENGINEERING_ROOT/.coord/timing.lock"
 LOG_DIR="$REPO_ROOT/results/logs"
 DRY_RUN=0
 JOB=""
@@ -66,8 +68,12 @@ case "$JOB" in
   db-sweep)
     CMD="for db in qdrant pgvector milvus; do make db-up DB=\$db && make bench-db ARGS=\"--data data/processed/dev --languages \$db --indexes flat,ivf,pq,ivf_pq,hnsw,diskann --repeat 3\"; make db-down DB=\$db; done
 && make report ARGS='--data data/processed/dev'" ;;
+  load-sweep)
+    CMD="make load ARGS='--data data/processed/dev --languages rust,cpp,go,python'
+&& for db in qdrant pgvector milvus; do make db-up DB=\$db && make load-db ARGS=\"--data data/processed/dev --languages \$db\"; make db-down DB=\$db; done
+&& make report ARGS='--data data/processed/dev'" ;;
   test) CMD="make test" ;;
-  "")   echo "usage: scripts/run.sh [--dry-run] <dev-sweep|full-sweep|test> | --stop" >&2; exit 2 ;;
+  "")   echo "usage: scripts/run.sh [--dry-run] <dev-sweep|full-sweep|db-sweep|load-sweep|test> | --stop" >&2; exit 2 ;;
   *)    echo "unknown job: $JOB" >&2; exit 2 ;;
 esac
 CMD="$(printf '%s' "$CMD" | tr '\n' ' ')"
