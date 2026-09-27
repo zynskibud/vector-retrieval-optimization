@@ -101,6 +101,16 @@ class Client(Protocol):
     def compact(self) -> dict: ...                # the database's repair; returns {"compact_s": s, ...detail}
     def stats(self) -> dict: ...
     def close(self) -> None: ...
+    # Phase 7 (CONTRACT section 15.3, tools/backup/bench.py). backup/restore raise HostStepRequired
+    # when the step needs a tool or a container that the dbbench container cannot reach.
+    def backup(self, path) -> dict: ...           # {"backup_s", "backup_bytes", ...detail}
+    def drop(self) -> None: ...                   # remove the table or collection
+    def restore(self, path) -> dict: ...          # {"restore_s", "rebuild_needed", ...detail}
+    def reopen(self, index: str) -> float: ...    # stage 2: search state on the restored data; seconds
+
+
+class HostStepRequired(Exception):
+    """The backup or restore of this database runs on the host (scripts/backup_db.sh)."""
 
 
 DELETE_NAMES = ("del10", "del30", "del50")

@@ -9,7 +9,8 @@ recall@10 and p50 against the deleted fraction (0 = the unchanged runs), solid b
 after compaction, plus a "Updates, deletes, compaction" table in results.md; and for cache runs
 (language "cache", CONTRACT section 14) hnsw-cache.png: hit rate and end-to-end p50 against
 capacity for lru and redis on the zipf workload, with the none backend as a horizontal line,
-plus an "Embedding cache" table in results.md.
+plus an "Embedding cache" table in results.md; and for backup runs (extra.restore_identical,
+CONTRACT section 15.3) a "Backup and restore" table in results.md, one row per file.
 
 Run: uv run python -m tools.bench.report --data data/processed/dev
 """
@@ -73,6 +74,7 @@ def load_rows(raw: Path, gt, filters: dict | None = None, delete_masks: dict | N
             r["load_line"] = r["language"] + (" +inserts" if r["insert_rate"] else "")
             r["is_change"] = bool(r["deleted"] or r["updated"])
             r["is_cache"] = r["language"] == "cache"
+            r["is_backup"] = "restore_identical" in doc.get("extra", {})
             r["deleted_fraction"] = DELETE_FRACTION.get(r["deleted"], 0.0 if not r["updated"] else np.nan)
             rows.append(r)
     return pd.DataFrame(rows)
@@ -248,6 +250,23 @@ def change_table(df: pd.DataFrame) -> str:
     return md_table(g[CHANGE_COLS]) if not g.empty else ""
 
 
+BACKUP_EXTRA = ["backup_s", "backup_bytes", "restore_s", "rebuild_needed", "cold", "rows_before", "rows_after",
+                "restore_identical", "ids_equal_fraction"]
+
+
+def backup_table(raw: Path, df: pd.DataFrame) -> str:
+    """One row per backup file: the extra fields, and recall@10 / p50 of run 1 and run 2 (after_restore)."""
+    g = df[df["is_backup"]]
+    rows = []
+    for f, h in g.groupby("file"):
+        ex = json.loads((raw / f).read_text())["extra"]
+        before, after = h[h["phase"] == ""], h[h["phase"] == "after_restore"]
+        rows.append({"index": h["index"].iloc[0], "language": h["language"].iloc[0], **{c: ex.get(c) for c in BACKUP_EXTRA},
+                     "recall@10": before["recall@10"].iloc[0], "recall@10_after": after["recall@10"].iloc[0],
+                     "p50_ms": before["p50_ms"].iloc[0], "p50_ms_after": after["p50_ms"].iloc[0], "file": f})
+    return md_table(pd.DataFrame(rows).sort_values(["index", "language"])) if rows else ""
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", type=Path, default=Path("data/processed/dev"))
@@ -268,7 +287,7 @@ def main() -> None:
     for index, g in df.groupby("index"):
         md += [f"## {index}", "", md_table(g[cols[1:]]), ""]
         # The latency-recall plot keeps the unfiltered runs only, as before Phase 3.
-        static = g[~g["is_load"] & (g["phase"] == "") & ~g["is_change"] & ~g["is_cache"]]
+        static = g[~g["is_load"] & (g["phase"] == "") & ~g["is_change"] & ~g["is_cache"] & ~g["is_backup"]]
         if not static.empty:
             plot(static[static["filter"] == "none"], index, f"{name}, n = {g['n'].iloc[0]:,}",
                  out / f"{index}.png")
@@ -282,6 +301,13 @@ def main() -> None:
                "FAISS HNSW (m=16, ef_construct=100, ef=64) behind the embedding model. Times in ms; embed_p50 over misses only; "
                "e2e = cache lookup + embed on a miss + search. recall@10 is over the first 1,000 requests whose text is a query.",
                "", ctable, ""]
+    btable = backup_table(raw, df)
+    if btable:
+        md += ["## Backup and restore (CONTRACT section 15)", "",
+               "Default build and search setting. backup_s / restore_s in seconds; backup_bytes = the snapshot, dump, or tar file. "
+               "restore_s includes any index build (rebuild_needed) and, for Milvus, the restart and the collection load (cold = true). "
+               "restore_identical = the IDs of all 1,000 queries are equal before and after, and rows_before = rows_after.",
+               "", btable, ""]
     table = change_table(df)
     if table:
         md += ["## Updates, deletes, compaction (CONTRACT section 13)", "",

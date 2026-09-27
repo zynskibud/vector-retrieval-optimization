@@ -19,6 +19,8 @@
 #   cache-sweep   Phase 6 (TIMING): embedding cache, backends none/lru/redis x capacity 500/2000/5000
 #                 on zipf, one uniform run per backend, one lru invalidation run (make cache-up,
 #                 make cache, make cache-down), then the report
+#   backup-sweep  Phase 7 (TIMING): each database in turn (up, make backup-db: flat, ivf, hnsw where it
+#                 has them, backup, drop, restore, searches before and after; down), then the report
 #   test          make test (light, but it still takes the lock so it never overlaps a sweep)
 #
 # Steps: preflight (stop on FAIL), take the lock with owner
@@ -42,7 +44,7 @@ for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=1 ;;
     --stop)    JOB="--stop" ;;
-    -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
     *)         JOB="$arg" ;;
   esac
 done
@@ -85,8 +87,11 @@ case "$JOB" in
   cache-sweep)
     CMD="make cache-up && make cache ARGS='--data data/processed/dev'; make cache-down
 && make report ARGS='--data data/processed/dev'" ;;
+  backup-sweep)
+    CMD="for db in qdrant pgvector milvus; do make db-up DB=\$db && make backup-db DB=\$db ARGS='--data data/processed/dev'; make db-down DB=\$db; done
+&& make report ARGS='--data data/processed/dev'" ;;
   test) CMD="make test" ;;
-  "")   echo "usage: scripts/run.sh [--dry-run] <dev-sweep|full-sweep|db-sweep|load-sweep|changes-sweep|cache-sweep|test> | --stop" >&2; exit 2 ;;
+  "")   echo "usage: scripts/run.sh [--dry-run] <dev-sweep|full-sweep|db-sweep|load-sweep|changes-sweep|cache-sweep|backup-sweep|test> | --stop" >&2; exit 2 ;;
   *)    echo "unknown job: $JOB" >&2; exit 2 ;;
 esac
 CMD="$(printf '%s' "$CMD" | tr '\n' ' ')"

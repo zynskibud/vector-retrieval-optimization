@@ -6,6 +6,14 @@ it: fetch the top `rerank` IDs, read their vectors with `get`, sort by the exact
 Filters (Phase 3): `views` is a FLOAT field (float32, as in metadata.parquet; an INT64 field
 would truncate and move rows across the threshold). filter=<name> searches with
 filter="views >= t", t from filters.json. No scalar index on views (Milvus scans the field).
+
+Backup and restore (Phase 7, CONTRACT section 15.3). With local storage and embedded etcd there
+is no object store for milvus-backup, so the backup is cold and runs on the host
+(scripts/backup_db.sh): stop the milvus container, tar the milvus-data volume, start it; restore =
+stop, wipe the volume, untar, start, wait healthy. backup() and restore() here raise
+HostStepRequired. flush_all() runs before the stop so every row is in a sealed segment on disk;
+reopen() connects again after the restart and loads the collection. The volume holds the index
+files, so no index is built again (rebuild_needed = false).
 """
 
 from __future__ import annotations
@@ -287,6 +295,39 @@ class MilvusDB:
             "index_bytes_source": "unavailable",
             "client_lib": f"pymilvus {pymilvus.__version__}",
         }
+
+    # -- Phase 7 ----------------------------------------------------------
+    def flush_all(self) -> None:
+        self.client.flush(COLLECTION)
+
+    def backup(self, path) -> dict:
+        raise base.HostStepRequired("milvus cold backup stops the container: run scripts/backup_db.sh on the host")
+
+    def restore(self, path) -> dict:
+        raise base.HostStepRequired("milvus cold restore starts the container: run scripts/backup_db.sh on the host")
+
+    def drop(self) -> None:
+        if self.client.has_collection(COLLECTION):
+            self.client.drop_collection(COLLECTION)
+
+    def reopen(self, index: str) -> float:
+        """Stage 2 after a restart: connect (with retries), load the collection, wait loaded. Seconds."""
+        t0 = time.perf_counter()
+
+        def up() -> bool:
+            try:
+                self.close()
+                self.connect()
+                return self.client.has_collection(COLLECTION)
+            except Exception:  # noqa: BLE001 - the server is still starting
+                return False
+
+        base.wait_until(up, 600, every_s=2.0, what="milvus reachable with the collection")
+        self.client.load_collection(COLLECTION)
+        base.wait_until(lambda: str(self.client.get_load_state(COLLECTION).get("state")).endswith("Loaded"),
+                        TIMEOUT_S, what="collection loaded")
+        self.index = index
+        return time.perf_counter() - t0
 
     def close(self) -> None:
         if self.client is not None:

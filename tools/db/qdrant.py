@@ -29,6 +29,14 @@ its own after del30. To measure the tombstone state, delete() and update() first
 deleted_threshold = 1.0 (vacuum off); compact() then sets deleted_threshold = 0.01 and
 vacuum_min_vector_number = 100 and waits for status green. stats() reads segment counts and
 deleted-vector counts from GET /telemetry (details_level=10).
+
+Backup and restore (Phase 7, CONTRACT section 15.3). backup(path): create_snapshot of the
+collection (Qdrant writes it to /qdrant/snapshots, the qdrant-snapshots volume), download it over
+GET /collections/vro/snapshots/<name> on the internal network into `path`, then delete the
+server copy. drop(): delete_collection. restore(path): upload the file with
+POST /collections/vro/snapshots/upload?priority=snapshot (multipart, wait=true), then wait for
+status green. The snapshot holds the segments with their HNSW graphs, so rebuild_needed is
+false when indexed_vectors_count equals points_count right after the upload returns.
 """
 
 from __future__ import annotations
@@ -221,6 +229,55 @@ class QdrantDB:
                                  "segment vectors_size_bytes + payloads_size_bytes (telemetry; HNSW links not included)",
             "ram_bytes": sum(int(s.get("ram_usage_bytes") or 0) for s in segs),
         }
+
+    # -- Phase 7 -------------------------------------------------------------
+    def backup(self, path) -> dict:
+        """Snapshot the collection and download the file to `path`. Returns seconds and bytes."""
+        from pathlib import Path
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        t0 = time.perf_counter()
+        snap = self.client.create_snapshot(COLLECTION, wait=True)
+        create_s = time.perf_counter() - t0
+        url = f"http://{self.host}:6333/collections/{COLLECTION}/snapshots/{snap.name}"
+        with urllib.request.urlopen(url, timeout=BUILD_TIMEOUT_S) as r, open(path, "wb") as f:
+            while chunk := r.read(1 << 20):
+                f.write(chunk)
+        backup_s = time.perf_counter() - t0
+        self.client.delete_snapshot(COLLECTION, snap.name, wait=True)
+        return {"backup_s": backup_s, "backup_bytes": path.stat().st_size, "snapshot_create_s": create_s,
+                "snapshot_name": snap.name, "method": "create_snapshot + HTTP download"}
+
+    def drop(self) -> None:
+        self.client.delete_collection(COLLECTION)
+
+    def restore(self, path) -> dict:
+        """Upload the snapshot file (recover with priority=snapshot) and wait for status green."""
+        import httpx
+        from pathlib import Path
+
+        path = Path(path)
+        url = f"http://{self.host}:6333/collections/{COLLECTION}/snapshots/upload"
+        t0 = time.perf_counter()
+        with open(path, "rb") as f:
+            r = httpx.post(url, params={"priority": "snapshot", "wait": "true"},
+                           files={"snapshot": (path.name, f, "application/octet-stream")}, timeout=BUILD_TIMEOUT_S)
+        r.raise_for_status()
+        upload_s = time.perf_counter() - t0
+        info = self.client.get_collection(COLLECTION)
+        points, indexed = int(info.points_count or 0), int(info.indexed_vectors_count or 0)
+        self._wait_green(require_indexed=(self.index == "hnsw"))
+        restore_s = time.perf_counter() - t0
+        return {"restore_s": restore_s, "upload_s": upload_s, "points_at_recover": points,
+                "indexed_vectors_at_recover": indexed,
+                "rebuild_needed": bool(self.index == "hnsw" and indexed < points),
+                "method": "POST snapshots/upload?priority=snapshot"}
+
+    def reopen(self, index: str) -> float:
+        """Stage 2 of a staged backup: set the search state on the restored collection. Seconds."""
+        self.index = index
+        return 0.0
 
     def search(self, query: np.ndarray, k: int, params: dict) -> tuple[list[int], list[float]]:
         rescore = bool(params.get("rescore") or params.get("rerank"))

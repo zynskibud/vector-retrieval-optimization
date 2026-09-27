@@ -25,6 +25,15 @@ backend (capacity 2000), and one lru run with --invalidate-at 25000. Repeat 1. R
 dbbench so Redis is reachable; --backends none,lru skips Redis.
 Outputs: results/raw/<data-name>/cache-<backend>-c<capacity>-<workload>[-inv].json
   make cache ARGS="--data data/processed/dev"   (after make cache-up)
+
+Backup mode (Phase 7, CONTRACT section 15.3): --backup, per database, flat, ivf, hnsw where the
+database has them, one run each of tools.backup.bench (repeat 1). Qdrant runs here (inside
+dbbench). pgvector and Milvus need a host step between two stages, so their cases run through
+scripts/backup_db.sh (make backup-db); this mode only lists them for that script (--list prints
+one "<index> <out> <exists 0|1>" line per case). With --limit N the outputs go to
+results/raw/<data-name>/bak-test/ so that the report does not read them.
+Outputs: results/raw/<data-name>/bak-<db>-<index>.json
+  make backup-db DB=qdrant ARGS="--data data/processed/dev"   (after make db-up DB=qdrant)
 """
 
 import argparse
@@ -183,6 +192,26 @@ def cache_cases(backends: list[str], data: Path, requests: int) -> list[dict]:
     return out
 
 
+# Phase 7 backup mode.
+BACKUP_PROGRAM = ["uv", "run", "python", "-m", "tools.backup.bench"]
+BACKUP_INDEXES = {"qdrant": ["flat", "hnsw"], "pgvector": ["flat", "ivf", "hnsw"], "milvus": ["flat", "ivf", "hnsw"]}
+BACKUP_IN_CONTAINER = {"qdrant"}  # the others need scripts/backup_db.sh
+
+
+def backup_cases(dbs: list[str], indexes: list[str], data: Path, limit: int | None) -> list[dict]:
+    """One case per (database, index) at the default build and search setting."""
+    out = []
+    folder = Path("results/raw") / data.name / ("bak-test" if limit else "")
+    for db in dbs:
+        for name in [i for i in BACKUP_INDEXES[db] if i in indexes]:
+            path = folder / f"bak-{db}-{name}.json"
+            cmd = BACKUP_PROGRAM + ["--db", db, "--index", name, "--data", str(data), "--out", str(path)]
+            if limit:
+                cmd += ["--limit", str(limit)]
+            out.append({"language": db, "index": name, "out": path, "cmd": cmd})
+    return out
+
+
 def sweep_for(lang: str, name: str) -> dict:
     return SWEEPS_BY_LANGUAGE.get(lang, {}).get(name, SWEEPS[name])
 
@@ -295,6 +324,9 @@ def main() -> None:
     ap.add_argument("--load", action="store_true", help="Phase 4: clients sweep plus one insert run (repeat 1)")
     ap.add_argument("--changes", action="store_true", help="Phase 5: deletes (with and without compaction) and updates (repeat 1)")
     ap.add_argument("--cache", action="store_true", help="Phase 6: embedding cache sweep (repeat 1; run in dbbench for redis)")
+    ap.add_argument("--backup", action="store_true", help="Phase 7: database backup and restore (repeat 1; see make backup-db)")
+    ap.add_argument("--list", action="store_true", help="backup mode: print '<index> <out> <exists>' per case and exit")
+    ap.add_argument("--limit", type=int, default=None, help="backup mode: rows (test runs; outputs under bak-test/)")
     ap.add_argument("--backends", default=",".join(CACHE_BACKENDS), help="cache mode: backends to run")
     ap.add_argument("--requests", type=int, default=50000, help="cache mode: requests per workload")
     ap.add_argument("--duration", type=float, default=20.0, help="load mode: seconds per run")
@@ -323,6 +355,18 @@ def main() -> None:
         if bad:
             sys.exit(f"changes mode has no {bad}; known: {list(CHANGE_LANGUAGES) + list(LOAD_PROGRAMS)}")
         todo, repeat = change_cases(languages, indexes, args.data), 1
+    elif args.backup:
+        bad = [l for l in languages if l not in BACKUP_INDEXES]
+        if bad:
+            sys.exit(f"backup mode has no {bad}; known: {list(BACKUP_INDEXES)}")
+        todo, repeat = backup_cases(languages, indexes, args.data, args.limit), 1
+        if args.list:
+            for case in todo:
+                print(case["index"], case["out"], int(case["out"].exists()))
+            return
+        for case in [c for c in todo if c["language"] not in BACKUP_IN_CONTAINER]:
+            print(f"{case['out'].name}: {case['language']} needs a host step; run make backup-db DB={case['language']}")
+        todo = [c for c in todo if c["language"] in BACKUP_IN_CONTAINER]
     else:
         todo, repeat = cases(languages, indexes, args.data), args.repeat
 
@@ -332,7 +376,7 @@ def main() -> None:
             print(f"{case['out'].name}: skipped, {case['language']} bench has no --clients")
         elif args.dry_run:
             print(shlex.join(case["cmd"]))
-        elif not program_exists(case["language"]):
+        elif not args.backup and not program_exists(case["language"]):
             print(f"{case['out'].name}: skipped, bench program for {case['language']} not found ({shlex.join(PROGRAMS[case['language']])})")
         elif (case["language"], case["index"]) in UNSUPPORTED:
             print(f"{case['out'].name}: skipped, {case['language']} has no {case['index']}")

@@ -3,7 +3,7 @@
 RUN   := docker compose run --rm bench
 SETUP := docker compose run --rm setup
 
-.PHONY: image setup build test bench report shell clean-raw db-up db-down dbbench db-test bench-db load load-db changes changes-db cache cache-up cache-down cache-test
+.PHONY: image setup build test bench report shell clean-raw db-up db-down dbbench db-test bench-db load load-db changes changes-db cache cache-up cache-down cache-test backup-db backup-test vro-test
 
 image:
 	docker compose build
@@ -82,3 +82,16 @@ cache:
 ## the cache tests, Redis included (after make cache-up)
 cache-test:
 	docker compose --profile db run --rm dbbench uv run --frozen pytest tools/cache/tests -q
+
+## Phase 7 backup and restore (CONTRACT section 15.3), one database at a time (after make db-up DB=...).
+## Runs on the host: scripts/backup_db.sh starts the dbbench stages and the docker steps between them.
+## e.g. make backup-db DB=pgvector ARGS="--data data/processed/dev [--indexes hnsw] [--limit 20000] [--force]"
+backup-db:
+	scripts/backup_db.sh $(DB) $(ARGS)
+## the database round-trip test: 20,000 rows, every index of DB, then the checks on the outputs
+backup-test:
+	scripts/backup_db.sh $(DB) --data data/processed/dev --limit 20000 --force
+	docker compose --profile db run --rm dbbench uv run --frozen pytest tools/backup/tests/test_db_roundtrip.py -q -k $(DB)
+## the cross-language .vro test (Rust writes, Go, C++, Python load), inside bench
+vro-test:
+	$(RUN) uv run --frozen pytest tools/backup/tests/test_vro_cross.py -q

@@ -129,7 +129,10 @@ docker compose run --rm bench uv run --frozen pytest tools/cache/tests -q     # 
 docker compose run --rm bench uv run --frozen python -m tools.cache.workload --data data/processed/dev   # zipf + uniform -> results/raw/dev/workloads/
 docker compose --profile db run --rm dbbench uv run --frozen python -m tools.cache.bench --data data/processed/dev --workload zipf --backend lru --capacity 2000 --out results/raw/dev/cache-lru-c2000-zipf.json
 make cache-up && make cache ARGS="--data data/processed/dev"; make cache-down  # Phase 6 sweep (timing: lock) -> cache-<backend>-c<cap>-<workload>[-inv].json
-scripts/run.sh dev-sweep | db-sweep | load-sweep | changes-sweep | cache-sweep  # timing jobs, only after the coordinator's GO
+make db-up DB=pgvector && make backup-db DB=pgvector ARGS="--data data/processed/dev [--indexes hnsw] [--force]"; make db-down DB=pgvector   # Phase 7 (host script scripts/backup_db.sh; timing: lock) -> bak-<db>-<index>.json
+make db-up DB=milvus && make backup-test DB=milvus; make db-down DB=milvus     # Phase 7 database round trip, 20,000 rows -> results/raw/dev/bak-test/
+make vro-test                                                                 # Phase 7 cross-language .vro test (Rust writes; Go, C++, Python load)
+scripts/run.sh dev-sweep | db-sweep | load-sweep | changes-sweep | cache-sweep | backup-sweep  # timing jobs, only after the coordinator's GO
 ```
 
 Rules:

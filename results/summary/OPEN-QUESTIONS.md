@@ -2,6 +2,12 @@
 
 Decisions that need the human, the default the session took, and its effect. Newest first. Remove an entry when the human decides.
 
+## 2026-09-26: Phase 7 database defaults (host steps, pgvector rebuild check, Milvus cold copy)
+
+- **Question:** four points where CONTRACT section 15.3 met the container rules.
+- **Default taken:** (1) The pgvector dump and the Milvus cold copy run on the host in `scripts/backup_db.sh`, because the dbbench container has no Docker socket and no `pg_dump`; the host runs only `docker compose exec`, `docker compose stop/up`, one throwaway `docker run` container on the volumes, and a clock. (2) `pg_restore` builds the IVFFlat or HNSW index again with unseeded randomness, so `restore_identical` is false for pgvector ivf and hnsw; the test requires recall@10 within 0.02 instead (CONTRACT 15.4 updated). On 20,000 rows: hnsw ids equal for 97.7% of queries, recall 0.9861 before and 0.9858 after; ivf ids equal for 14%, recall 0.730 before and 0.727 after. (3) Milvus is a cold copy of the whole `milvus-data` volume (`cold = true`). No warm method was tested: with local storage there is no object store for `milvus-backup`. (4) The Qdrant snapshot is downloaded to the raw volume and the server copy deleted; `rebuild_needed` is false when `indexed_vectors_count` equals the point count right after the upload (it did, for hnsw).
+- **Effect:** the `milvus-data` volume holds 13.5 GB from the earlier phases, so a Milvus backup copies 13.5 GB (about 150 s each way) even for a 20,000-row collection, and `backup_bytes` means the volume, not the collection. The user must delete the volume (`docker volume rm vector_retrieval_optimization_milvus-data`, Milvus down) before `backup-sweep`; the deletion was refused to this session. pgvector's `backup_s` includes the start of `docker compose exec` (about 0.3 s) and `-Fc` compression.
+
 ## 2026-09-26: Two container caps: day (3 CPUs, 6 GB) and TIMING (6 CPUs, 12 GB)
 
 - **Question:** the coordinator's rule (PROTOCOL.md): by day one container at a time at 3 CPUs and 6 GB; a TIMING job on GO at 6 CPUs and up to 12 GB, with the caps in the compose file.

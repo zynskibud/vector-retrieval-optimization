@@ -46,6 +46,13 @@ or UPDATE leaves the old row version as a dead tuple in the heap and its entry i
 
 Search: one prepared statement, binary protocol. The query vector goes as a binary
 pgvector value (int16 dim, int16 unused, dim big-endian float4).
+
+Backup and restore (Phase 7, CONTRACT section 15.3). The dbbench image has no Postgres client
+binaries, so backup() and restore() raise HostStepRequired unless pg_dump is on PATH. The
+normal path is scripts/backup_db.sh on the host: `docker compose exec pgvector pg_dump -Fc -t items`
+into a file inside the pgvector container, DROP TABLE, pg_restore. The dump holds the rows and the
+index definitions but not the index pages, so pg_restore builds the vector index again
+(rebuild_needed = true, restore_s includes the build).
 """
 
 from __future__ import annotations
@@ -269,6 +276,47 @@ class PgvectorClient:
         if iterative:
             rows.sort(key=lambda r: (-r[1], r[0]))
         return [int(r[0]) for r in rows], [float(r[1]) for r in rows]
+
+    # -- Phase 7 ----------------------------------------------------------
+    def _pg_env(self) -> dict:
+        import os
+        return {**os.environ, "PGPASSWORD": "vro"}
+
+    def backup(self, path) -> dict:
+        """pg_dump -Fc of table items into `path` (only when pg_dump is installed here)."""
+        import shutil
+        import subprocess
+        from pathlib import Path
+
+        if not shutil.which("pg_dump"):
+            raise base.HostStepRequired("pg_dump is not in this container: run scripts/backup_db.sh on the host")
+        t0 = time.perf_counter()
+        subprocess.run(["pg_dump", "-Fc", "-h", "pgvector", "-U", "vro", "-d", "vro", "-t", "items", "-f", str(path)],
+                       check=True, env=self._pg_env())
+        return {"backup_s": time.perf_counter() - t0, "backup_bytes": Path(path).stat().st_size,
+                "method": "pg_dump -Fc -t items (dbbench)"}
+
+    def drop(self) -> None:
+        self.conn.execute("DROP TABLE IF EXISTS items")
+
+    def restore(self, path) -> dict:
+        """pg_restore of the dump (only when pg_restore is installed here). Rebuilds the vector index."""
+        import shutil
+        import subprocess
+
+        if not shutil.which("pg_restore"):
+            raise base.HostStepRequired("pg_restore is not in this container: run scripts/backup_db.sh on the host")
+        t0 = time.perf_counter()
+        subprocess.run(["pg_restore", "-h", "pgvector", "-U", "vro", "-d", "vro", str(path)], check=True, env=self._pg_env())
+        return {"restore_s": time.perf_counter() - t0, "rebuild_needed": True, "method": "pg_restore (dbbench)"}
+
+    def reopen(self, index: str) -> float:
+        """Stage 2: set the index name and run ANALYZE (pg_restore does not restore statistics). Seconds."""
+        t0 = time.perf_counter()
+        self.attach(index)
+        self._search_key = None
+        self.conn.execute("ANALYZE items")
+        return time.perf_counter() - t0
 
     # -- stats ------------------------------------------------------------
     def stats(self) -> dict:

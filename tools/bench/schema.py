@@ -20,7 +20,7 @@ SEARCH_KEYS = {"search_params": dict, "ids": list, "scores": list, "latency_ms":
 MACHINE_KEYS = {"os": str, "arch": str, "cpu": str, "cores": int}
 # A load run (CONTRACT section 12.1) has extra.clients; it then needs these keys in extra.
 LOAD_KEYS = {"errors": int, "cpu_pct": float, "clients": int, "duration_s": float, "queries_done": int}
-PHASES = {"after_inserts"}  # search_params.phase (CONTRACT section 12.2)
+PHASES = {"after_inserts", "after_restore"}  # search_params.phase (CONTRACT sections 12.2 and 15.3)
 # A cache run (language "cache", CONTRACT section 14.3) needs these keys in search_params and extra.
 # Its latency_ms has one value per request (extra.requests), not q.
 CACHE_PARAMS = {"backend": str, "capacity": int, "workload": str, "model_version": str}

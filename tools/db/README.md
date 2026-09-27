@@ -125,6 +125,22 @@ What the tombstone state means for each graph index:
 
 `make changes-db ARGS="--data data/processed/dev --languages <db>"` runs the runner's changes sweep (CONTRACT 13; `chg-<db>-<index>-<change>[-compact].json`).
 
+## Backup and restore (Phase 7, CONTRACT section 15.3)
+
+`tools/backup/bench.py` loads and builds, runs the 1,000 queries (search run 1), backs up, drops, restores, runs the queries again (search run 2, `search_params.phase = "after_restore"`), and writes CONTRACT section 3 JSON with `extra.backup_s`, `backup_bytes`, `restore_s`, `rebuild_needed`, `cold`, `rows_before`, `rows_after`, `restore_identical`, `ids_equal_fraction`, `ids_overlap`. Cases: flat, ivf, hnsw where the database has them (Qdrant: flat, hnsw).
+
+The dbbench container has no Docker socket, so the work runs in stages, started on the host by `scripts/backup_db.sh` (`make backup-db DB=<db> ARGS="--data DIR"`):
+
+| Database | Method | Where | rebuild_needed |
+|---|---|---|---|
+| Qdrant | `create_snapshot`, HTTP download to `<out stem>.snapshot` on the raw volume, `delete_collection`, upload with `POST /collections/vro/snapshots/upload?priority=snapshot`, wait green | one dbbench process, `--stage all` | false if `indexed_vectors_count` = points right after the upload |
+| pgvector | `pg_dump -Fc -t items` to `/tmp` in the pgvector container, `DROP TABLE items`, `pg_restore` | host: `docker compose exec pgvector` between `--stage before` and `--stage after` | true for ivf and hnsw (the dump has no index pages), false for flat |
+| Milvus | cold: stop milvus, `tar` the milvus-data volume to `<out stem>.tar` on the raw volume, start, wait healthy; restore = stop, wipe the volume, untar, start, wait healthy | host: `docker compose stop/up` and a `docker run --rm vro-bench:latest` container on the two volumes, between the stages | false (the volume holds the index files); `cold = true` |
+
+Stage files: `--stage before` writes `<out stem>.stage1.json` (the document with search run 1) on the raw volume. The host step times itself and passes its numbers as `--stage after --host-json '{...}'`; stage after reconnects (`client.reopen(index)`: Milvus loads the collection, and those seconds are added to `restore_s`; pgvector runs `ANALYZE`), runs search run 2, merges, writes `<out>`, and deletes the stage file. The dump and the tar are deleted after the restore. `backup()` and `restore()` on the pgvector and Milvus clients raise `HostStepRequired` inside dbbench (pgvector uses `pg_dump` if it is on PATH).
+
+pgvector seeds neither its IVFFlat k-means sample nor its HNSW levels, so the index that `pg_restore` builds differs from the first one and `restore_identical` is false for ivf and hnsw. The test (`tools/backup/tests/test_db_roundtrip.py`, `make backup-test DB=<db>`, 20,000 rows) then requires recall@10 after the restore within 0.02 of recall@10 before (exact top 10 over the loaded rows), and `restore_identical` for every case without a rebuild.
+
 ## Tests (`tests/test_<db>.py`)
 
 Run with the database up, against `data/processed/dev` with `--limit 20000` and brute-force truth computed in the test:
