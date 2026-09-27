@@ -13,7 +13,7 @@ Six vector search indexes built by hand in Python, Go, C++, and Rust, checked ag
 | 4 | Concurrency | Code done: closed-loop clients 1..64 and inserts during search for HNSW in all four languages and for the three databases; the load sweep waits for the machine lock |
 | 5 | Updates and deletes | Code done: tombstone deletes, updates, and compaction for flat, IVF, HNSW in all four languages and for the three databases, with per-change ground truth; the changes sweep waits for the machine lock |
 | 6 | Embedding cache | In progress: all-MiniLM-L6-v2 on CPU in the container, LRU and Redis backends, Zipf workload |
-| 7 | Backup and restore | Not started |
+| 7 | Backup and restore | In progress: the `.vro` index file (flat, IVF, HNSW) is written and read by all four languages, and a file written by one language loads in the other three with identical results; the database snapshot tests are next |
 | 8 | Write-up | Not started |
 
 The full plan is in [`docs/plan.html`](docs/plan.html).
