@@ -8,6 +8,12 @@ Decisions that need the human, the default the session took, and its effect. New
 - **Default taken:** unchanged. Lowering the container to 4 CPUs would also change the benchmark builds, which use `VRO_THREADS=6`; a separate test-only limit needs a second compose service.
 - **Effect:** a test run can take 6 cores for minutes while a GPU job runs. If that hurts the other projects, add a `bench-4` service with `cpus: 4` for tests.
 
+## 2026-09-26: Phase 6 design taken without human review
+
+- **Question:** how to measure an embedding cache.
+- **Default taken (CONTRACT section 14):** all-MiniLM-L6-v2 on CPU inside the container (downloaded once by the setup service into a volume), a Zipf-distributed request stream over a pool of 5,000 texts, a hashed key that includes the model version so a version change invalidates by miss, an in-process LRU and a Redis 7 container (512 MB, allkeys-lru), FAISS HNSW for the search stage, a runner sweep over backend and capacity. Two Opus 5.5 agents. Running the embedding model on CPU in a container is treated as CPU-BULK, not GPU, because it uses neither Ollama nor MPS; if the coordinator disagrees, the Phase 6 runs move to the GPU class.
+- **Effect:** the cache numbers show CPU embedding cost (about 5-20 ms per text on this machine) against a cache hit (microseconds for LRU, about 0.2 ms for Redis on localhost), and the hit rate the workload's repetition allows.
+
 ## 2026-09-26: Phase 5 design taken without human review
 
 - **Question:** how deletes, updates, and compaction are defined and measured.

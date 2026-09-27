@@ -481,3 +481,39 @@ The search runs carry `search_params.deleted = <name>`, `search_params.updated =
 `<index>-delete.png`: recall (y) against deleted fraction (x: 0, 0.1, 0.3, 0.5) at the default search setting, one line per system, solid before and dashed after compaction; and p50 likewise. A table of `compact_s`, `index_bytes` / `disk_bytes` before and after.
 
 Tests, on 20,000 rows with truth computed in the test: after `del30` no deleted ID is returned, and recall@10 against the remaining-rows truth is within 0.03 of the undeleted recall for flat (= 1.0), ivf, hnsw; after `upd10`, for 100 sampled updated rows a query equal to the row's new vector returns that row as the top-1; after `--compact`, recall is within 0.01 of a fresh build on the remaining rows and `index_bytes_after < index_bytes` for flat and ivf. The databases: the same checks, and `disk_bytes` reported before and after compaction.
+
+## 14. Embedding cache (Phase 6)
+
+The query path of a text search is: text → embedding model → vector → index search. Phase 6 measures how much an embedding cache saves when queries repeat, and what it costs. It lives in `tools/cache/` and uses FAISS HNSW (the reference) for the search stage, so the hand-built indexes are not involved.
+
+### 14.1 Model and workload
+
+- **Model:** `sentence-transformers/all-MiniLM-L6-v2`, the model that made the corpus vectors, run on CPU inside the container (no GPU; the `setup` service downloads it once into the `hf-cache` volume). `tools/cache/embed.py` wraps it: `embed(texts) -> float32 (n, 384)`, L2-normalized, batch size 32. A check: embedding the `text` of 100 corpus rows from `metadata.parquet` must give cosine ≥ 0.99 against their stored vectors (the dataset's embeddings came from the same model).
+- **Workload:** `tools/cache/workload.py` builds a request stream from `query_meta.parquet` and `metadata.parquet`: a pool of P distinct texts (default 5,000: the 1,000 query paragraphs plus 4,000 corpus paragraphs chosen with a fixed seed), and R requests (default 50,000) drawn from the pool with a Zipf distribution (exponent s, default 1.1) over a fixed random ranking of the pool, so a few texts repeat often and most rarely; also a `uniform` mode. It writes `workload_<name>.parquet` with columns `request_id, pool_id, text`.
+
+### 14.2 Cache
+
+`tools/cache/cache.py` defines one interface with two backends:
+
+```python
+class EmbeddingCache(Protocol):
+    def get(self, key: str) -> np.ndarray | None: ...
+    def put(self, key: str, vector: np.ndarray) -> None: ...
+    def stats(self) -> dict: ...            # hits, misses, evictions, entries, bytes
+```
+
+- **Key:** `sha256(normalize(text) + "|" + model_name + "|" + model_version)`, where `normalize` lowercases, collapses whitespace, and strips. The model version is a string parameter; changing it makes every old entry miss (invalidation by key, no flush needed).
+- **`lru`:** in-process, `OrderedDict`, capacity in entries, LRU eviction.
+- **`redis`:** a Redis 7 container (compose service `redis`, profile `cache`, `maxmemory` 512 MB, `allkeys-lru`), values as raw float32 bytes (1,536 B), optional TTL. Shared by all clients of the process.
+
+### 14.3 Bench and output
+
+`tools/cache/bench.py --workload zipf|uniform --backend none|lru|redis --capacity N --model-version v1 [--invalidate-at REQUEST]`: builds the FAISS HNSW index on the data set once, then replays the workload one request at a time: look up the cache; on a miss, embed and put; then search (k = 10, ef = 64). It records per request: hit or miss, embed time, search time, end-to-end time. Output: the CONTRACT section 3 JSON with `language = "cache"`, `index = "hnsw"`, one search run per backend/capacity with `search_params = {backend, capacity, workload, model_version}`, `latency_ms` = end-to-end per request, and `extra`: `hit_rate`, `embed_p50_ms`, `search_p50_ms`, `e2e_p50_ms`, `e2e_p99_ms`, `entries`, `cache_bytes`, `evictions`, and, with `--invalidate-at`, `hit_rate_after_invalidate`. `ids` and `scores` hold the results of the first 1,000 requests (recall is computed against `ground_truth.npy` for the requests whose text is one of the 1,000 queries, and reported as `extra.recall_on_queries`, which checks that the embedding path reproduces the stored query vectors).
+
+The runner sweeps `backend` over none, lru, redis and `capacity` over 500, 2,000, 5,000 on the zipf workload, plus one uniform run per backend, plus one lru run with `--invalidate-at 25000` (model version v1 → v2 mid-stream).
+
+### 14.4 Report and tests
+
+`hnsw-cache.png`: hit rate (y) and end-to-end p50 (y2) against capacity (x) for lru and redis on the zipf workload, with the `none` backend as a horizontal line. A table with hit rate, embed p50, search p50, e2e p50/p99, cache bytes.
+
+Tests: the model check of 14.1; the key normalization (case and whitespace collapse hit, a different model version misses); lru evicts the least recently used entry at capacity; redis round-trips a vector bit-exactly; a 2,000-request zipf replay with lru capacity 500 has a hit rate above the uniform workload's; after `--invalidate-at`, the next 100 requests are all misses.

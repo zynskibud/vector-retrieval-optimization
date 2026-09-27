@@ -28,6 +28,7 @@ x-bench: &bench
     - cargo-registry:/usr/local/cargo/registry
     - go-cache:/root/.cache/go-build
     - go-mod:/root/go
+    - hf-cache:/root/.cache/huggingface   # Phase 6: the embedding model, downloaded once by setup
   environment:
     TMPDIR: /scratch    # disk-backed (ext4 on the VM disk): DiskANN test files need real O_DIRECT reads, not tmpfs
     VRO_THREADS: "6"    # build threads for the benches; must match `cpus` below
@@ -120,6 +121,14 @@ services:
     cpus: 4
     mem_limit: 4g
 
+  # Phase 6: Redis as the shared embedding cache.
+  redis:
+    image: redis:7-alpine
+    profiles: [cache, db]
+    networks: [dbnet]
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru --save ""
+    mem_limit: 768m
+
 networks:
   dbnet:
     internal: true      # containers on it reach each other and nothing outside
@@ -139,3 +148,4 @@ volumes:
   cargo-registry:
   go-cache:
   go-mod:
+  hf-cache:
