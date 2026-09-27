@@ -6,15 +6,23 @@
 namespace vro {
 
 float dot(const float* a, const float* b, std::size_t n) {
+    // 16 lanes, then a left-to-right sum of the lanes, then the tail: the same
+    // order of float additions as the Rust reference (indexes/rust/src/distance.rs),
+    // so both languages get bit-identical scores and walk the graph the same way.
+    constexpr std::size_t W = 16;
+    const std::size_t body = n - n % W;
+    float acc[W] = {};
+    for (std::size_t i = 0; i < body; i += W)
+        for (std::size_t l = 0; l < W; ++l) acc[l] += a[i + l] * b[i + l];
+    float tail = 0.0f;
+    for (std::size_t i = body; i < n; ++i) tail += a[i] * b[i];
     float sum = 0.0f;
-#pragma clang loop vectorize(enable) interleave(enable)
-    for (std::size_t i = 0; i < n; ++i) sum += a[i] * b[i];
-    return sum;
+    for (std::size_t l = 0; l < W; ++l) sum += acc[l];
+    return sum + tail;
 }
 
 float l2_sq(const float* a, const float* b, std::size_t n) {
     float sum = 0.0f;
-#pragma clang loop vectorize(enable) interleave(enable)
     for (std::size_t i = 0; i < n; ++i) {
         float d = a[i] - b[i];
         sum += d * d;

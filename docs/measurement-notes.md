@@ -44,3 +44,13 @@ The report prints the spread of the repeat runs (`p50_spread`, min-max of each r
 **Effect.** Any test or run that uses `--limit N` sees a prefix of the most-viewed rows: a filter named `top10` keeps 50% of a 20,000-row prefix, not 10%. The full dev set and the full corpus are not affected, because their masks and truth are computed over all rows. Filtered recall numbers from a prefix are still correct against the truth the test computes, but their selectivity labels are not the contract's.
 
 **Options.** Shuffle the corpus once in `tools/data/prepare.py` with the fixed seed (changes every row ID, so every ground-truth file and every stored result must be regenerated), or keep the order and never quote filtered numbers from a prefix. Decision: keep the order for now; the sweeps use full sets. Revisit before the write-up.
+
+## 5. The C++ dot product was scalar inside the container (closed)
+
+**Observed.** On an identical HNSW graph, C++ returned a different result from Rust, Go, and Python on 1 query of 1,000. The graph was proven identical through the .vro file (each language loaded the same file).
+
+**Cause.** The container's C++ compiler is GCC. It ignored the `#pragma clang loop vectorize(enable)` in `distance.cpp`, so `dot()` summed one float at a time, left to right. Rust sums in 16 lanes and adds the lanes afterwards. The two orders round differently in the last bit, and on query 195 that flipped one comparison in the walk. On the macOS host, Apple clang honored the pragma, so the host-run numbers were vectorized.
+
+**Effect.** Every C++ latency measured inside the container before this fix used a scalar inner loop: flat scans, IVF scans, and the HNSW walk were slower than the language allows, and the Phase 4 thread-scaling gap between C++ and Rust (3.8x vs 5.7x) is partly this.
+
+**Fix.** `dot()` now uses 16 explicit accumulators added in Rust's order, which GCC vectorizes and which makes C++ and Rust agree bit for bit. Go (4 lanes) and Python (NumPy) still sum in their own orders and match Rust in results, not bits. All container numbers for C++ come from the fixed loop; anything measured before 2026-09-26 is not comparable.
