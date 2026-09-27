@@ -102,7 +102,7 @@ import time
 
 import numpy as np
 
-from . import changes, filters, splitmix
+from . import changes, filters, splitmix, vro
 
 BUILD_PARAMS: dict = {"m": 16, "ef_construct": 100}
 SEARCH_PARAMS: dict = {"ef": 64, "filter": "none"}
@@ -807,3 +807,123 @@ def repair(index: dict) -> tuple[int, int]:
     added = g.repair(ep, top, index["ef_construct"])
     g.freeze()
     return added
+
+
+def _masked(slots: np.ndarray, counts: np.ndarray) -> np.ndarray:
+    """Copy of slots with every slot at or past the node's count set to -1 (CONTRACT 15.1)."""
+    out = slots.copy()
+    out[np.arange(slots.shape[1])[None, :] >= counts[:, None]] = -1
+    return out
+
+
+def save(index: dict, path, build_params: dict | None = None, seed: int | None = None) -> int:
+    """Write the .vro file (CONTRACT 15.1). The in-memory layout maps to the file as:
+    nbr0 -> layer0_slots, cnt0 -> layer0_counts, up[:L] -> upper_slots, up_cnt[:L] -> upper_counts,
+    up_off + [L] -> upper_offsets (N + 1), levels (int32) -> levels (u8), ept[0] -> entry.
+    Slots past a node's count are written as -1.
+
+    A rebuilt (compacted) index has an ID map from node to row. The file always holds all N original
+    rows in row order (CONTRACT 15.1), so save expands it: node j becomes row id_map[j] (edges are
+    mapped the same way), and a dropped row gets a zero vector, level 0, no edges, and its tombstone
+    bit. id_map ascends, so the upper-layer blocks keep their order."""
+    g = index["graph"]
+    n = len(g.v)
+    if g.n != n or not g.frozen:
+        raise ValueError("hnsw.save: the index has rows that are not inserted yet")
+    if n and int(g.levels.max()) > 255:
+        raise ValueError("hnsw.save: a level does not fit in u8")
+    m = g.m
+    L = int(g.levels.sum())
+    v, levels, dead, ep = g.v, g.levels, index.get("deleted"), int(index["ept"][0])
+    slots0, cnt0 = _masked(g.nbr0, g.cnt0), g.cnt0
+    up_slots, up_cnt = _masked(g.up[:L], g.up_cnt[:L]), g.up_cnt[:L]
+    id_map = index.get("id_map")
+    if id_map is not None:
+        if (np.diff(id_map) <= 0).any():
+            raise ValueError("hnsw.save: the ID map must ascend")
+        n_full = int(index["n_orig"])
+        lut = np.append(id_map, -1).astype(np.int32)  # lut[-1] == -1 keeps empty slots empty
+
+        def remap(slots):
+            return lut[slots]
+
+        v = np.zeros((n_full, g.v.shape[1]), dtype=np.float32)
+        v[id_map] = g.v
+        levels = np.zeros(n_full, dtype=np.int32)
+        levels[id_map] = g.levels
+        full_dead = np.ones(n_full, dtype=bool)
+        full_dead[id_map] = False if dead is None else dead
+        dead = full_dead
+        s0 = np.full((n_full, 2 * m), -1, dtype=np.int32)
+        s0[id_map] = remap(slots0)
+        c0 = np.zeros(n_full, dtype=np.int32)
+        c0[id_map] = cnt0
+        slots0, cnt0 = s0, c0
+        up_slots = remap(up_slots)
+        ep = int(id_map[ep])
+        n = n_full
+    up_off = np.zeros(n + 1, dtype=np.int32)
+    np.cumsum(levels, out=up_off[1:])
+    bp = {"m": m, "ef_construct": index["ef_construct"]} if build_params is None else build_params
+    return vro.write(path, "hnsw", n, v.shape[1], bp, index.get("seed", 0) if seed is None else seed, [
+        ("vectors", "f32", v),
+        ("tombstones", "u8", vro.pack_tombstones(dead, n)),
+        ("levels", "u8", levels),
+        ("entry", "int32", np.array([ep], dtype=np.int32)),
+        ("layer0_slots", "int32", slots0),
+        ("layer0_counts", "int32", cnt0),
+        ("upper_slots", "int32", up_slots),
+        ("upper_counts", "int32", up_cnt),
+        ("upper_offsets", "int32", up_off),
+    ])
+
+
+def load(path, params: dict | None = None, dim: int | None = None) -> dict:
+    """Read a .vro file written by any language. Refuses a wrong index, dim, or build_params.
+    The loaded index is complete: no rebuild and no repair."""
+    r = vro.read(path, "hnsw", dim, params)
+    h = r.header
+    n, d = h["n"], h["dim"]
+    m = int(h["build_params"]["m"])
+    ef_c = int(h["build_params"]["ef_construct"])
+    levels = r.array("levels", "u8", (n,)).astype(np.int32)
+    L = int(levels.sum())
+    up_off = r.array("upper_offsets", "int32", (n + 1,))
+    if n and (up_off[0] != 0 or up_off[n] != L or (np.diff(up_off) != levels).any()):
+        raise vro.FormatError(f"{path}: upper_offsets do not match the levels")
+    g = _Graph.__new__(_Graph)
+    g.v, g.n, g.m, g.levels = r.array("vectors", "f32", (n, d)), n, m, levels
+    g.nbr0 = r.array("layer0_slots", "int32", (n, 2 * m))
+    g.cnt0 = r.array("layer0_counts", "int32", (n,))
+    g.up_off = np.ascontiguousarray(up_off[:n])
+    g.up = np.full((max(L, 1), m), -1, dtype=np.int32)
+    g.up_cnt = np.zeros(max(L, 1), dtype=np.int32)
+    g.up[:L] = r.array("upper_slots", "int32", (L, m))
+    g.up_cnt[:L] = r.array("upper_counts", "int32", (L,))
+    if (g.cnt0 < 0).any() or (g.cnt0 > 2 * m).any() or (g.up_cnt < 0).any() or (g.up_cnt > m).any():
+        raise vro.FormatError(f"{path}: an edge count is out of range")
+    g.adj, g.frozen = None, True
+    g._tls = threading.local()
+    g.locks = [threading.Lock() for _ in range(N_STRIPES)]
+    ep = int(r.array("entry", "int32", (1,))[0]) if n else 0
+    top = int(levels[ep]) if n else 0
+    index = {
+        "graph": g,
+        "entry": ep,
+        "top": top,
+        "ept": (ep, top),
+        "ef_construct": ef_c,
+        "global_lock": threading.Lock(),
+        "m": m,
+        "seed": int(h["seed"]),
+        "n_orig": n,
+        "train_s": 0.0,
+        "add_s": 0.0,
+        "extra": {"top_layer": top, "entry_point": ep,
+                  "nodes_per_layer": [int((levels >= l).sum()) for l in range(top + 1)]},
+        "header": h,
+    }
+    dead = vro.unpack_tombstones(r.array("tombstones", "u8", ((n + 7) // 8,)), n)
+    if dead is not None:
+        index["deleted"] = dead
+    return index

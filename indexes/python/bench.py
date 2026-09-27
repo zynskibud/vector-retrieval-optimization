@@ -24,7 +24,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import changes, kmeans
+from . import changes, kmeans, vro
 from .npy import read_npy
 
 INDEXES = ("flat", "ivf", "pq", "ivf_pq", "hnsw", "diskann")
@@ -211,6 +211,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap.add_argument("--update", default=None)
     ap.add_argument("--compact", action="store_true")
     ap.add_argument("--compact-mode", default="rebuild")
+    ap.add_argument("--save", type=Path, default=None)
+    ap.add_argument("--load", type=Path, default=None)
     return ap.parse_args(argv)
 
 
@@ -346,6 +348,30 @@ def apply_changes(mod, index, args, n: int, extra: dict):
     return index, labels
 
 
+SAVE_INDEXES = ("flat", "ivf", "hnsw")
+
+
+def load_index(mod, args, dim: int):
+    """--load (CONTRACT 15.2): read the .vro file instead of a build. build_params come from the
+    header; a --build value that differs from the header is a usage error (exit 2)."""
+    given = {}
+    for item in args.build:
+        for pair in filter(None, item.split(",")):
+            key, _, value = pair.partition("=")
+            given[key] = parse_value(value)
+    try:
+        header = vro.Reader(args.load).header
+    except OSError as e:
+        raise RuntimeError(f"--load {args.load}: {e}") from None
+    for key, value in given.items():
+        if header["build_params"].get(key) != value:
+            raise UsageError(f"--build {key}={value} conflicts with {header['build_params'].get(key)!r} "
+                             f"in {args.load}")
+    t0 = time.perf_counter()
+    index = mod.load(args.load, given, dim=dim)
+    return index, time.perf_counter() - t0
+
+
 def run(args) -> dict:
     mod, build_params, searches = resolve_params(args)  # validate before the slow load
     load = args.clients != 1 or args.duration > 0 or args.insert_rate > 0
@@ -354,9 +380,20 @@ def run(args) -> dict:
     if load and not hasattr(mod, "insert"):
         raise UsageError(f"--clients/--duration/--insert-rate: only hnsw supports load runs, not {args.index}")
     changed = check_changes(args, load)
-    vectors = read_npy(args.data / "vectors.npy", args.limit)
+    if (args.save or args.load) and args.index not in SAVE_INDEXES:
+        raise UsageError(f"--save/--load: only {list(SAVE_INDEXES)}, not {args.index}")
+    if (args.save or args.load) and load:
+        raise UsageError("--save/--load are not combined with load runs")
     queries = read_npy(args.data / "queries.npy")
-    n, dim = vectors.shape
+    if args.load:
+        index, load_s = load_index(mod, args, queries.shape[1])
+        n, dim = index["header"]["n"], index["header"]["dim"]
+        build_params = dict(index["header"]["build_params"])
+        vectors = None
+        args.seed = int(index["header"]["seed"])  # the file's seed: compaction and reports use it
+    else:
+        vectors = read_npy(args.data / "vectors.npy", args.limit)
+        n, dim = vectors.shape
     if build_params.get("train_size", 0) is None:  # ivf: 6.2 default depends on nlist and N
         build_params["train_size"] = kmeans.default_train_size(n, build_params["nlist"])
 
@@ -369,7 +406,9 @@ def run(args) -> dict:
             if str(p.get("filter", "none")) not in filters.NAMES:
                 raise UsageError(f"unknown filter {p['filter']!r}; known: {list(filters.NAMES)}")
     n_build = n - n // 10 if args.insert_rate > 0 else None  # CONTRACT 12.2: build on the first 90%
-    if n_build is None:
+    if args.load:
+        pass
+    elif n_build is None:
         index = mod.build(vectors, build_params, args.threads, args.seed)
     else:
         index = mod.build(vectors, build_params, args.threads, args.seed, n_build=n_build)
@@ -381,9 +420,18 @@ def run(args) -> dict:
         "index_bytes": int(mod.index_bytes(index)),
     }
     extra = dict(index.get("extra", {}))
+    if args.load:
+        extra["load_s"] = load_s
+        extra["loaded_from"] = str(args.load)
+        extra["loaded_language"] = index["header"].get("language")
     if changed:
         index, labels = apply_changes(mod, index, args, n, extra)
         searches = [{**p, **labels} for p in searches]
+    if args.save:
+        args.save.parent.mkdir(parents=True, exist_ok=True)
+        t0 = time.perf_counter()
+        extra["file_bytes"] = mod.save(index, args.save, build_params, args.seed)
+        extra["save_s"] = time.perf_counter() - t0
     for i in range(min(args.warmup, len(queries))):
         mod.search(index, queries[i], args.k, searches[0])
     if not load:

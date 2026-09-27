@@ -16,7 +16,7 @@ import time
 
 import numpy as np
 
-from . import changes, distance, filters
+from . import changes, distance, filters, vro
 
 BUILD_PARAMS: dict = {}
 SEARCH_PARAMS: dict = {"filter": "none"}
@@ -127,3 +127,37 @@ def index_bytes(index: dict) -> int:
     if index.get("deleted") is not None:
         total += changes.tombstone_bytes(len(index["deleted"]))
     return total
+
+
+def save(index: dict, path, build_params: dict | None = None, seed: int = 0) -> int:
+    """Write the .vro file (CONTRACT 15.1): vectors and tombstones. Returns the file size.
+
+    A compacted index (it has an ID map) is expanded back to all N original rows in row order:
+    a dropped row gets a zero vector and its tombstone bit (CONTRACT 15.1)."""
+    v = index["vectors"]
+    dead = index.get("deleted")
+    id_map = index.get("id_map")
+    if id_map is not None:
+        n = int(index["n_orig"])
+        full = np.zeros((n, v.shape[1]), dtype=np.float32)
+        full[id_map] = v
+        full_dead = np.ones(n, dtype=bool)
+        full_dead[id_map] = False if dead is None else dead
+        v, dead = full, full_dead
+    n, dim = v.shape
+    return vro.write(path, "flat", n, dim, {} if build_params is None else build_params, seed, [
+        ("vectors", "f32", v),
+        ("tombstones", "u8", vro.pack_tombstones(dead, n)),
+    ])
+
+
+def load(path, params: dict | None = None, dim: int | None = None) -> dict:
+    """Read a .vro file written by any language. Refuses a wrong index, dim, or build_params."""
+    r = vro.read(path, "flat", dim, params)
+    n, d = r.header["n"], r.header["dim"]
+    index = {"vectors": r.array("vectors", "f32", (n, d)), "train_s": 0.0, "add_s": 0.0}
+    dead = vro.unpack_tombstones(r.array("tombstones", "u8", ((n + 7) // 8,)), n)
+    if dead is not None:
+        index.update(deleted=dead, owned=True, n_orig=n)
+    index["header"] = r.header
+    return index

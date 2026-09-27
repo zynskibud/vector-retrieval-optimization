@@ -23,7 +23,7 @@ import time
 
 import numpy as np
 
-from . import changes, distance, filters, kmeans
+from . import changes, distance, filters, kmeans, vro
 
 BUILD_PARAMS: dict = {"nlist": 1024, "train_size": None, "iters": 20}
 SEARCH_PARAMS: dict = {"nprobe": 8, "filter": "none"}
@@ -139,4 +139,53 @@ def compact(index: dict, mode: str = "rebuild") -> dict:
         labels = _labels(index)
         keep = ~dead[list_ids]
         _set_lists(index, list_ids[keep], labels[keep])
+    return index
+
+
+def save(index: dict, path, build_params: dict | None = None, seed: int = 0) -> int:
+    """Write the .vro file (CONTRACT 15.1). list_ids and list_offsets are stored as int32.
+
+    After compaction, list_ids holds only the live IDs, so its shape is [live rows], not [N]. A row
+    that is in no list (dropped by compaction) gets its tombstone bit (CONTRACT 15.1)."""
+    v = index["vectors"]
+    n, dim = v.shape
+    dead = np.ones(n, dtype=bool)
+    dead[index["list_ids"]] = False
+    if index.get("deleted") is not None:
+        dead |= index["deleted"]
+    if n >= 2**31:
+        raise ValueError("ivf.save: IDs do not fit in int32")
+    bp = {"nlist": index["nlist"]} if build_params is None else build_params
+    return vro.write(path, "ivf", n, dim, bp, seed, [
+        ("vectors", "f32", v),
+        ("tombstones", "u8", vro.pack_tombstones(dead, n)),
+        ("centers", "f32", index["centers"]),
+        ("list_ids", "int32", index["list_ids"]),
+        ("list_offsets", "int32", index["offsets"]),
+    ])
+
+
+def load(path, params: dict | None = None, dim: int | None = None) -> dict:
+    """Read a .vro file written by any language. Refuses a wrong index, dim, or build_params."""
+    r = vro.read(path, "ivf", dim, params)
+    n, d = r.header["n"], r.header["dim"]
+    nlist = int(r.header["build_params"]["nlist"])
+    offsets = r.array("list_offsets", "int32", (nlist + 1,)).astype(np.int64)
+    list_ids = r.array("list_ids", "int32").astype(np.int64)
+    if list_ids.shape != (int(offsets[-1]),) or offsets[0] != 0 or (np.diff(offsets) < 0).any():
+        raise vro.FormatError(f"{path}: list_offsets and list_ids do not agree")
+    index = {
+        "vectors": r.array("vectors", "f32", (n, d)),
+        "centers": r.array("centers", "f32", (nlist, d)),
+        "list_ids": list_ids,
+        "offsets": offsets,
+        "nlist": nlist,
+        "train_s": 0.0,
+        "add_s": 0.0,
+        "extra": {"id_type": "int64"},
+        "header": r.header,
+    }
+    dead = vro.unpack_tombstones(r.array("tombstones", "u8", ((n + 7) // 8,)), n)
+    if dead is not None:
+        index["deleted"] = dead
     return index
