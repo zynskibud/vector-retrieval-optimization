@@ -543,6 +543,8 @@ Sections per index (all int32 unless stated; `shape` in the header):
 | ivf | `centers` (f32, nlist × dim), `list_ids` (int32, N), `list_offsets` (int32, nlist + 1) |
 | hnsw | `levels` (u8, N), `entry` (int32, [1]: entry point), `layer0_slots` (int32, N × 2m), `layer0_counts` (int32, N), `upper_slots` (int32, L × m, where L = number of node-layer pairs above layer 0), `upper_counts` (int32, L), `upper_offsets` (int32, N + 1: node i's upper blocks are `upper_slots[m·upper_offsets[i] .. m·upper_offsets[i+1]]`, one block per layer 1..level(i)) |
 
+**After a compaction**, the file still describes all N original rows in row order: a dropped row has its tombstone bit set, a zero vector (`flat`, `hnsw`), no edges and level 0 (`hnsw`), and is absent from the ivf lists (`list_ids` then has fewer than N entries; readers accept any length consistent with `list_offsets`, and a writer may also keep dropped rows in the lists since they are tombstoned). A language that keeps a position-to-row map after compaction expands back to N rows on save. So a file never needs an ID-map section, and a compacted index saved in one language loads in every other.
+
 An index loaded from a file is complete: no rebuild, no repair. A search on the loaded index returns the same IDs and scores as on the index that wrote the file. A language that keeps a different in-memory layout converts on save and load. A language must refuse a file whose `index`, `dim`, or `build_params` do not match what it expects, and must read the section table rather than assume offsets.
 
 ### 15.2 Command line and output
