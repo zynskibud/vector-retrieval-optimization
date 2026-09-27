@@ -2,11 +2,11 @@
 
 Decisions that need the human, the default the session took, and its effect. Newest first. Remove an entry when the human decides.
 
-## 2026-09-26: Test suites use up to 6 threads (CPU-BULK allows 4 workers)
+## 2026-09-26: Two container caps: day (3 CPUs, 6 GB) and TIMING (6 CPUs, 12 GB)
 
-- **Question:** PROTOCOL.md caps CPU-BULK jobs at 4 workers. The container has 6 CPUs and the builds and test suites use all of them.
-- **Default taken:** unchanged. Lowering the container to 4 CPUs would also change the benchmark builds, which use `VRO_THREADS=6`; a separate test-only limit needs a second compose service.
-- **Effect:** a test run can take 6 cores for minutes while a GPU job runs. If that hurts the other projects, add a `bench-4` service with `cpus: 4` for tests.
+- **Question:** the coordinator's rule (PROTOCOL.md): by day one container at a time at 3 CPUs and 6 GB; a TIMING job on GO at 6 CPUs and up to 12 GB, with the caps in the compose file.
+- **Default taken:** `docker-compose.yml` reads `VRO_CPUS`, `VRO_MEM`, `VRO_DB_CPUS` with the day caps as defaults; `scripts/run.sh` exports the TIMING values for every job except `test`. `VRO_THREADS` equals the CPU cap, so tests and builds by day use 3 threads and the sweeps 6. The database containers get 3 CPUs by day and 4 in a sweep (the Phase 2 design). The 6 GB day cap is under the 9 GB that Python IVF needs on the full corpus, so full-corpus work is TIMING only.
+- **Effect:** a test suite by day takes about twice as long as at 6 threads. Sweep numbers are unchanged (6 threads, as before). A database test by day runs two containers (the database and dbbench); this is the one exception to one container at a time.
 
 ## 2026-09-26: Phase 7 design taken without human review
 

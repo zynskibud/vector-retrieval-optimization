@@ -31,11 +31,14 @@ x-bench: &bench
     - hf-cache:/root/.cache/huggingface   # Phase 6: the embedding model, downloaded once by setup
   environment:
     TMPDIR: /scratch    # disk-backed (ext4 on the VM disk): DiskANN test files need real O_DIRECT reads, not tmpfs
-    VRO_THREADS: "6"    # build threads for the benches; must match `cpus` below
+    VRO_THREADS: "${VRO_CPUS:-3}"    # build threads for the benches; the same number as `cpus` below
   tmpfs:
     - /tmp:size=1g
-  cpus: 6
-  mem_limit: 6g          # raise to 12g after Docker Desktop's memory is set to 16 GB
+  # Two caps, fixed by the coordinator protocol (../.coord/PROTOCOL.md). The file's defaults are the
+  # day cap: one container at a time, 3 CPUs, 6 GB. A TIMING job started by scripts/run.sh on the
+  # coordinator's GO exports VRO_CPUS=6 VRO_MEM=12g. Nothing else sets these variables.
+  cpus: ${VRO_CPUS:-3}
+  mem_limit: ${VRO_MEM:-6g}
   pids_limit: 512
   security_opt:
     - no-new-privileges:true
@@ -64,7 +67,8 @@ services:
 
   # Phase 2 databases. One at a time. Each under a profile, so `make test` and the
   # sweeps never start them. Data in named volumes, so backup/restore (Phase 7)
-  # can inspect them. Memory caps: 4 GB now, 8 GB for the full-corpus runs.
+  # can inspect them. Caps: 3 CPUs by day, 4 in a TIMING job (VRO_DB_CPUS, set by
+  # scripts/run.sh); 4 GB now, 8 GB for the full-corpus runs.
   qdrant:
     image: qdrant/qdrant:v1.19.1
     profiles: [qdrant, db]
@@ -72,7 +76,7 @@ services:
     volumes:
       - qdrant-data:/qdrant/storage
       - qdrant-snapshots:/qdrant/snapshots
-    cpus: 4
+    cpus: ${VRO_DB_CPUS:-3}
     mem_limit: 4g
 
   pgvector:
@@ -92,7 +96,7 @@ services:
     # A parallel index build keeps maintenance_work_mem (1GB) in dynamic shared
     # memory under /dev/shm; Docker's default 64 MB fails with DiskFull.
     shm_size: 1536m
-    cpus: 4
+    cpus: ${VRO_DB_CPUS:-3}
     mem_limit: 4g
 
   # Milvus standalone with embedded etcd and local file storage (no etcd or
@@ -118,7 +122,7 @@ services:
       timeout: 10s
       retries: 20
       start_period: 60s
-    cpus: 4
+    cpus: ${VRO_DB_CPUS:-3}
     mem_limit: 4g
 
   # Phase 6: Redis as the shared embedding cache.

@@ -16,6 +16,9 @@
 #   changes-sweep Phase 5 (TIMING): flat, ivf, hnsw in python, go, cpp, rust with del10/30/50 (with and
 #                 without compaction) and upd10 (make changes), then each database in turn (up,
 #                 make changes-db, down), then the report
+#   cache-sweep   Phase 6 (TIMING): embedding cache, backends none/lru/redis x capacity 500/2000/5000
+#                 on zipf, one uniform run per backend, one lru invalidation run (make cache-up,
+#                 make cache, make cache-down), then the report
 #   test          make test (light, but it still takes the lock so it never overlaps a sweep)
 #
 # Steps: preflight (stop on FAIL), take the lock with owner
@@ -39,7 +42,7 @@ for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=1 ;;
     --stop)    JOB="--stop" ;;
-    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
     *)         JOB="$arg" ;;
   esac
 done
@@ -79,8 +82,11 @@ case "$JOB" in
     CMD="make changes ARGS='--data data/processed/dev --languages rust,cpp,go,python'
 && for db in qdrant pgvector milvus; do make db-up DB=\$db && make changes-db ARGS=\"--data data/processed/dev --languages \$db\"; make db-down DB=\$db; done
 && make report ARGS='--data data/processed/dev'" ;;
+  cache-sweep)
+    CMD="make cache-up && make cache ARGS='--data data/processed/dev'; make cache-down
+&& make report ARGS='--data data/processed/dev'" ;;
   test) CMD="make test" ;;
-  "")   echo "usage: scripts/run.sh [--dry-run] <dev-sweep|full-sweep|db-sweep|load-sweep|changes-sweep|test> | --stop" >&2; exit 2 ;;
+  "")   echo "usage: scripts/run.sh [--dry-run] <dev-sweep|full-sweep|db-sweep|load-sweep|changes-sweep|cache-sweep|test> | --stop" >&2; exit 2 ;;
   *)    echo "unknown job: $JOB" >&2; exit 2 ;;
 esac
 CMD="$(printf '%s' "$CMD" | tr '\n' ' ')"
@@ -114,13 +120,21 @@ START="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "vector-retrieval $JOB $START" > "$LOCK_DIR/owner"
 
 if [ "$DRY_RUN" -eq 1 ]; then
-  echo "dry run: took and released the lock; would run: $CMD"
+  caps="day caps (3 CPUs, 6 GB)"; [ "$JOB" != "test" ] && caps="TIMING caps (VRO_CPUS=6 VRO_MEM=12g VRO_DB_CPUS=4)"
+  echo "dry run: took and released the lock; would run with $caps: $CMD"
   rm -rf "$LOCK_DIR"
   exit 0
 fi
 
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/$JOB-$(date +%Y%m%d-%H%M%S).log"
+
+# The TIMING caps (PROTOCOL.md): 6 CPUs and 12 GB for the bench container, 4 CPUs for a
+# database. docker-compose.yml defaults to the day caps (3 CPUs, 6 GB, 3 CPUs) when these
+# are unset, and only this script sets them. The test job keeps the day caps.
+if [ "$JOB" != "test" ]; then
+  export VRO_CPUS=6 VRO_MEM=12g VRO_DB_CPUS=4
+fi
 
 # The detached wrapper owns the lock: it releases it on exit, TERM, or INT,
 # and stops the container it started so a killed job does not keep running.
