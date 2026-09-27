@@ -3,7 +3,7 @@
 RUN   := docker compose run --rm bench
 SETUP := docker compose run --rm setup
 
-.PHONY: image setup build test bench report shell clean-raw db-up db-down dbbench db-test bench-db load load-db
+.PHONY: image setup build test bench report shell clean-raw db-up db-down dbbench db-test bench-db load load-db changes changes-db
 
 image:
 	docker compose build
@@ -62,3 +62,11 @@ load:
 	$(RUN) uv run --frozen python -m tools.bench.runner --load $(ARGS)
 load-db:
 	docker compose --profile db run --rm dbbench uv run --frozen python -m tools.bench.runner --load $(ARGS)
+
+## Phase 5 changes sweep (CONTRACT section 13): deletes with and without compaction, and updates.
+## languages inside bench:   make changes ARGS="--data data/processed/dev --languages python,go,cpp,rust"
+## databases inside dbbench: make changes-db ARGS="--data data/processed/dev --languages qdrant"  (after make db-up DB=qdrant)
+changes:
+	$(RUN) uv run --frozen python -m tools.bench.runner --changes $(ARGS)
+changes-db:
+	docker compose --profile db run --rm dbbench uv run --frozen python -m tools.bench.runner --changes $(ARGS)

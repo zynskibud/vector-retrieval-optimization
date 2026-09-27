@@ -13,6 +13,9 @@
 #   db-sweep      Phase 2: each database in turn (up, its supported indexes on the dev set, 3 repeats, down)
 #   load-sweep    Phase 4 (TIMING): hnsw in python, go, cpp, rust under 1..64 clients and one
 #                 insert run (make load), then each database in turn (up, make load-db, down), then the report
+#   changes-sweep Phase 5 (TIMING): flat, ivf, hnsw in python, go, cpp, rust with del10/30/50 (with and
+#                 without compaction) and upd10 (make changes), then each database in turn (up,
+#                 make changes-db, down), then the report
 #   test          make test (light, but it still takes the lock so it never overlaps a sweep)
 #
 # Steps: preflight (stop on FAIL), take the lock with owner
@@ -36,7 +39,7 @@ for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=1 ;;
     --stop)    JOB="--stop" ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
     *)         JOB="$arg" ;;
   esac
 done
@@ -72,8 +75,12 @@ case "$JOB" in
     CMD="make load ARGS='--data data/processed/dev --languages rust,cpp,go,python'
 && for db in qdrant pgvector milvus; do make db-up DB=\$db && make load-db ARGS=\"--data data/processed/dev --languages \$db\"; make db-down DB=\$db; done
 && make report ARGS='--data data/processed/dev'" ;;
+  changes-sweep)
+    CMD="make changes ARGS='--data data/processed/dev --languages rust,cpp,go,python'
+&& for db in qdrant pgvector milvus; do make db-up DB=\$db && make changes-db ARGS=\"--data data/processed/dev --languages \$db\"; make db-down DB=\$db; done
+&& make report ARGS='--data data/processed/dev'" ;;
   test) CMD="make test" ;;
-  "")   echo "usage: scripts/run.sh [--dry-run] <dev-sweep|full-sweep|db-sweep|load-sweep|test> | --stop" >&2; exit 2 ;;
+  "")   echo "usage: scripts/run.sh [--dry-run] <dev-sweep|full-sweep|db-sweep|load-sweep|changes-sweep|test> | --stop" >&2; exit 2 ;;
   *)    echo "unknown job: $JOB" >&2; exit 2 ;;
 esac
 CMD="$(printf '%s' "$CMD" | tr '\n' ' ')"
