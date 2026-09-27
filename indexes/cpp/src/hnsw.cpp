@@ -102,8 +102,9 @@ std::size_t slot_row(const Index& ix, int l, std::int32_t node) {
 }
 std::size_t cap(const Index& ix, int l) { return l == 0 ? ix.m0 : ix.m; }
 
-// Greedy descent with ef = 1 on layer l from cur.
-Cand greedy(Access& a, const float* q, Cand cur, int l, std::int64_t& dc) {
+// Greedy descent with ef = 1 on layer l from cur. Never moves to node skip.
+Cand greedy(Access& a, const float* q, Cand cur, int l, std::int64_t& dc,
+            std::int32_t skip = -1) {
     const Matrix& v = *a.ix->vectors;
     bool moved = true;
     while (moved) {
@@ -111,6 +112,7 @@ Cand greedy(Access& a, const float* q, Cand cur, int l, std::int64_t& dc) {
         std::int32_t n;
         const std::int32_t* nb = a.list(l, cur.id, n);
         for (std::int32_t j = 0; j < n; ++j) {
+            if (nb[j] == skip) continue;
             Cand c{dot(q, v.row(static_cast<std::size_t>(nb[j])), v.dim), nb[j]};
             ++dc;
             if (better(c, cur)) {
@@ -122,11 +124,14 @@ Cand greedy(Access& a, const float* q, Cand cur, int l, std::int64_t& dc) {
     return cur;
 }
 
-// Algorithm 2. Returns up to ef results, best first.
+// Algorithm 2. Returns up to ef results, best first. Node skip (if >= 0) is
+// treated as visited: it is never scored or expanded.
 std::vector<Cand> search_layer(Access& a, const float* q, const std::vector<Cand>& eps,
-                               std::size_t ef, int l, Visited& vis, std::int64_t& dc) {
+                               std::size_t ef, int l, Visited& vis, std::int64_t& dc,
+                               std::int32_t skip = -1) {
     const Matrix& v = *a.ix->vectors;
     vis.reset(v.rows);
+    if (skip >= 0) vis.test_and_set(skip);
     std::priority_queue<Cand, std::vector<Cand>, BestOnTop> cand;
     std::priority_queue<Cand, std::vector<Cand>, WorstOnTop> res;
     for (const Cand& e : eps) {
@@ -167,16 +172,25 @@ std::vector<Cand> search_layer(Access& a, const float* q, const std::vector<Cand
 // heap is not full) enters the candidate heap and is expanded, also if it fails.
 // pass == nullptr: no filter (identical to search_layer from one entry point).
 // expanded = nodes popped from the candidate heap and expanded.
+// Tombstones (CONTRACT 13.3) use the same rule: a tombstoned node is scored and
+// expanded but never enters the result heap. pass is indexed by row ID; after
+// a compact (rebuild), idmap maps node -> row ID.
 std::vector<Cand> search_layer0_filtered(Access& a, const float* q, Cand ep, std::size_t ef,
-                                         const std::uint8_t* pass, Visited& vis,
+                                         const std::uint8_t* pass, const Tombstones* dead,
+                                         const std::int32_t* idmap, Visited& vis,
                                          std::int64_t& dc, std::int64_t& expanded) {
     const Matrix& v = *a.ix->vectors;
     vis.reset(v.rows);
+    auto admit = [&](std::int32_t node) {
+        if (dead && dead->test(static_cast<std::size_t>(node))) return false;
+        if (!pass) return true;
+        return pass[static_cast<std::size_t>(idmap ? idmap[node] : node)] != 0;
+    };
     std::priority_queue<Cand, std::vector<Cand>, BestOnTop> cand;
     std::priority_queue<Cand, std::vector<Cand>, WorstOnTop> res;
     vis.test_and_set(ep.id);
     cand.push(ep);
-    if (!pass || pass[static_cast<std::size_t>(ep.id)]) res.push(ep);
+    if (admit(ep.id)) res.push(ep);
     while (!cand.empty()) {
         Cand c = cand.top();
         if (res.size() >= ef && better(res.top(), c)) break;
@@ -191,7 +205,7 @@ std::vector<Cand> search_layer0_filtered(Access& a, const float* q, Cand ep, std
             ++dc;
             if (res.size() < ef || better(ce, res.top())) {
                 cand.push(ce);
-                if (!pass || pass[static_cast<std::size_t>(e)]) {
+                if (admit(e)) {
                     res.push(ce);
                     if (res.size() > ef) res.pop();
                 }
@@ -413,6 +427,7 @@ void repair(Index& ix) {
         std::vector<std::int32_t> zero = in_degree0(ix);  // step A
         if (pass == 0) ix.zero_in_before_repair = zero.size();
         for (std::int32_t vtx : zero) {
+            if (ix.dead.test(static_cast<std::size_t>(vtx))) continue;  // repair mode: no edges to dead nodes
             std::int32_t c;
             const auto* nb = ix.neighbors(0, vtx, c);
             std::int32_t u = -1;
@@ -430,7 +445,7 @@ void repair(Index& ix) {
         std::vector<char> seen = reachable0(ix);  // step B
         bool found = false;
         for (std::size_t i = 0; i < seen.size(); ++i) {
-            if (seen[i]) continue;
+            if (seen[i] || ix.dead.test(i)) continue;
             found = true;
             std::int32_t vtx = static_cast<std::int32_t>(i);
             std::int32_t u = -1, u_free = -1;
@@ -496,6 +511,8 @@ Index build(Matrix& vectors, const Params& params, const BuildContext& ctx) {
     ix.m0 = 2 * ix.m;
     ix.ef_construct = static_cast<std::size_t>(efc);
     ix.threads = std::max(1, ctx.threads);
+    ix.seed = ctx.seed;
+    ix.n_orig = vectors.rows;
     const std::size_t n_all = vectors.rows;  // storage and levels for every row
     const std::size_t n = ctx.build_rows > 0 ? std::min(ctx.build_rows, n_all) : n_all;
 
@@ -571,14 +588,16 @@ SearchResult search(const Index& ix, const float* query, std::size_t k, const Pa
     ++dc;
     for (int l = ix.level[static_cast<std::size_t>(entry)]; l >= 1; --l) cur = greedy(a, query, cur, l, dc);
     thread_local Visited vis;
-    const FilterMask* f = get_filter(ix.data_dir, params, v.rows);
+    const FilterMask* f = get_filter(ix.data_dir, params, ix.n_orig);
+    const std::int32_t* idmap = ix.ids.empty() ? nullptr : ix.ids.data();
     std::int64_t expanded = 0;
     std::vector<Cand> w = search_layer0_filtered(a, query, cur, ef, f ? f->pass.data() : nullptr,
-                                                 vis, dc, expanded);
+                                                 ix.dead.any() ? &ix.dead : nullptr, idmap, vis,
+                                                 dc, expanded);
     if (f) r.counters["filter_rows"] = static_cast<double>(f->rows);  // omitted for none (11.2)
     r.counters["visited"] = static_cast<double>(expanded);
     for (std::size_t i = 0; i < k && i < w.size(); ++i) {
-        r.ids[i] = w[i].id;
+        r.ids[i] = idmap ? idmap[w[i].id] : w[i].id;
         r.scores[i] = w[i].score;
     }
     r.distance_computations = dc;
@@ -592,8 +611,10 @@ std::size_t index_bytes(const Index& ix) {
         counts += c.size() * sizeof(std::int32_t);
         for (std::size_t i = 0; i < c.size(); ++i) edges += static_cast<std::size_t>(c[i].load());
     }
+    // + the tombstone bit set and, after a compact (rebuild), the node -> ID map.
     return edges * sizeof(std::int32_t) +
-           ix.level.size() * (sizeof(std::uint8_t) + sizeof(std::int32_t)) + counts;
+           ix.level.size() * (sizeof(std::uint8_t) + sizeof(std::int32_t)) + counts +
+           ix.dead.bytes() + ix.ids.size() * sizeof(std::int32_t);
 }
 
 std::map<std::string, double> extra(const Index& ix) {
@@ -634,6 +655,174 @@ void insert(Index& ix, const std::vector<std::int64_t>& ids, const Matrix& rows)
 
 void repair_after_inserts(Index& ix) {
     if (ix.entry.load() >= 0) repair(ix);
+}
+
+// ---------- Changes (CONTRACT 13.3) ----------
+
+namespace {
+
+// Live node with the highest level, lowest ID on a tie; not skip. -1 if none.
+std::int32_t top_live_node(const Index& ix, std::int32_t skip) {
+    std::int32_t best = -1;
+    const std::size_t n = ix.n_live.load();
+    for (std::size_t i = 0; i < n; ++i) {
+        if (static_cast<std::int32_t>(i) == skip || ix.dead.test(i)) continue;
+        if (best < 0 || ix.level[i] > ix.level[static_cast<std::size_t>(best)])
+            best = static_cast<std::int32_t>(i);
+    }
+    return best;
+}
+
+// Rewrites the list of node on layer l without the entry x (if present).
+void remove_from_list(Index& ix, int l, std::int32_t node, std::int32_t x) {
+    std::int32_t c;
+    const auto* nb = ix.neighbors(l, node, c);
+    std::vector<std::int32_t> keep;
+    keep.reserve(static_cast<std::size_t>(c));
+    for (std::int32_t j = 0; j < c; ++j)
+        if (nb[j] != x) keep.push_back(nb[j]);
+    if (keep.size() != static_cast<std::size_t>(c)) write_list(ix, l, node, keep);
+}
+
+// Insert procedure (Algorithm 1) for a node that is already in the graph with
+// no out-edges, at its existing level. The search skips node i.
+void relink(Index& ix, Access& a, std::int32_t i, Visited& vis) {
+    const Matrix& v = *ix.vectors;
+    const float* q = v.row(static_cast<std::size_t>(i));
+    const int li = ix.level[static_cast<std::size_t>(i)];
+    std::int32_t start = ix.entry.load();
+    if (start == i) start = top_live_node(ix, i);
+    if (start < 0) return;  // the only node
+    const int top = ix.level[static_cast<std::size_t>(start)];
+    std::int64_t dc = 0;
+    Cand cur{dot(q, v.row(static_cast<std::size_t>(start)), v.dim), start};
+    for (int l = top; l > li; --l) cur = greedy(a, q, cur, l, dc, i);
+    std::vector<Cand> eps{cur};
+    for (int l = std::min(li, top); l >= 0; --l) {
+        std::vector<Cand> w = search_layer(a, q, eps, ix.ef_construct, l, vis, dc, i);
+        if (w.empty()) w.push_back(cur);
+        std::vector<std::int32_t> nb = select_heuristic(ix, w, ix.m);
+        set_own_list(ix, a, l, i, nb);
+        for (std::int32_t e : nb) add_edge(ix, a, l, e, i);
+        eps = std::move(w);
+    }
+}
+
+// In-place repair (mode repair); see hnsw.hpp.
+void repair_in_place(Index& ix) {
+    const std::size_t n = ix.n_live.load();
+    for (int l = 0; l < static_cast<int>(ix.links.size()); ++l) {
+        for (std::size_t u = 0; u < n; ++u) {
+            if (ix.level[u] < l || ix.dead.test(u)) continue;
+            const auto node = static_cast<std::int32_t>(u);
+            std::int32_t c;
+            const auto* nb = ix.neighbors(l, node, c);
+            bool has_dead = false;
+            for (std::int32_t j = 0; j < c && !has_dead; ++j)
+                has_dead = ix.dead.test(static_cast<std::size_t>(nb[j]));
+            if (!has_dead) continue;
+            std::vector<std::int32_t> cand;
+            for (std::int32_t j = 0; j < c; ++j) {
+                const std::int32_t x = nb[j];
+                if (!ix.dead.test(static_cast<std::size_t>(x))) {
+                    cand.push_back(x);
+                    continue;
+                }
+                std::int32_t cx;
+                const auto* nx = ix.neighbors(l, x, cx);
+                for (std::int32_t t = 0; t < cx; ++t)
+                    if (!ix.dead.test(static_cast<std::size_t>(nx[t]))) cand.push_back(nx[t]);
+            }
+            std::vector<Cand> sc = scored(ix, node, cand);
+            std::vector<std::int32_t> out;
+            if (sc.size() <= cap(ix, l)) {
+                for (const Cand& x : sc) out.push_back(x.id);
+            } else {
+                out = select_heuristic(ix, sc, cap(ix, l));
+            }
+            write_list(ix, l, node, out);
+        }
+    }
+    // Tombstoned nodes lose their out-edges (all lists above no longer hold them).
+    for (std::size_t u = 0; u < n; ++u) {
+        if (!ix.dead.test(u)) continue;
+        for (int l = 0; l <= ix.level[u] && l < static_cast<int>(ix.links.size()); ++l)
+            write_list(ix, l, static_cast<std::int32_t>(u), {});
+    }
+    if (ix.entry.load() >= 0 && ix.dead.test(static_cast<std::size_t>(ix.entry.load()))) {
+        std::int32_t e = top_live_node(ix, -1);
+        ix.entry = e;
+        ix.top = e >= 0 ? static_cast<int>(ix.level[static_cast<std::size_t>(e)]) : -1;
+    }
+    if (ix.entry.load() >= 0) repair(ix);
+}
+
+}  // namespace
+
+void delete_rows(Index& ix, const std::vector<std::uint8_t>& mask) {
+    if (!ix.ids.empty()) throw std::runtime_error("hnsw: delete after compact is not supported");
+    if (mask.size() != ix.vectors->rows) throw std::runtime_error("hnsw: delete mask size != rows");
+    ix.dead.set(mask);
+}
+
+void update_rows(Index& ix, const std::vector<std::int64_t>& ids, const Matrix& rows) {
+    if (!ix.ids.empty()) throw std::runtime_error("hnsw: update after compact is not supported");
+    Matrix& v = *ix.vectors;
+    if (rows.rows != ids.size() || rows.dim != v.dim)
+        throw std::runtime_error("hnsw: update ids and rows differ in shape");
+    Access a{&ix, nullptr, {}};  // one thread: no locks
+    Visited vis;
+    for (std::size_t j = 0; j < ids.size(); ++j) {
+        if (ids[j] < 0 || static_cast<std::size_t>(ids[j]) >= ix.n_live.load())
+            throw std::runtime_error("hnsw: update ID not in the graph");
+        const auto i = static_cast<std::int32_t>(ids[j]);
+        std::copy(rows.row(j), rows.row(j) + v.dim, v.row(static_cast<std::size_t>(i)));
+        for (int l = 0; l <= ix.level[static_cast<std::size_t>(i)]; ++l) {
+            std::int32_t c;
+            const auto* nb = ix.neighbors(l, i, c);
+            std::vector<std::int32_t> old(nb, nb + c);
+            for (std::int32_t u : old) remove_from_list(ix, l, u, i);
+            write_list(ix, l, i, {});
+        }
+        relink(ix, a, i, vis);
+    }
+    repair(ix);
+}
+
+void compact(Index& ix, CompactMode mode) {
+    if (!ix.ids.empty()) return;  // already rebuilt
+    if (mode == CompactMode::kRepair) {
+        if (ix.dead.any()) repair_in_place(ix);
+        return;
+    }
+    // Rebuild from the live rows, in row order.
+    const Matrix& v = *ix.vectors;
+    const std::size_t n = ix.n_live.load();
+    std::vector<std::int32_t> live;
+    std::unique_ptr<Matrix> own;
+    if (ix.dead.any()) {
+        own = std::make_unique<Matrix>();
+        own->dim = v.dim;
+        own->rows = n - std::min(n, ix.dead.count);
+        own->data.reserve(own->rows * v.dim);
+        for (std::size_t i = 0; i < n; ++i) {
+            if (ix.dead.test(i)) continue;
+            own->data.insert(own->data.end(), v.row(i), v.row(i) + v.dim);
+            live.push_back(static_cast<std::int32_t>(i));
+        }
+        own->rows = live.size();
+    }
+    Params p;
+    p.values["m"] = std::to_string(ix.m);
+    p.values["ef_construct"] = std::to_string(ix.ef_construct);
+    BuildContext ctx{ix.threads, ix.seed, "", ix.data_dir};
+    ctx.build_rows = own ? 0 : n;
+    Index fresh = build(own ? *own : *ix.vectors, p, ctx);
+    fresh.n_orig = ix.n_orig;
+    fresh.own = std::move(own);  // the heap Matrix does not move: fresh.vectors stays valid
+    fresh.ids = std::move(live);
+    fresh.times = ix.times;      // build times of the original build
+    ix = std::move(fresh);
 }
 
 }  // namespace vro::hnsw

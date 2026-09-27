@@ -110,6 +110,16 @@ Int64Array read_i64(const std::string& path) {
     return a;
 }
 
+std::vector<std::int64_t> read_i64_1d(const std::string& path) {
+    std::ifstream in;
+    Header h = open_and_parse(in, path);
+    if (h.ndim != 1) fail(path, "expected a 1-D array");
+    if (h.descr != "<i8") fail(path, "descr is '" + h.descr + "', expected '<i8'");
+    std::vector<std::int64_t> out;
+    read_data(in, out, h.rows, path);
+    return out;
+}
+
 std::vector<std::uint8_t> read_bool(const std::string& path) {
     std::ifstream in;
     Header h = open_and_parse(in, path);

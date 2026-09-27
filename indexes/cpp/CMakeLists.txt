@@ -44,7 +44,7 @@ endforeach()
 
 # One test executable per index, so Wave 2 agents edit only their own file.
 # A placeholder returns 77, which ctest reports as "skipped".
-foreach(t ivf pq hnsw ivf_pq diskann filter load)
+foreach(t ivf pq hnsw ivf_pq diskann filter load changes)
   add_executable(test_${t} tests/test_${t}.cpp)
   target_link_libraries(test_${t} PRIVATE vro_core)
   add_test(NAME ${t} COMMAND test_${t} ${VRO_REPO_ROOT} $<TARGET_FILE:bench>)

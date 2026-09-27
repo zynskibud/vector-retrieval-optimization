@@ -62,14 +62,24 @@ struct IndexSpec {
 // CONTRACT 11.2: search key "filter" for flat, ivf, hnsw only.
 const std::vector<std::string> kFilters = {"none", "top50", "top10", "top1", "top01"};
 
+// CONTRACT 13.2: set by bench on runs with --delete / --update; no default, so
+// the JSON of runs without changes is unchanged.
+const std::vector<std::string> kDeletes = {"del10", "del30", "del50"};
+const std::vector<std::string> kUpdates = {"upd10"};
+#define VRO_CHANGE_KEYS                                         \
+    {"deleted", "", PType::kString, kDeletes},                  \
+        {"updated", "", PType::kString, kUpdates}, {"compacted", "", PType::kInt, {}}
+
 const std::map<std::string, IndexSpec>& index_specs() {
     static const std::map<std::string, IndexSpec> specs = {
-        {"flat", {{}, {{"filter", "none", PType::kString, kFilters}}}},
+        {"flat", {{}, {{"filter", "none", PType::kString, kFilters}, VRO_CHANGE_KEYS}}},
         {"ivf",
          {{{"nlist", "1024", PType::kInt, {}},
            {"train_size", "", PType::kInt, {}},
            {"iters", "20", PType::kInt, {}}},
-          {{"nprobe", "8", PType::kInt, {}}, {"filter", "none", PType::kString, kFilters}}}},
+          {{"nprobe", "8", PType::kInt, {}},
+           {"filter", "none", PType::kString, kFilters},
+           VRO_CHANGE_KEYS}}},
         {"pq",
          {{{"m", "48", PType::kInt, {}},
            {"nbits", "8", PType::kInt, {}},
@@ -91,7 +101,8 @@ const std::map<std::string, IndexSpec>& index_specs() {
            {"filter", "none", PType::kString, kFilters},
            // CONTRACT 12.2: set by bench on the pass after inserts; no default,
            // so the JSON of other runs is unchanged.
-           {"phase", "", PType::kString, {"after_inserts"}}}}},
+           {"phase", "", PType::kString, {"after_inserts"}},
+           VRO_CHANGE_KEYS}}},
         {"diskann",
          {{{"r", "64", PType::kInt, {}},
            {"l_build", "100", PType::kInt, {}},
@@ -105,6 +116,8 @@ const std::map<std::string, IndexSpec>& index_specs() {
     };
     return specs;
 }
+
+#undef VRO_CHANGE_KEYS
 
 const ParamSpec* find_spec(const std::vector<ParamSpec>& specs, const std::string& key) {
     for (const auto& s : specs)
@@ -176,6 +189,10 @@ struct Args {
     int clients = 1;           // CONTRACT 12.1
     double duration = 0.0;     // seconds; 0 = one pass (or 20 s in a load run)
     double insert_rate = 0.0;  // rows per second; CONTRACT 12.2
+    std::string del;           // --delete del10|del30|del50 (CONTRACT 13.2)
+    std::string upd;           // --update upd10
+    bool compact = false;      // --compact
+    std::string compact_mode = "rebuild";  // --compact-mode rebuild|repair
     std::vector<std::string> build;
     std::vector<std::string> search;
 };
@@ -200,6 +217,10 @@ Args parse_args(int argc, char** argv) {
     Args a;
     for (int i = 1; i < argc; ++i) {
         std::string flag = argv[i];
+        if (flag == "--compact") {  // the only flag without a value
+            a.compact = true;
+            continue;
+        }
         if (i + 1 >= argc) throw UsageError("missing value for " + flag);
         std::string v = argv[++i];
         if (flag == "--index") a.index = v;
@@ -215,6 +236,9 @@ Args parse_args(int argc, char** argv) {
         else if (flag == "--clients") a.clients = static_cast<int>(parse_int_flag(flag, v, 1));
         else if (flag == "--duration") a.duration = parse_num_flag(flag, v);
         else if (flag == "--insert-rate") a.insert_rate = parse_num_flag(flag, v);
+        else if (flag == "--delete") a.del = v;
+        else if (flag == "--update") a.upd = v;
+        else if (flag == "--compact-mode") a.compact_mode = v;
         else throw UsageError("unknown option: " + flag);
     }
     if (a.index.empty()) throw UsageError("missing --index");
@@ -225,6 +249,20 @@ Args parse_args(int argc, char** argv) {
     if (load && a.index != "hnsw")
         throw UsageError("--clients, --duration, --insert-rate: only hnsw supports load runs, not " +
                          a.index);
+    // CONTRACT 13.2: changes for flat, ivf, hnsw only; not combined with each
+    // other or with a load run.
+    const bool changes = !a.del.empty() || !a.upd.empty();
+    if ((changes || a.compact) && a.index != "flat" && a.index != "ivf" && a.index != "hnsw")
+        throw UsageError("--delete, --update, --compact: only flat, ivf, hnsw, not " + a.index);
+    if (!a.del.empty() && std::find(kDeletes.begin(), kDeletes.end(), a.del) == kDeletes.end())
+        throw UsageError("unknown --delete: " + a.del);
+    if (!a.upd.empty() && std::find(kUpdates.begin(), kUpdates.end(), a.upd) == kUpdates.end())
+        throw UsageError("unknown --update: " + a.upd);
+    if (!a.del.empty() && !a.upd.empty()) throw UsageError("--delete and --update in one run");
+    if (a.compact && !changes) throw UsageError("--compact needs --delete or --update");
+    if (a.compact_mode != "rebuild" && a.compact_mode != "repair")
+        throw UsageError("--compact-mode must be rebuild or repair, got: " + a.compact_mode);
+    if (changes && load) throw UsageError("--delete, --update: not in a load run");
     if (load && a.duration == 0.0) a.duration = 20.0;  // CONTRACT 12.1 default
     if (a.threads == 0) a.threads = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
     return a;
@@ -243,7 +281,32 @@ struct AnyIndex {
         throw UsageError("insert is supported only by hnsw");
     }
     virtual void finish_inserts() { throw UsageError("insert is supported only by hnsw"); }
+    // CONTRACT 13.3. Only flat, ivf, hnsw implement these; the others throw.
+    virtual void delete_rows(const std::vector<std::uint8_t>&) {
+        throw UsageError("delete is supported only by flat, ivf, hnsw");
+    }
+    virtual void update_rows(const std::vector<std::int64_t>&, const Matrix&) {
+        throw UsageError("update is supported only by flat, ivf, hnsw");
+    }
+    virtual void compact(CompactMode) {
+        throw UsageError("compact is supported only by flat, ivf, hnsw");
+    }
 };
+
+template <typename Idx>
+constexpr bool kHasChanges = std::is_same_v<Idx, flat::Index> || std::is_same_v<Idx, ivf::Index> ||
+                             std::is_same_v<Idx, hnsw::Index>;
+
+#define VRO_CHANGES(ns)                                                                       \
+    void do_delete(ns::Index& i, const std::vector<std::uint8_t>& m) { ns::delete_rows(i, m); } \
+    void do_update(ns::Index& i, const std::vector<std::int64_t>& ids, const Matrix& rows) {    \
+        ns::update_rows(i, ids, rows);                                                        \
+    }                                                                                         \
+    void do_compact(ns::Index& i, CompactMode mode) { ns::compact(i, mode); }
+VRO_CHANGES(flat)
+VRO_CHANGES(ivf)
+VRO_CHANGES(hnsw)
+#undef VRO_CHANGES
 
 template <typename Idx, SearchResult (*Search)(const Idx&, const float*, std::size_t, const Params&),
           std::size_t (*Bytes)(const Idx&), std::map<std::string, double> (*Extra)(const Idx&)>
@@ -262,6 +325,18 @@ struct Wrapped : AnyIndex {
     void finish_inserts() override {
         if constexpr (std::is_same_v<Idx, hnsw::Index>) hnsw::repair_after_inserts(idx);
         else AnyIndex::finish_inserts();
+    }
+    void delete_rows(const std::vector<std::uint8_t>& mask) override {
+        if constexpr (kHasChanges<Idx>) do_delete(idx, mask);
+        else AnyIndex::delete_rows(mask);
+    }
+    void update_rows(const std::vector<std::int64_t>& ids, const Matrix& rows) override {
+        if constexpr (kHasChanges<Idx>) do_update(idx, ids, rows);
+        else AnyIndex::update_rows(ids, rows);
+    }
+    void compact(CompactMode mode) override {
+        if constexpr (kHasChanges<Idx>) do_compact(idx, mode);
+        else AnyIndex::compact(mode);
     }
     Idx idx;
 };
@@ -611,6 +686,57 @@ int run(int argc, char** argv) {
                     {"peak_rss_mb", peak_rss_mb()},
                     {"index_bytes", index->bytes()}};
 
+    // CONTRACT 13.2: changes after the build, before the searches. The files are
+    // read before the clock starts; only the index calls are timed.
+    json change_extra = json::object();
+    if (!args.del.empty() || !args.upd.empty()) {
+        if (!args.del.empty()) {
+            std::vector<std::uint8_t> mask = npy::read_bool(args.data + "/delete_" + args.del + ".npy");
+            if (mask.size() < n) throw std::runtime_error("delete_" + args.del + ".npy has fewer rows than the corpus");
+            mask.resize(n);  // --limit: the first n rows
+            std::size_t deleted = 0;
+            for (std::uint8_t b : mask) deleted += b;
+            auto t0 = std::chrono::steady_clock::now();
+            index->delete_rows(mask);
+            change_extra["delete_s"] = seconds_since(t0);
+            change_extra["deleted_rows"] = deleted;
+        } else {
+            std::vector<std::int64_t> all_ids =
+                npy::read_i64_1d(args.data + "/update_" + args.upd + "_ids.npy");
+            Matrix all_rows = npy::read_f32(args.data + "/update_" + args.upd + "_vectors.npy");
+            if (all_rows.rows != all_ids.size() || all_rows.dim != dim)
+                throw std::runtime_error("update_" + args.upd + " ids and vectors differ in shape");
+            std::vector<std::int64_t> ids;  // --limit: only IDs below n
+            Matrix rows;
+            rows.dim = dim;
+            for (std::size_t j = 0; j < all_ids.size(); ++j) {
+                if (all_ids[j] < 0 || static_cast<std::size_t>(all_ids[j]) >= n) continue;
+                ids.push_back(all_ids[j]);
+                rows.data.insert(rows.data.end(), all_rows.row(j), all_rows.row(j) + dim);
+            }
+            rows.rows = ids.size();
+            auto t0 = std::chrono::steady_clock::now();
+            index->update_rows(ids, rows);
+            change_extra["update_s"] = seconds_since(t0);
+            change_extra["updated_rows"] = ids.size();
+        }
+        change_extra["index_bytes_before_compact"] = index->bytes();
+        if (args.compact) {
+            CompactMode mode =
+                args.compact_mode == "repair" ? CompactMode::kRepair : CompactMode::kRebuild;
+            auto t0 = std::chrono::steady_clock::now();
+            index->compact(mode);
+            change_extra["compact_s"] = seconds_since(t0);
+            change_extra["compact_mode"] = args.compact_mode;
+            change_extra["index_bytes_after"] = index->bytes();
+        }
+        for (auto& p : search_sets) {
+            if (!args.del.empty()) p.values["deleted"] = args.del;
+            if (!args.upd.empty()) p.values["updated"] = args.upd;
+            p.values["compacted"] = args.compact ? "1" : "0";
+        }
+    }
+
     warm_up(*index, queries, args.k, args.warmup, search_sets.front());
     json searches = json::array();
     for (const auto& p : search_sets) {
@@ -651,6 +777,7 @@ int run(int argc, char** argv) {
 
     json extra = json::object();
     for (const auto& [key, v] : index->extra()) extra[key] = v;
+    for (const auto& [key, v] : change_extra.items()) extra[key] = v;
     if (load) {
         extra["clients"] = args.clients;
         extra["duration_s"] = args.duration;

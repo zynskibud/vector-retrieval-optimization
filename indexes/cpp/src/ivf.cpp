@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 
@@ -112,6 +113,7 @@ SearchResult search(const Index& index, const float* query, std::size_t k, const
         for (std::int32_t j = lo; j < hi; ++j) {
             const std::int32_t id = index.list_ids[static_cast<std::size_t>(j)];
             if (pass && !pass[static_cast<std::size_t>(id)]) continue;
+            if (index.dead.test(static_cast<std::size_t>(id))) continue;
             ++scanned;
             float s = dot(query, v.row(static_cast<std::size_t>(id)), dim);
             if (s >= top.threshold()) top.push(id, s);
@@ -126,7 +128,7 @@ SearchResult search(const Index& index, const float* query, std::size_t k, const
 
 std::size_t index_bytes(const Index& index) {
     return index.centers.size() * sizeof(float) + index.list_ids.size() * sizeof(std::int32_t) +
-           index.offsets.size() * sizeof(std::int32_t);
+           index.offsets.size() * sizeof(std::int32_t) + index.dead.bytes();
 }
 
 std::map<std::string, double> extra(const Index& index) {
@@ -139,6 +141,72 @@ std::map<std::string, double> extra(const Index& index) {
     return {{"id_bytes", 4.0},  // list IDs are int32 (extra holds numbers only)
             {"largest_list", static_cast<double>(largest)},
             {"empty_lists", static_cast<double>(empty)}};
+}
+
+namespace {
+
+// Rebuilds the CSR lists from labels (one per row; -1 = leave the row out).
+// Counting sort: IDs keep row order inside each list.
+void rebuild_lists(Index& index, const std::vector<std::int32_t>& labels) {
+    std::vector<std::int32_t> offsets(index.nlist + 1, 0);
+    std::size_t total = 0;
+    for (std::int32_t c : labels)
+        if (c >= 0) {
+            ++offsets[static_cast<std::size_t>(c) + 1];
+            ++total;
+        }
+    for (std::size_t c = 0; c < index.nlist; ++c) offsets[c + 1] += offsets[c];
+    std::vector<std::int32_t> ids(total);
+    std::vector<std::int32_t> cursor(offsets.begin(), offsets.end() - 1);
+    for (std::size_t i = 0; i < labels.size(); ++i)
+        if (labels[i] >= 0)
+            ids[static_cast<std::size_t>(cursor[static_cast<std::size_t>(labels[i])]++)] =
+                static_cast<std::int32_t>(i);
+    index.offsets = std::move(offsets);
+    index.list_ids = std::move(ids);
+}
+
+// Current label of every row (-1 = in no list), from the CSR lists.
+std::vector<std::int32_t> current_labels(const Index& index) {
+    std::vector<std::int32_t> labels(index.vectors->rows, -1);
+    for (std::size_t c = 0; c < index.nlist; ++c)
+        for (std::int32_t j = index.offsets[c]; j < index.offsets[c + 1]; ++j)
+            labels[static_cast<std::size_t>(index.list_ids[static_cast<std::size_t>(j)])] =
+                static_cast<std::int32_t>(c);
+    return labels;
+}
+
+}  // namespace
+
+void delete_rows(Index& index, const std::vector<std::uint8_t>& mask) {
+    if (mask.size() != index.vectors->rows) throw std::runtime_error("ivf: delete mask size != rows");
+    index.dead.set(mask);
+}
+
+void update_rows(Index& index, const std::vector<std::int64_t>& ids, const Matrix& rows) {
+    Matrix& v = *index.vectors;
+    if (rows.rows != ids.size() || rows.dim != v.dim)
+        throw std::runtime_error("ivf: update ids and rows differ in shape");
+    std::vector<std::int32_t> labels = current_labels(index);
+    for (std::size_t j = 0; j < ids.size(); ++j) {
+        if (ids[j] < 0 || static_cast<std::size_t>(ids[j]) >= v.rows)
+            throw std::runtime_error("ivf: update ID out of range");
+        const auto id = static_cast<std::size_t>(ids[j]);
+        std::copy(rows.row(j), rows.row(j) + v.dim, v.row(id));
+        if (labels[id] < 0) continue;  // compacted away: stays out
+        labels[id] = static_cast<std::int32_t>(
+            nearest_center(v.row(id), index.centers.data(), index.nlist, index.dim, Metric::kDot));
+    }
+    rebuild_lists(index, labels);
+}
+
+void compact(Index& index, CompactMode /*mode*/) {
+    if (!index.dead.any()) return;  // nothing to drop (an update only)
+    std::vector<std::int32_t> labels = current_labels(index);
+    for (std::size_t i = 0; i < labels.size(); ++i)
+        if (index.dead.test(i)) labels[i] = -1;
+    rebuild_lists(index, labels);
+    index.dead.clear();
 }
 
 }  // namespace vro::ivf

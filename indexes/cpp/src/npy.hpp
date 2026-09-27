@@ -23,6 +23,9 @@ Matrix read_f32(const std::string& path, std::size_t max_rows = 0);
 // Reads a 2-D '<i8' array.
 Int64Array read_i64(const std::string& path);
 
+// Reads a 1-D '<i8' array (for example update_upd10_ids.npy, CONTRACT 13.1).
+std::vector<std::int64_t> read_i64_1d(const std::string& path);
+
 // Reads a 1-D '|b1' (bool) array: one byte per entry, 0 or 1.
 std::vector<std::uint8_t> read_bool(const std::string& path);
 

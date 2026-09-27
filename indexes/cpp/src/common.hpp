@@ -68,6 +68,40 @@ struct FilterMask {
 // The mask is cut to the first n rows (bench --limit). Bad name: ParamError.
 const FilterMask* get_filter(const std::string& data_dir, const Params& params, std::size_t n);
 
+// Tombstones (CONTRACT 13.3): one bit per corpus row; bit i set = row i is
+// deleted. Empty (no bits) until the first delete, so bytes() is 0 on runs
+// without changes. index_bytes counts bytes() (N/8, rounded up to 8 bytes).
+struct Tombstones {
+    std::vector<std::uint64_t> bits;
+    std::size_t count = 0;  // number of set bits
+
+    bool any() const { return count != 0; }
+    bool test(std::size_t i) const {
+        return count != 0 && ((bits[i >> 6] >> (i & 63)) & 1u) != 0;
+    }
+    // Sets the bits of every row with mask[i] != 0. mask has one byte per row.
+    void set(const std::vector<std::uint8_t>& mask) {
+        if (bits.size() * 64 < mask.size()) bits.resize((mask.size() + 63) / 64, 0);
+        for (std::size_t i = 0; i < mask.size(); ++i) {
+            if (!mask[i]) continue;
+            std::uint64_t b = std::uint64_t{1} << (i & 63);
+            if ((bits[i >> 6] & b) == 0) {
+                bits[i >> 6] |= b;
+                ++count;
+            }
+        }
+    }
+    void clear() {
+        bits.clear();
+        bits.shrink_to_fit();
+        count = 0;
+    }
+    std::size_t bytes() const { return bits.size() * sizeof(std::uint64_t); }
+};
+
+// --compact-mode (CONTRACT 13.3).
+enum class CompactMode { kRebuild, kRepair };
+
 struct BuildTimes {
     double train_s = 0.0;
     double add_s = 0.0;

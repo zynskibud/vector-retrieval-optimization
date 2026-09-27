@@ -7,6 +7,30 @@
 // are std::atomic<int32_t>; insert() stores the slots, then the count, with
 // release order; search loads them with acquire order. insert() may run on one
 // thread while other threads search.
+//
+// Changes (CONTRACT 13.3):
+// - delete_rows: tombstone bits. A tombstoned node stays in the graph: search
+//   still scores it, expands it, and follows its edges, but never admits it to
+//   the result list (hnswlib markDelete).
+// - update_rows: per updated node, in batch order: overwrite the vector; for
+//   every layer of the node, remove the node from the lists of its old
+//   out-neighbors (a scan over each of those lists) and drop its out-edges;
+//   re-run the insert procedure with its existing level (the search skips the
+//   node itself, which old in-edges can still reach). If the node is the entry
+//   point, the insert starts from the live node with the highest level (lowest
+//   ID) and the node stays the entry point. The repair pass runs once after
+//   the batch.
+// - compact, mode rebuild: builds a new graph from the live rows with the same
+//   m, ef_construct, threads, and seed; levels are redrawn for the live rows in
+//   row order. The live rows are copied into own; ids maps node -> row ID.
+// - compact, mode repair (in place, no rebuild): for every live node on every
+//   layer whose list holds a tombstoned node, the new candidate list is its
+//   live neighbors plus the live neighbors of each tombstoned neighbor; the
+//   heuristic (Algorithm 4) cuts it to the cap. Tombstoned nodes lose all
+//   their out-edges, so no edge points to them any more. If the entry point is
+//   tombstoned, the live node with the highest level (lowest ID) becomes the
+//   entry point. Then the repair pass (CONTRACT 6.6) runs on the live nodes.
+//   The tombstone bits stay (the rows still exist in the arrays).
 #pragma once
 
 #include <atomic>
@@ -77,6 +101,11 @@ struct Index {
     std::size_t repair_step_b = 0;              // of repair_added: edges to BFS-unreachable nodes
     std::size_t repair_passes = 0;
     int threads = 1;
+    std::uint64_t seed = 42;          // build seed; compact (rebuild) reuses it
+    std::size_t n_orig = 0;           // corpus rows (IDs 0..n_orig-1); filter masks use IDs
+    Tombstones dead;                  // CONTRACT 13.3, indexed by node
+    std::unique_ptr<Matrix> own;      // compacted live rows (vectors points here)
+    std::vector<std::int32_t> ids;    // after compact (rebuild): node -> row ID; empty = identity
     BuildTimes times;
 
     // Neighbors of node on layer l: pointer to the first slot, count in n.
@@ -101,6 +130,12 @@ void repair_after_inserts(Index& index);
 SearchResult search(const Index& index, const float* query, std::size_t k, const Params& params);
 std::size_t index_bytes(const Index& index);
 std::map<std::string, double> extra(const Index& index);
+
+// CONTRACT 13.3. mask: one byte per corpus row, 1 = delete.
+void delete_rows(Index& index, const std::vector<std::uint8_t>& mask);
+// Replaces the vector of row ids[j] with rows.row(j) and relinks the node.
+void update_rows(Index& index, const std::vector<std::int64_t>& ids, const Matrix& rows);
+void compact(Index& index, CompactMode mode);
 
 // Level of each row for n rows (CONTRACT 6.6), exposed for tests.
 // Nodes that a directed BFS on layer 0 from the entry point does not reach.
