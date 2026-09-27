@@ -36,6 +36,10 @@ class Client(Protocol):
     def insert(self, vectors: np.ndarray, meta_rows: pa.Table, ids: list[int]) -> float:
         ...                                      # add rows to the built index (ID = row index); returns seconds
     def finish_inserts(self) -> None: ...        # make every inserted row searchable before the after-inserts pass
+    # Phase 5 (CONTRACT section 13.4), after build_index and before the searches:
+    def delete(self, ids: np.ndarray) -> float: ...                  # delete rows by ID, searchable state on return; seconds
+    def update(self, ids: np.ndarray, vectors: np.ndarray, meta_rows: pa.Table) -> float: ...  # new vectors, same IDs; seconds
+    def compact(self) -> dict: ...                                   # the database's repair; {"compact_s": s, ...detail}
     def stats(self) -> dict: ...                 # server-side numbers: row count, index size or segment info, server version, disk bytes if reported
     def close(self) -> None: ...
 ```
@@ -98,6 +102,29 @@ Inserts during searches (`--insert-rate`), one batch of 100 rows per `insert` ca
 
 If the database inserts slower than R, the inserter continues after the loop until every row is in. `extra.inserted_during_loop` counts the rows added inside the loop.
 
+## Updates, deletes, compaction (Phase 5, CONTRACT section 13)
+
+`python -m tools.db.bench ... --delete del10|del30|del50 | --update upd10 [--compact]`. The change runs after the build and before the warm-up. `base.delete_ids` / `base.update_rows` read `delete_<name>.npy` and `update_<name>_{ids,vectors}.npy` and keep only IDs below `n` (so `--limit` works). JSON:
+
+- `extra`: `delete_s`, `deleted_rows` or `update_s`, `updated_rows`; with `--compact` `compact_s` and `compact_detail` (the steps and their seconds). `extra.disk_bytes` (and `build.index_bytes`) are the stats after the build; `extra.disk_bytes_after`, `index_bytes_after`, `table_bytes_after`, `segments_count_after`, `rows_after` are the stats when the searches start (after the compaction with `--compact`, else right after the change). The full `stats()` dicts are `extra.stats_changed` and `extra.stats_after`.
+- Every search run carries `search_params.deleted` or `updated`, and `compacted` = 0 or 1. The report scores it against `ground_truth_<name>.npy` and counts `deleted_returned`.
+
+Each database's own background compaction is switched off for the change, so a run without `--compact` measures the tombstone state:
+
+| | delete | update | compact | disk_bytes |
+|---|---|---|---|---|
+| Qdrant | `update_collection(deleted_threshold=1.0)` (vacuum off), then `delete(PointIdsList)` in batches of 10,000, `wait=True`. The point is a set bit in the segment's deleted bit set; the HNSW node stays and searches walk through it. | vacuum off, `upsert` (same ID, same payload) in batches of 2,000; the old copy is marked deleted, the new one lands in an appendable segment; the time includes the wait until green and every vector indexed. | `update_collection(deleted_threshold=0.01, vacuum_min_vector_number=100)`, wait for green and all vectors indexed. The vacuum optimizer rebuilds each segment with deleted points from its live points (a new HNSW graph). With the defaults (0.2, 1000) Qdrant does this on its own after del30. | `GET /telemetry?details_level=10`: segment `disk_usage_bytes` if non-zero, else `vectors_size_bytes + payloads_size_bytes` of the segments (`disk_bytes_source` says which). v1.19.1 reports `disk_usage_bytes = 0`, and `vectors_size_bytes` counts live vectors only, so this number drops at the delete, not at the compaction; `deleted_vectors` and `segments_count` show the compaction. |
+| pgvector | `ALTER TABLE items SET (autovacuum_enabled = false)`, then `DELETE ... WHERE id = ANY(...)` in chunks of 10,000, one transaction. | autovacuum off, `COPY` into a temp table, one `UPDATE ... FROM`. Each row gets a new tuple and a new index entry; the old entry stays. | `VACUUM (ANALYZE) items` (`vacuum_s`), then `REINDEX INDEX items_hnsw` / `items_ivf` (`reindex_s`), autovacuum reset. | `pg_total_relation_size('items')`; also `table_bytes` (`pg_relation_size`), `index_bytes`, `dead_tuples`. |
+| Milvus | `collection.autocompaction.enabled = false`, `delete(filter="id in [...]")` in chunks of 10,000, one `flush`; searches then use Strong consistency. | same property, `upsert` in batches of 2,000, `flush`, wait until the new segment is indexed and loaded. | `compact(is_l0=True)` (moves the L0 deletes into the segments), then `compact()` (mix compaction rewrites the segments without deleted rows), each polled with `get_compaction_state`; then wait until indexed and loaded. | Prometheus metrics on port 9091: `milvus_datacoord_stored_binlog_size` (Flushed) + `milvus_datacoord_stored_index_files_size`. The index files of dropped segments count until garbage collection, so `disk_bytes_after` can be larger than `disk_bytes`. Also `segments_count`, `segment_rows`. |
+
+What the tombstone state means for each graph index:
+
+- Qdrant: the deleted node stays in the HNSW graph of its segment. A search expands it and follows its edges, and drops it from the result (the same as hnswlib `markDelete`).
+- pgvector: the HNSW graph keeps the dead tuple's element. A search expands it, and the heap visibility check drops it, so the `ef_search` candidates hold fewer live rows. `VACUUM` marks the elements deleted and repairs their neighbors' edges (slow: 111 s for 6,076 deleted rows of 20,000); the index file shrinks only at `REINDEX`.
+- Milvus: sealed segments are immutable. The delete is a bit set applied at search time; the mix compaction writes new segments and builds a new index for each.
+
+`make changes-db ARGS="--data data/processed/dev --languages <db>"` runs the runner's changes sweep (CONTRACT 13; `chg-<db>-<index>-<change>[-compact].json`).
+
 ## Tests (`tests/test_<db>.py`)
 
 Run with the database up, against `data/processed/dev` with `--limit 20000` and brute-force truth computed in the test:
@@ -107,5 +134,7 @@ Run with the database up, against `data/processed/dev` with `--limit 20000` and 
 3. A `bench` subprocess run produces JSON that passes `tools.bench.schema.validate`.
 4. The test leaves the collection dropped (`reset` at the end).
 5. `test_load` (Phase 4, `tests/load.py`): hnsw ef=64, `--clients 8 --duration 5`: zero errors, qps > 0, first-pass recall >= 0.95. Then `--clients 4 --duration 10 --insert-rate 2000` (build on 18,000): zero errors, `inserted_rows` = 2,000, after-inserts recall within 0.01 of a static 20,000-row build (both computed in the test). Run: `pytest tools/db/tests/test_<db>.py -k test_load`.
+
+6. `test_changes` (Phase 5, `tests/changes.py`), hnsw at ef=64 on 20,000 rows: after `del30` no deleted ID is returned and recall@10 against the remaining-rows truth is at most 0.03 below the recall before the delete; `disk_bytes` is reported before and after `compact()`, and the compacted recall is within 0.01 of a fresh build on the remaining rows (CONTRACT 13.5); after `upd10`, 100 sampled updated rows are the top-1 for their new vectors. Run: `pytest tools/db/tests/test_<db>.py -k changes`.
 
 The test must finish in under 10 minutes. After the tests, stop the database (`make db-down`).

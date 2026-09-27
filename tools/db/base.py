@@ -95,8 +95,33 @@ class Client(Protocol):
     def attach(self, index: str) -> None: ...     # a second connection to a built index: set the search state only
     def insert(self, vectors: np.ndarray, meta_rows: pa.Table, ids: list[int]) -> float: ...  # add rows to a built index; seconds
     def finish_inserts(self) -> None: ...         # make every inserted row searchable (Milvus: flush)
+    # Phase 5 (CONTRACT section 13.4): applied after build_index, before the searches.
+    def delete(self, ids: np.ndarray) -> float: ...  # delete rows by ID; searchable state when it returns; seconds
+    def update(self, ids: np.ndarray, vectors: np.ndarray, meta_rows: pa.Table) -> float: ...  # new vectors, same IDs; seconds
+    def compact(self) -> dict: ...                # the database's repair; returns {"compact_s": s, ...detail}
     def stats(self) -> dict: ...
     def close(self) -> None: ...
+
+
+DELETE_NAMES = ("del10", "del30", "del50")
+UPDATE_NAMES = ("upd10",)
+
+
+def delete_ids(data_dir, name: str, n: int) -> np.ndarray:
+    """Row IDs deleted by change set `name` among the first n rows (CONTRACT section 13.1)."""
+    if name not in DELETE_NAMES:
+        raise ValueError(f"unknown delete set {name!r}; known: {DELETE_NAMES}")
+    return np.flatnonzero(np.load(Path(data_dir) / f"delete_{name}.npy")[:n]).astype(np.int64)
+
+
+def update_rows(data_dir, name: str, n: int) -> tuple[np.ndarray, np.ndarray]:
+    """(IDs, new vectors) of update set `name`, restricted to IDs < n."""
+    if name not in UPDATE_NAMES:
+        raise ValueError(f"unknown update set {name!r}; known: {UPDATE_NAMES}")
+    ids = np.load(Path(data_dir) / f"update_{name}_ids.npy")
+    vecs = np.load(Path(data_dir) / f"update_{name}_vectors.npy")
+    keep = ids < n
+    return ids[keep].astype(np.int64), np.ascontiguousarray(vecs[keep], dtype=np.float32)
 
 
 def get_client(name: str) -> Client:

@@ -112,3 +112,12 @@ def test_load():
         c.connect()
         c.reset()
         c.close()
+
+
+def test_changes(setup):
+    """Phase 5 (CONTRACT section 13.5): del30, compact, upd10 on hnsw. Leaves the collection dropped."""
+    from tools.db.tests import changes
+
+    c, _, _ = setup
+    changes.check(c, "hnsw", search={"ef": 64})
+    c.index = None

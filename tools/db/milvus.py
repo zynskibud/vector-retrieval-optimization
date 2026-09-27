@@ -10,7 +10,9 @@ filter="views >= t", t from filters.json. No scalar index on views (Milvus scans
 
 from __future__ import annotations
 
+import re
 import time
+import urllib.request
 
 import numpy as np
 import pyarrow as pa
@@ -129,6 +131,111 @@ class MilvusDB:
         self.client.flush(COLLECTION)
         self.consistency = "Strong"
 
+    # -- Phase 5 -------------------------------------------------------------
+    def _prepare_change(self) -> None:
+        self.client.alter_collection_properties(COLLECTION, {"collection.autocompaction.enabled": False})
+        self.consistency = "Strong"
+
+    def _wait_indexed(self) -> None:
+        def built() -> bool:
+            d = self.client.describe_index(COLLECTION, "embedding")
+            return d.get("state") == "Finished" and d.get("pending_index_rows", 0) == 0
+
+        base.wait_until(built, TIMEOUT_S, what="index built")
+        base.wait_until(lambda: str(self.client.get_load_state(COLLECTION).get("state")).endswith("Loaded"),
+                        TIMEOUT_S, what="collection loaded")
+
+    def delete(self, ids: np.ndarray) -> float:
+        """delete(filter="id in [...]") in chunks of 10,000 IDs, then one flush. Seconds cover both."""
+        self._prepare_change()
+        ids = [int(i) for i in ids]
+        t0 = time.perf_counter()
+        for s in range(0, len(ids), 10000):
+            chunk = ids[s:s + 10000]
+            self.client.delete(COLLECTION, filter=f"id in [{','.join(map(str, chunk))}]")
+        self.client.flush(COLLECTION)
+        return time.perf_counter() - t0
+
+    def update(self, ids: np.ndarray, vectors: np.ndarray, meta_rows: pa.Table) -> float:
+        """upsert in batches of 2,000 rows, flush, wait until the new segments are indexed."""
+        self._prepare_change()
+        cols = {c: meta_rows.column(c).to_pylist() for c in base.META_COLUMNS}
+        t0 = time.perf_counter()
+        for s in range(0, len(ids), 2000):
+            e = min(s + 2000, len(ids))
+            self.client.upsert(COLLECTION, self._rows(vectors[s:e], cols, ids[s:e], offset=s))
+        self.client.flush(COLLECTION)
+        self._wait_indexed()
+        return time.perf_counter() - t0
+
+    def _compact_job(self, **kw) -> float:
+        t0 = time.perf_counter()
+        job = self.client.compact(COLLECTION, **kw)
+        base.wait_until(lambda: str(self.client.get_compaction_state(job)).endswith("Completed"),
+                        TIMEOUT_S, what="compaction completed")
+        return time.perf_counter() - t0
+
+    def compact(self) -> dict:
+        t0 = time.perf_counter()
+        live = int(self.client.query(COLLECTION, filter="", output_fields=["count(*)"],
+                                     consistency_level="Strong")[0]["count(*)"])
+        stored = lambda: sum(int(g.num_rows) for g in self.client.list_persistent_segments(COLLECTION))
+        # A job can complete as a no-op when the data coordinator has not yet registered the L0
+        # delete segment, so repeat L0 + mix compaction until the segments hold only live rows.
+        l0_s = mix_s = 0.0
+        rounds = 0
+        while rounds < 20:
+            rounds += 1
+            l0_s += self._compact_job(is_l0=True)
+            mix_s += self._compact_job()
+            if stored() == live:
+                break
+            time.sleep(3.0)
+        t1 = time.perf_counter()
+        self._wait_indexed()
+
+        def handed_off() -> bool:
+            # The query node swaps in the compacted segments asynchronously: wait until it serves
+            # exactly the persistent non-empty segments.
+            persistent = {g.segment_id for g in self.client.list_persistent_segments(COLLECTION) if int(g.num_rows) > 0}
+            loaded = {g.segment_id for g in self.client.list_loaded_segments(COLLECTION)}
+            return persistent == loaded
+
+        base.wait_until(handed_off, TIMEOUT_S, every_s=1.0, what="compacted segments loaded")
+        index_s = time.perf_counter() - t1
+        total = time.perf_counter() - t0
+        # The size metrics are refreshed on the data coordinator's tick: wait (untimed, up to 60 s)
+        # until they count the same rows as the collection.
+        rows = lambda: int(self.client.get_collection_stats(COLLECTION).get("row_count", 0))
+        try:
+            base.wait_until(lambda: self._metrics().get("stored_rows") == rows(), 60, every_s=2.0, what="metrics")
+        except TimeoutError:
+            pass
+        return {"compact_s": total, "l0_compaction_s": l0_s, "mix_compaction_s": mix_s, "index_and_load_s": index_s,
+                "rounds": rounds, "live_rows": live, "stored_rows_after": stored(),
+                "method": "compact(is_l0=True), then compact(); wait for index built and loaded"}
+
+    def _metrics(self) -> dict:
+        try:
+            cid = str(self.client.describe_collection(COLLECTION)["collection_id"])
+            host = self.uri.split("//", 1)[-1].rsplit(":", 1)[0]
+            with urllib.request.urlopen(f"http://{host}:9091/metrics", timeout=30) as r:
+                text = r.read().decode()
+        except Exception as e:  # noqa: BLE001
+            return {"metrics_error": str(e)}
+        out = {}
+        pat = re.compile(r'^(milvus_datacoord_stored_(?:binlog_size|index_files_size|rows_num))\{([^}]*)\} (\S+)$')
+        for line in text.splitlines():
+            mt = pat.match(line)
+            if not mt or f'collection_id="{cid}"' not in mt.group(2):
+                continue
+            if "segment_state=" in mt.group(2) and 'segment_state="Flushed"' not in mt.group(2):
+                continue
+            key = {"milvus_datacoord_stored_binlog_size": "binlog_bytes", "milvus_datacoord_stored_index_files_size":
+                   "index_files_bytes", "milvus_datacoord_stored_rows_num": "stored_rows"}[mt.group(1)]
+            out[key] = out.get(key, 0) + int(float(mt.group(3)))
+        return out
+
     def search(self, query: np.ndarray, k: int, params: dict) -> tuple[list[int], list[float]]:
         sp: dict = {}
         limit = k
@@ -165,8 +272,15 @@ class MilvusDB:
         if self.index is not None:
             d = self.client.describe_index(COLLECTION, "embedding")
             info = {k: (v if isinstance(v, (int, float, str, bool)) or v is None else str(v)) for k, v in d.items()}
+        segs = self.client.list_persistent_segments(COLLECTION)
+        met = self._metrics()
+        extra = {"segments_count": len(segs), "segment_rows": sorted(int(g.num_rows) for g in segs), **met}
+        if "binlog_bytes" in met:
+            extra["disk_bytes"] = met["binlog_bytes"] + met.get("index_files_bytes", 0)
+            extra["disk_bytes_source"] = "metrics: stored_binlog_size (Flushed) + stored_index_files_size"
         return {
             "rows": rows,
+            **extra,
             "index_info": info,
             "server_version": str(self.client.get_server_version()),
             "index_bytes": 0,

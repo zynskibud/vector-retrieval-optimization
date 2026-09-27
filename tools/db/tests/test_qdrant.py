@@ -102,3 +102,10 @@ def test_load(client):
 
     load.check("qdrant")
     client.reset()
+
+
+def test_changes(client):
+    """Phase 5 (CONTRACT section 13.5): del30, compact, upd10 on hnsw. Leaves the collection dropped."""
+    from tools.db.tests import changes
+
+    changes.check(client, "hnsw", search={"ef": 64, "rescore": 0})

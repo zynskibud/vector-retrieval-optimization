@@ -28,6 +28,22 @@ relaxed_order for the transaction; the index scan then continues past ef_search 
 k rows pass the filter (up to hnsw.max_scan_tuples, default 20,000). relaxed_order can return
 rows slightly out of order, so the client re-sorts by score. iterative=0 sets it off.
 
+Updates and deletes (Phase 5, CONTRACT section 13.4). delete() and update() first switch
+autovacuum off for the table, so the searches see the tombstone state (Postgres MVCC: a DELETE
+or UPDATE leaves the old row version as a dead tuple in the heap and its entry in every index).
+- delete(ids): DELETE ... WHERE id = ANY(chunk of 10,000 IDs), one transaction.
+- update(ids, ...): COPY the new vectors into a temporary table, then one
+  UPDATE items SET embedding = u.embedding FROM u WHERE items.id = u.id. Each updated row gets
+  a new tuple, and Postgres inserts the new vector into the HNSW / IVFFlat index; the old index
+  entry stays and points to a dead tuple.
+- An index scan still reaches dead entries: HNSW walks through them (they are graph nodes) and
+  the heap visibility check then drops them, so the ef_search candidates hold fewer live rows.
+  They stay in the graph until VACUUM, which marks them deleted in the index and repairs the
+  neighbors of the removed elements; the index file does not shrink until REINDEX.
+- compact(): VACUUM (ANALYZE) items, then REINDEX INDEX <vector index> (a new build from the live
+  rows). vacuum_s and reindex_s are reported separately. The table file keeps its size
+  (VACUUM makes the space reusable, it does not return it; that needs VACUUM FULL).
+
 Search: one prepared statement, binary protocol. The query vector goes as a binary
 pgvector value (int16 dim, int16 unused, dim big-endian float4).
 """
@@ -192,6 +208,45 @@ class PgvectorClient:
     def finish_inserts(self) -> None:
         pass  # each COPY commits; committed rows are visible to every later query
 
+    # -- Phase 5 ----------------------------------------------------------
+    def _autovacuum_off(self) -> None:
+        self.conn.execute("ALTER TABLE items SET (autovacuum_enabled = false)")
+
+    def delete(self, ids: np.ndarray) -> float:
+        self._autovacuum_off()
+        ids = [int(i) for i in ids]
+        t0 = time.perf_counter()
+        with self.conn.transaction():
+            for s in range(0, len(ids), 10000):
+                self.conn.execute("DELETE FROM items WHERE id = ANY(%s)", (ids[s:s + 10000],))
+        return time.perf_counter() - t0
+
+    def update(self, ids: np.ndarray, vectors: np.ndarray, meta_rows: pa.Table) -> float:
+        """New vectors under the same IDs; the metadata does not change, so meta_rows is not used."""
+        self._autovacuum_off()
+        t0 = time.perf_counter()
+        with self.conn.transaction(), self.conn.cursor() as cur:
+            cur.execute(f"CREATE TEMP TABLE upd (id bigint, embedding vector({vectors.shape[1]})) ON COMMIT DROP")
+            with cur.copy("COPY upd (id, embedding) FROM STDIN (FORMAT BINARY)") as cp:
+                cp.set_types(["int8", self.vector_oid])
+                for j, i in enumerate(ids):
+                    cp.write_row((int(i), Vec(vectors[j])))
+            cur.execute("UPDATE items SET embedding = upd.embedding FROM upd WHERE items.id = upd.id")
+        return time.perf_counter() - t0
+
+    def compact(self) -> dict:
+        t0 = time.perf_counter()
+        self.conn.execute("SET maintenance_work_mem = '1GB'")
+        self.conn.execute("VACUUM (ANALYZE) items")
+        vacuum_s = time.perf_counter() - t0
+        t1 = time.perf_counter()
+        if self.index_name:
+            self.conn.execute(f"REINDEX INDEX {self.index_name}")
+        reindex_s = time.perf_counter() - t1
+        self.conn.execute("ALTER TABLE items RESET (autovacuum_enabled)")
+        return {"compact_s": time.perf_counter() - t0, "vacuum_s": vacuum_s, "reindex_s": reindex_s,
+                "method": f"VACUUM (ANALYZE) items; REINDEX INDEX {self.index_name or '(none)'}"}
+
     # -- search -----------------------------------------------------------
     def search(self, query: np.ndarray, k: int, params: dict) -> tuple[list[int], list[float]]:
         with self.conn.transaction():
@@ -236,6 +291,9 @@ class PgvectorClient:
             "client_lib": f"psycopg {psycopg.__version__}",
             "index_name": self.index_name or "none (sequential scan)",
         }
+        st = c.execute("SELECT n_live_tup, n_dead_tup FROM pg_stat_user_tables WHERE relname = 'items'").fetchone()
+        if st:
+            out["live_tuples"], out["dead_tuples"] = int(st[0]), int(st[1])
         if not self.index_name:
             out["index_bytes_source"] = "unavailable"
         return out

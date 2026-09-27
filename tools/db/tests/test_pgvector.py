@@ -120,3 +120,11 @@ def test_load():
         c.connect()
         c.reset()
         c.close()
+
+
+def test_changes(setup):
+    """Phase 5 (CONTRACT section 13.5): del30, compact, upd10 on hnsw. Leaves the table dropped."""
+    from tools.db.tests import changes
+
+    client, _, _ = setup
+    changes.check(client, "hnsw", build={"views_index": 0}, search={"ef": 64})

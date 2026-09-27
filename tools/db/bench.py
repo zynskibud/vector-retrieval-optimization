@@ -4,6 +4,14 @@ Run inside the dbbench container (make dbbench ARGS="..."):
   python -m tools.db.bench --db qdrant --index hnsw --data data/processed/dev --out results/raw/dev/qdrant-hnsw.json --search ef=64
 
 CONTRACT sections 2 to 4 apply; tools/db/README.md says how a database maps to them.
+
+Phase 5 (CONTRACT section 13): --delete del10|del30|del50 or --update upd10, then optionally
+--compact, run after the build and before the warm-up. Each step is timed into extra
+(delete_s, deleted_rows, update_s, updated_rows, compact_s). extra.disk_bytes / index_bytes are
+the stats after the build; extra.disk_bytes_after / index_bytes_after are the stats when the
+searches start (after the compaction with --compact, else right after the change). The full
+stats() dicts are in extra.stats_changed (after the change) and extra.stats_after (after compact).
+Every search run carries search_params.deleted / updated and compacted = 0|1.
 """
 
 import argparse
@@ -98,7 +106,51 @@ def parse_args(argv):
     ap.add_argument("--warmup", type=int, default=100)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--batch", type=int, default=2000)
+    ap.add_argument("--delete", default=None, help="Phase 5: del10 | del30 | del50")
+    ap.add_argument("--update", default=None, help="Phase 5: upd10")
+    ap.add_argument("--compact", action="store_true", help="Phase 5: run the database's repair after the change")
     return ap.parse_args(argv)
+
+
+def check_changes(args) -> None:
+    if args.delete and args.update:
+        raise UsageError("--delete and --update are not combined in one run (CONTRACT section 13.2)")
+    if args.delete and args.delete not in base.DELETE_NAMES:
+        raise UsageError(f"unknown delete set {args.delete!r}; known: {base.DELETE_NAMES}")
+    if args.update and args.update not in base.UPDATE_NAMES:
+        raise UsageError(f"unknown update set {args.update!r}; known: {base.UPDATE_NAMES}")
+    if args.compact and not (args.delete or args.update):
+        raise UsageError("--compact needs --delete or --update")
+
+
+def apply_changes(client, args, n: int, meta) -> tuple[dict, dict]:
+    """Run --delete / --update / --compact. Returns (extra keys, search_params keys)."""
+    extra: dict = {}
+    if args.delete:
+        ids = base.delete_ids(args.data, args.delete, n)
+        extra["delete_s"] = client.delete(ids)
+        extra["deleted_rows"] = int(len(ids))
+    if args.update:
+        ids, vecs = base.update_rows(args.data, args.update, n)
+        extra["update_s"] = client.update(ids, vecs, meta.take(ids))
+        extra["updated_rows"] = int(len(ids))
+    after = client.stats()
+    extra["stats_changed"] = after
+    if args.compact:
+        detail = client.compact()
+        extra["compact_s"] = float(detail.pop("compact_s"))
+        extra["compact_detail"] = detail
+        after = client.stats()
+        extra["stats_after"] = after
+    for key in ("disk_bytes", "index_bytes", "table_bytes", "segments_count", "rows"):
+        if key in after:
+            extra[f"{key}_after"] = after[key]
+    marks = {"compacted": int(bool(args.compact))}
+    if args.delete:
+        marks["deleted"] = args.delete
+    if args.update:
+        marks["updated"] = args.update
+    return extra, marks
 
 
 def run(args) -> dict:
@@ -111,6 +163,7 @@ def run(args) -> dict:
     build_params = parse_pairs(args.build, base.build_defaults(args.db, args.index), "build")
     searches = [parse_pairs([s], base.search_defaults(args.db, args.index), "search") for s in args.search]
     searches = searches or [base.search_defaults(args.db, args.index)]
+    check_changes(args)
     for sp in searches:
         if str(sp.get("filter", "none")) not in base.FILTER_NAMES:
             raise UsageError(f"unknown filter {sp['filter']!r}; known: {base.FILTER_NAMES}")
@@ -135,10 +188,12 @@ def run(args) -> dict:
         load_s = client.load(vectors, meta, args.batch)
         build_s = client.build_index(args.index, build_params)
         stats = client.stats()
+        changes, marks = ({}, {}) if not (args.delete or args.update) else apply_changes(client, args, n, meta)
         for i in range(min(args.warmup, len(queries))):
             client.search(queries[i], args.k, searches[0])
         results = [run_search(client, queries, args.k, p) for p in searches]
         for r in results:
+            r["search_params"] = {**r["search_params"], **marks}
             if "filter" in r["search_params"]:
                 r["extra"]["filter_rows"] = filter_rows.get(str(r["search_params"]["filter"]), n)
     finally:
@@ -151,7 +206,7 @@ def run(args) -> dict:
         "build": {"train_s": 0.0, "add_s": load_s + build_s, "total_s": load_s + build_s,
                   "peak_rss_mb": peak_rss_mb(), "index_bytes": int(stats.pop("index_bytes", 0))},
         "searches": results, "machine": machine(),
-        "extra": {"load_s": load_s, "server_build_s": build_s, **stats},
+        "extra": {"load_s": load_s, "server_build_s": build_s, **stats, **changes},
     }
 
 
