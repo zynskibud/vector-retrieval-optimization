@@ -26,7 +26,8 @@
 #                 has them, backup, drop, restore, searches before and after; down), then the report
 #   test          make test (light, but it still takes the lock so it never overlaps a sweep)
 #
-# Steps: preflight (stop on FAIL), take the lock with owner
+# Steps: preflight (stop on FAIL; WAIT when a GPU lock is held: the job starts and its
+# wrapper polls the lock every 5 minutes before the first job), take the lock with owner
 # "vector-retrieval <job>[+<job>...] <ISO time>", start the jobs detached under
 # `caffeinate -i`, release the lock when the last job exits or the run is killed
 # (SIGTERM/SIGINT; a SIGKILL leaves a stale lock that preflight reports and
@@ -122,8 +123,11 @@ echo "jobs: $JOB"
 echo "command: $CMD"
 echo
 
-# Preflight. Stop on a hard failure; do not touch the lock.
-if ! "$REPO_ROOT/scripts/preflight.sh"; then
+# Preflight. Stop on a hard failure; do not touch the lock. Exit 3 means a GPU lock is
+# held: start anyway, and the detached wrapper waits for the lock before the first job.
+"$REPO_ROOT/scripts/preflight.sh"
+PRE=$?
+if [ "$PRE" -ne 0 ] && [ "$PRE" -ne 3 ]; then
   echo "run.sh: preflight failed, not starting" >&2
   exit 1
 fi
@@ -168,9 +172,15 @@ fi
 nohup caffeinate -i bash -c '
   trap "docker ps -q --filter ancestor=vro-bench:latest | xargs -r docker stop >/dev/null 2>&1; rm -rf \"$0\"; echo \"[run.sh] lock released $(date -u +%FT%TZ)\"" EXIT
   trap "exit 143" TERM INT
-  cd "$1" && echo "[run.sh] start $(date -u +%FT%TZ) job=$2" && eval "$3"
+  cd "$1" && echo "[run.sh] start $(date -u +%FT%TZ) job=$2"
+  # A TIMING job needs the GPU lock free (PROTOCOL.md): wait, polling every 5 minutes.
+  while [ -d "$4/gpu.lock" ] || [ -d "$4/heavy.lock" ]; do
+    echo "[run.sh] $(date -u +%FT%TZ) waiting: GPU lock held by $(cat "$4"/gpu.lock/owner "$4"/heavy.lock/owner 2>/dev/null | tr "\n" " ")"
+    sleep 300
+  done
+  eval "$3"
   echo "[run.sh] end $(date -u +%FT%TZ) exit=$?"
-' "$LOCK_DIR" "$REPO_ROOT" "$JOB" "$CMD" >"$LOG" 2>&1 &
+' "$LOCK_DIR" "$REPO_ROOT" "$JOB" "$CMD" "$AI_ENGINEERING_ROOT/.coord" >"$LOG" 2>&1 &
 echo $! > "$LOCK_DIR/pid"
 
 echo "started $JOB, pid $(cat "$LOCK_DIR/pid"), lock $LOCK_DIR"

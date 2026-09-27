@@ -2,8 +2,10 @@
 # Preflight checks before a heavy job (a benchmark sweep) on this machine.
 #
 # Prints one line per check. Exits 1 on a hard failure: disk under 15 GB,
-# the coordinator lock held by someone else, Docker down, the image missing,
-# or the dev data missing. Load, power, and lid only warn.
+# the timing lock held by someone else, Docker down, the image missing,
+# or the dev data missing. Exits 3 (WAIT) when the only problem is a GPU
+# lock (gpu.lock or heavy.lock): run.sh then starts and waits for it to
+# clear. Load, power, and lid only warn.
 #
 # This script only looks. It never starts or stops a container or a job.
 
@@ -16,10 +18,12 @@ GPU_LOCKS="$AI_ENGINEERING_ROOT/.coord/gpu.lock $AI_ENGINEERING_ROOT/.coord/heav
 DISK_FAIL_GB=15
 LOAD_WARN=2
 HARD_FAIL=0
+WAIT=0
 
 ok()   { printf 'OK    %s\n' "$1"; }
 warn() { printf 'WARN  %s\n' "$1"; }
 fail() { printf 'FAIL  %s\n' "$1"; HARD_FAIL=1; }
+wait_() { printf 'WAIT  %s\n' "$1"; WAIT=1; }
 
 echo "Preflight for Vector Retrieval Optimization, $(date)"
 echo "Repo: $REPO_ROOT"
@@ -60,7 +64,7 @@ else
 fi
 for g in $GPU_LOCKS; do
   if [ -d "$g" ]; then
-    fail "GPU lock held ($(basename "$g")): $(cat "$g/owner" 2>/dev/null || echo unknown); a TIMING job needs it free"
+    wait_ "GPU lock held ($(basename "$g")): $(cat "$g/owner" 2>/dev/null || echo unknown); a TIMING job waits for it (run.sh polls every 5 min)"
   fi
 done
 
@@ -117,5 +121,9 @@ echo
 if [ "$HARD_FAIL" -ne 0 ]; then
   echo "preflight: FAIL"
   exit 1
+fi
+if [ "$WAIT" -ne 0 ]; then
+  echo "preflight: WAIT (GPU lock held)"
+  exit 3
 fi
 echo "preflight: OK"
