@@ -15,9 +15,10 @@ pub mod npy;
 pub mod params;
 pub mod pq;
 pub mod splitmix;
+pub mod vro;
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub use npy::Matrix;
@@ -83,6 +84,11 @@ pub trait AnnIndex: Send + Sync {
     fn compact_repair(&mut self) -> Result<(), String> {
         Err("this index has no in-place repair; use --compact-mode rebuild".into())
     }
+    /// Writes the index to a `.vro` file (CONTRACT 15.1) with the header's `build_params`
+    /// and `seed`. Returns the file size in bytes. Only flat, ivf, hnsw support it.
+    fn save(&self, _path: &Path, _build_params: &Params, _seed: u64) -> Result<u64, String> {
+        Err("this index does not support save (CONTRACT 15: flat, ivf, hnsw)".into())
+    }
     /// Build-time keys for the top-level `"extra"` object of the output JSON.
     fn extra(&self) -> serde_json::Map<String, serde_json::Value> {
         serde_json::Map::new()
@@ -128,6 +134,20 @@ impl Tombstones {
     /// Memory of the bit set: N/8 bytes, rounded up.
     pub fn bytes(&self) -> u64 {
         self.rows.div_ceil(8) as u64
+    }
+    /// The bit set as ceil(N/8) bytes: bit i (LSB first within a byte) is row i
+    /// (CONTRACT 15.1). The u64 words are little-endian, so this is their byte image.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out: Vec<u8> = self.bits.iter().flat_map(|w| w.to_le_bytes()).collect();
+        out.truncate(self.rows.div_ceil(8));
+        out
+    }
+    /// The inverse of [`Tombstones::to_bytes`] for `rows` rows. Bits past `rows` are ignored.
+    pub fn from_bytes(bytes: &[u8], rows: usize) -> Self {
+        let mask: Vec<bool> = (0..rows)
+            .map(|i| bytes.get(i / 8).is_some_and(|b| (b >> (i % 8)) & 1 == 1))
+            .collect();
+        Self::from_mask(&mask)
     }
     /// One bool per row: true when the row is deleted.
     pub fn to_mask(&self) -> Vec<bool> {
@@ -318,4 +338,64 @@ pub fn build_partial(
     }
     hnsw::build_partial(vectors, params, threads, seed, build_rows)
         .map(|i| Box::new(i) as Box<dyn AnnIndex>)
+}
+
+/// Indexes that can be saved to and loaded from a `.vro` file (CONTRACT 15).
+pub const SAVE_INDEXES: [&str; 3] = ["flat", "ivf", "hnsw"];
+
+/// Checks a `.vro` header against what the caller expects (CONTRACT 15.1): the index
+/// name, the dimension (if given), the set of build parameter keys of that index,
+/// and the value of every key in `expected` (for example the `--build` flags).
+pub fn check_vro_header(
+    h: &vro::Header,
+    index: &str,
+    dim: Option<usize>,
+    expected: &Params,
+) -> Result<(), String> {
+    if h.index != index {
+        return Err(format!("the file holds index '{}', expected '{index}'", h.index));
+    }
+    if let Some(d) = dim {
+        if h.dim != d {
+            return Err(format!("the file has dim {}, expected {d}", h.dim));
+        }
+    }
+    let defaults = build_defaults(index, h.n).ok_or_else(|| format!("unknown index: {index}"))?;
+    let have: Vec<&String> = h.build_params.0.keys().collect();
+    let want: Vec<&String> = defaults.0.keys().collect();
+    if have != want {
+        return Err(format!("the file's build_params keys {have:?} are not the keys of {index} {want:?}"));
+    }
+    for (k, v) in &expected.0 {
+        match h.build_params.0.get(k) {
+            Some(fv) if vro::param_eq(fv, v) => {}
+            Some(fv) => {
+                return Err(format!("build parameter {k}: the file has {fv:?}, requested {v:?}"))
+            }
+            None => return Err(format!("build parameter {k} is not in the file")),
+        }
+    }
+    Ok(())
+}
+
+/// Loads a `.vro` file written by any language (CONTRACT 15). The header must match
+/// `index`, `dim` (if given), and `expected` (see [`check_vro_header`]). `threads` is
+/// the thread count that a later hnsw compaction rebuild uses. No rebuild, no repair.
+pub fn load(
+    index: &str,
+    path: &Path,
+    expected: &Params,
+    dim: Option<usize>,
+    threads: usize,
+) -> Result<(Box<dyn AnnIndex>, vro::Header), String> {
+    let mut r = vro::Reader::open(path)?;
+    check_vro_header(&r.header, index, dim, expected)?;
+    let header = r.header.clone();
+    let idx: Box<dyn AnnIndex> = match index {
+        "flat" => Box::new(flat::load(&mut r)?),
+        "ivf" => Box::new(ivf::load(&mut r)?),
+        "hnsw" => Box::new(hnsw::load(&mut r, threads)?),
+        other => return Err(format!("{other} does not support load (CONTRACT 15: flat, ivf, hnsw)")),
+    };
+    Ok((idx, header))
 }

@@ -53,8 +53,23 @@
 //!   the highest level (lowest row on a tie) becomes the entry point; (4) the repair pass
 //!   of CONTRACT 6.6 runs over the live nodes. The tombstoned nodes keep their slots and
 //!   the bit set stays, so memory shrinks only by the dropped edges.
+//!
+//! Save and load (CONTRACT 15.1). The file stores row IDs: `levels` (u8, N), `entry`,
+//! `layer0_slots` (N x 2m) with `layer0_counts`, and the upper layers as one block list:
+//! node i owns blocks `upper_offsets[i]..upper_offsets[i + 1]`, one per layer
+//! 1..level(i), each m slots in `upper_slots` with a count in `upper_counts`. Empty
+//! slots are -1. Save converts the per-layer node maps to that block list; load builds
+//! the per-layer arrays and maps back from `levels` (blocks in row order, as the build
+//! does). Each list keeps its order, so a search walks the same nodes in the same order.
+//! After a compaction rebuild, nodes are positions: save maps them to row IDs, and each
+//! dropped row becomes a node with level 0, no edges, a zero vector, and its tombstone
+//! bit set. No edge leads to it, so the loaded graph returns the same IDs and scores
+//! (positions keep row order, so ties break the same way). A partial build (rows not
+//! yet inserted) is refused.
 
 use crate::distance::dot;
+use crate::vro;
+use std::path::Path;
 use crate::splitmix::SplitMix64;
 use crate::{
     check_update, AnnIndex, BuildTimes, FilterMasks, Matrix, ParamValue::*, Params, SearchResult,
@@ -1144,6 +1159,184 @@ pub fn index_bytes(index: &HnswIndex) -> u64 {
         + index.row_ids.as_ref().map_or(0, |r| r.len() as u64 * 4)
 }
 
+impl HnswIndex {
+    /// Writes the `.vro` file (CONTRACT 15.1). Returns the file size in bytes.
+    pub fn save(&self, path: &Path, build_params: &Params, seed: u64) -> Result<u64, String> {
+        let g = &self.graph;
+        let nodes = g.vectors.rows;
+        if g.active.load(AtOrd::Acquire) != nodes {
+            return Err("hnsw: save needs every row inserted (not a partial build)".into());
+        }
+        let (n, dim, m) = (self.rows, g.vectors.cols, g.m);
+        let row_ids = self.row_ids.as_deref();
+        let row_of = |pos: u32| row_ids.map_or(pos, |r| r[pos as usize]) as usize;
+        // Node of each row, or None for a row dropped by a compaction rebuild.
+        let mut node_of: Vec<Option<u32>> = vec![None; n];
+        for pos in 0..nodes as u32 {
+            node_of[row_of(pos)] = Some(pos);
+        }
+        let mut vectors = vec![0f32; n * dim];
+        let mut levels = vec![0u8; n];
+        let mut dead = self.tombstones.as_ref().map_or(vec![false; n], Tombstones::to_mask);
+        let mut layer0_slots = vec![-1i32; n * 2 * m];
+        let mut layer0_counts = vec![0i32; n];
+        let (mut upper_slots, mut upper_counts) = (Vec::new(), Vec::new());
+        let mut upper_offsets = vec![0i32; n + 1];
+        let mut buf = Vec::new();
+        for row in 0..n {
+            upper_offsets[row + 1] = upper_offsets[row];
+            let Some(pos) = node_of[row] else {
+                dead[row] = true;
+                continue;
+            };
+            vectors[row * dim..(row + 1) * dim].copy_from_slice(g.vectors.row(pos as usize));
+            let level = g.levels[pos as usize];
+            levels[row] = level;
+            g.layers[0].read(pos, &mut buf);
+            for (j, &nb) in buf.iter().enumerate() {
+                layer0_slots[row * 2 * m + j] = row_of(nb) as i32;
+            }
+            layer0_counts[row] = buf.len() as i32;
+            for layer in 1..=level as usize {
+                g.layers[layer].read(pos, &mut buf);
+                let start = upper_slots.len();
+                upper_slots.resize(start + m, -1);
+                for (j, &nb) in buf.iter().enumerate() {
+                    upper_slots[start + j] = row_of(nb) as i32;
+                }
+                upper_counts.push(buf.len() as i32);
+                upper_offsets[row + 1] += 1;
+            }
+        }
+        let big_l = upper_counts.len();
+        let entry = [row_of(g.entry_top().0) as i32];
+        let tomb = Tombstones::from_mask(&dead).to_bytes();
+        use vro::{Data, Section};
+        let sections = [
+            Section { name: "vectors", shape: vec![n, dim], data: Data::F32(&vectors) },
+            Section { name: "tombstones", shape: vec![n.div_ceil(8)], data: Data::U8(&tomb) },
+            Section { name: "levels", shape: vec![n], data: Data::U8(&levels) },
+            Section { name: "entry", shape: vec![1], data: Data::I32(&entry) },
+            Section { name: "layer0_slots", shape: vec![n, 2 * m], data: Data::I32(&layer0_slots) },
+            Section { name: "layer0_counts", shape: vec![n], data: Data::I32(&layer0_counts) },
+            Section { name: "upper_slots", shape: vec![big_l, m], data: Data::I32(&upper_slots) },
+            Section { name: "upper_counts", shape: vec![big_l], data: Data::I32(&upper_counts) },
+            Section { name: "upper_offsets", shape: vec![n + 1], data: Data::I32(&upper_offsets) },
+        ];
+        vro::write(path, "hnsw", n, dim, build_params, seed, &sections)
+    }
+}
+
+/// Loads an hnsw index from an open `.vro` file (header already checked). No rebuild,
+/// no repair. Checks: `upper_offsets` gives each node `level(i)` blocks and ends at L,
+/// every count is within the cap, every slot inside the count is a row ID, and the
+/// entry point is a row. `threads` is kept for a later compaction rebuild.
+pub fn load(r: &mut vro::Reader, threads: usize) -> Result<HnswIndex, String> {
+    let m = r.header.build_params.get_usize("m")?;
+    let ef_construct = r.header.build_params.get_usize("ef_construct")?;
+    let seed = r.header.seed;
+    if m < 2 {
+        return Err(format!("hnsw: m must be >= 2, got {m}"));
+    }
+    let vectors = r.read_vectors()?;
+    let n = vectors.rows;
+    if n == 0 || n > i32::MAX as usize {
+        return Err(format!("hnsw: N = {n} is out of range"));
+    }
+    let tombstones = r.read_tombstones()?;
+    let levels = r.read_u8("levels", &[n])?;
+    let entry = r.read_i32("entry", &[1])?[0];
+    let l0_slots = r.read_i32("layer0_slots", &[n, 2 * m])?;
+    let l0_counts = r.read_i32("layer0_counts", &[n])?;
+    let upper_offsets = r.read_i32("upper_offsets", &[n + 1])?;
+    let big_l = upper_offsets[n].max(0) as usize;
+    let upper_slots = r.read_i32("upper_slots", &[big_l, m])?;
+    let upper_counts = r.read_i32("upper_counts", &[big_l])?;
+
+    if entry < 0 || entry as usize >= n {
+        return Err(format!("hnsw: entry point {entry} is not a row"));
+    }
+    if levels.iter().any(|&l| l as usize > MAX_LEVEL) {
+        return Err(format!("hnsw: a level is above {MAX_LEVEL}"));
+    }
+    if upper_offsets[0] != 0 {
+        return Err("hnsw: upper_offsets[0] must be 0".into());
+    }
+    for i in 0..n {
+        if upper_offsets[i + 1] - upper_offsets[i] != levels[i] as i32 {
+            return Err(format!("hnsw: upper_offsets gives node {i} a wrong number of blocks"));
+        }
+    }
+    let check_list = |slots: &[i32], count: i32, cap: usize, what: &str| -> Result<(), String> {
+        if count < 0 || count as usize > cap {
+            return Err(format!("hnsw: {what}: count {count} outside 0..={cap}"));
+        }
+        if slots[..count as usize].iter().any(|&v| v < -1 || v as i64 >= n as i64) {
+            return Err(format!("hnsw: {what}: a slot is not a row ID"));
+        }
+        Ok(())
+    };
+    let max_level = *levels.iter().max().expect("n > 0") as usize;
+    let mut layers = Vec::with_capacity(max_level + 1);
+    for layer in 0..=max_level {
+        let cap = if layer == 0 { 2 * m } else { m };
+        let mut map = Vec::new();
+        let (mut slots, mut counts) = (Vec::new(), Vec::new());
+        if layer == 0 {
+            for i in 0..n {
+                let s = &l0_slots[i * cap..(i + 1) * cap];
+                check_list(s, l0_counts[i], cap, "layer0")?;
+                counts.push(AtomicU32::new(l0_counts[i] as u32));
+                let c = l0_counts[i] as usize;
+                slots.extend(s.iter().enumerate().map(|(j, &v)| AtomicI32::new(if j < c { v } else { -1 })));
+            }
+        } else {
+            map = vec![ABSENT; n];
+            let mut c = 0u32;
+            for i in 0..n {
+                if (levels[i] as usize) < layer {
+                    continue;
+                }
+                map[i] = c;
+                c += 1;
+                let b = upper_offsets[i] as usize + layer - 1;
+                let s = &upper_slots[b * m..(b + 1) * m];
+                check_list(s, upper_counts[b], m, &format!("layer {layer}"))?;
+                counts.push(AtomicU32::new(upper_counts[b] as u32));
+                let cnt = upper_counts[b] as usize;
+                slots.extend(s.iter().enumerate().map(|(j, &v)| AtomicI32::new(if j < cnt { v } else { -1 })));
+            }
+        }
+        layers.push(Layer { cap, slots, counts, map });
+    }
+    let top = levels[entry as usize] as usize;
+    let graph = Graph {
+        vectors,
+        entry: Mutex::new((entry as u32, top)),
+        entry_top: AtomicU64::new(pack(entry as u32, top)),
+        active: AtomicUsize::new(n),
+        levels,
+        layers,
+        locks: (0..LOCK_STRIPES.min(n)).map(|_| Mutex::new(())).collect(),
+        m,
+        ef_construct,
+    };
+    Ok(HnswIndex {
+        graph,
+        unreachable_before_repair: 0,
+        repair_added: 0,
+        repair_added_unreachable: 0,
+        build_threads: threads,
+        times: BuildTimes::default(),
+        filters: FilterMasks::default(),
+        insert_lock: Mutex::new(()),
+        seed,
+        rows: n,
+        tombstones,
+        row_ids: None,
+    })
+}
+
 impl AnnIndex for HnswIndex {
     fn set_filter_dir(&mut self, dir: &str) {
         HnswIndex::set_filter_dir(self, dir);
@@ -1174,6 +1367,9 @@ impl AnnIndex for HnswIndex {
     }
     fn compact_repair(&mut self) -> Result<(), String> {
         HnswIndex::compact_repair(self).map(|_| ())
+    }
+    fn save(&self, path: &Path, build_params: &Params, seed: u64) -> Result<u64, String> {
+        HnswIndex::save(self, path, build_params, seed)
     }
     fn supports_concurrency(&self) -> bool {
         true

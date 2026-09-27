@@ -17,6 +17,13 @@
 //! rebuilds the CSR lists without the tombstoned IDs and drops the bit set. The lists
 //! keep the row IDs, so the corpus array is kept as it is (it is not part of
 //! `index_bytes`); the centers are not retrained.
+//!
+//! Save and load (CONTRACT 15.1): sections `vectors`, `tombstones`, `centers`,
+//! `list_ids` (N), `list_offsets` (nlist + 1), the in-memory CSR arrays as they are.
+//! After a compaction the lists no longer hold the dropped rows, so save puts each
+//! dropped row back into the list of its best center and sets its tombstone bit: the
+//! file then has N list IDs, and the loaded index skips those rows (not scored, not
+//! counted), so IDs, scores, and `distance_computations` are the same.
 
 use crate::distance::{dot, TopK};
 use crate::kmeans::{best_center, kmeans, Assign, KmeansOptions};
@@ -25,7 +32,9 @@ use crate::{
     check_update, AnnIndex, BuildTimes, FilterMasks, Matrix, ParamValue::*, Params, SearchResult,
     Tombstones,
 };
+use crate::vro;
 use rayon::prelude::*;
+use std::path::Path;
 use std::time::Instant;
 
 pub fn build_defaults(n: usize) -> Params {
@@ -151,6 +160,73 @@ impl IvfIndex {
         self.offsets = o;
         Ok(())
     }
+}
+
+impl IvfIndex {
+    /// Writes the `.vro` file (CONTRACT 15.1). Returns the file size in bytes.
+    pub fn save(&self, path: &Path, build_params: &Params, seed: u64) -> Result<u64, String> {
+        let (n, dim) = (self.vectors.rows, self.vectors.cols);
+        let mut labels = self.labels();
+        let missing: Vec<usize> = (0..n).filter(|&i| labels[i] == usize::MAX).collect();
+        let (ids, offsets, tomb) = if missing.is_empty() {
+            let tomb = vro::tombstone_bytes(self.tombstones.as_ref(), n);
+            (None, None, tomb)
+        } else {
+            let mut dead = self.tombstones.as_ref().map_or(vec![false; n], Tombstones::to_mask);
+            for &i in &missing {
+                labels[i] = best_center(self.vectors.row(i), &self.centers, dim, Assign::Dot).0;
+                dead[i] = true;
+            }
+            let (l, o) = csr(&labels, self.nlist, |_| false);
+            (Some(l), Some(o), Tombstones::from_mask(&dead).to_bytes())
+        };
+        let ids = ids.as_deref().unwrap_or(&self.ids);
+        let offsets = offsets.as_deref().unwrap_or(&self.offsets);
+        let sections = [
+            vro::Section { name: "vectors", shape: vec![n, dim], data: vro::Data::F32(&self.vectors.data) },
+            vro::Section { name: "tombstones", shape: vec![n.div_ceil(8)], data: vro::Data::U8(&tomb) },
+            vro::Section { name: "centers", shape: vec![self.nlist, dim], data: vro::Data::F32(&self.centers) },
+            vro::Section { name: "list_ids", shape: vec![ids.len()], data: vro::Data::I32(ids) },
+            vro::Section { name: "list_offsets", shape: vec![self.nlist + 1], data: vro::Data::I32(offsets) },
+        ];
+        vro::write(path, "ivf", n, dim, build_params, seed, &sections)
+    }
+}
+
+/// Loads an ivf index from an open `.vro` file (header already checked). Checks that
+/// the CSR arrays are consistent: offsets start at 0, never decrease, end at the
+/// number of list IDs, and every ID is a row.
+pub fn load(r: &mut vro::Reader) -> Result<IvfIndex, String> {
+    let nlist = r.header.build_params.get_usize("nlist")?;
+    let vectors = r.read_vectors()?;
+    let (n, dim) = (vectors.rows, vectors.cols);
+    let tombstones = r.read_tombstones()?;
+    let centers = r.read_f32("centers", &[nlist, dim])?;
+    let offsets = r.read_i32("list_offsets", &[nlist + 1])?;
+    let ids_shape = r.shape("list_ids")?;
+    if ids_shape.len() != 1 || ids_shape[0] > n {
+        return Err(format!("ivf: list_ids has shape {ids_shape:?}, expected at most [{n}]"));
+    }
+    let ids = r.read_i32("list_ids", &ids_shape)?;
+    if offsets[0] != 0
+        || offsets.windows(2).any(|w| w[1] < w[0])
+        || offsets[nlist] as usize != ids.len()
+    {
+        return Err("ivf: list_offsets are not a valid CSR offset array".into());
+    }
+    if ids.iter().any(|&id| id < 0 || id as usize >= n) {
+        return Err("ivf: list_ids holds an ID outside 0..N".into());
+    }
+    Ok(IvfIndex {
+        vectors,
+        centers,
+        nlist,
+        ids,
+        offsets,
+        times: BuildTimes::default(),
+        filters: FilterMasks::default(),
+        tombstones,
+    })
 }
 
 pub fn build(
@@ -293,6 +369,9 @@ impl AnnIndex for IvfIndex {
     }
     fn compact(&mut self) -> Result<(), String> {
         IvfIndex::compact(self)
+    }
+    fn save(&self, path: &Path, build_params: &Params, seed: u64) -> Result<u64, String> {
+        IvfIndex::save(self, path, build_params, seed)
     }
     fn extra(&self) -> serde_json::Map<String, serde_json::Value> {
         let mut m = serde_json::Map::new();

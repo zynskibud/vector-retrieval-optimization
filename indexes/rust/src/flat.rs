@@ -11,8 +11,15 @@
 //! After a change, compaction shrinks the corpus array itself, so the array counts:
 //! `index_bytes` = vector array + bit set (before compaction) or vector array + ID map
 //! (after).
+//!
+//! Save and load (CONTRACT 15.1): sections `vectors` (N x dim) and `tombstones`. After a
+//! compaction the array holds only the live rows, so save writes all N rows back in row
+//! order: live rows from the array, dropped rows as zero vectors with their tombstone bit
+//! set. The loaded index skips those rows, so it returns the same IDs and scores.
 
 use crate::distance::{dot, TopK};
+use crate::vro;
+use std::path::Path;
 use crate::{
     check_update, AnnIndex, BuildTimes, FilterMasks, Matrix, ParamValue::*, Params, SearchResult,
     Tombstones,
@@ -100,6 +107,47 @@ impl FlatIndex {
         self.changed = true;
         Ok(())
     }
+}
+
+impl FlatIndex {
+    /// Writes the `.vro` file (CONTRACT 15.1). Returns the file size in bytes.
+    pub fn save(&self, path: &Path, build_params: &Params, seed: u64) -> Result<u64, String> {
+        let (n, dim) = (self.rows, self.vectors.cols);
+        let expanded;
+        let (vectors, tomb) = match &self.row_ids {
+            None => (&self.vectors.data, vro::tombstone_bytes(self.tombstones.as_ref(), n)),
+            Some(r) => {
+                let mut data = vec![0f32; n * dim];
+                let mut dead = vec![true; n];
+                for (pos, &id) in r.iter().enumerate() {
+                    let id = id as usize;
+                    data[id * dim..(id + 1) * dim].copy_from_slice(self.vectors.row(pos));
+                    dead[id] = false;
+                }
+                expanded = data;
+                (&expanded, Tombstones::from_mask(&dead).to_bytes())
+            }
+        };
+        let sections = [
+            vro::Section { name: "vectors", shape: vec![n, dim], data: vro::Data::F32(vectors) },
+            vro::Section { name: "tombstones", shape: vec![n.div_ceil(8)], data: vro::Data::U8(&tomb) },
+        ];
+        vro::write(path, "flat", n, dim, build_params, seed, &sections)
+    }
+}
+
+/// Loads a flat index from an open `.vro` file (header already checked).
+pub fn load(r: &mut vro::Reader) -> Result<FlatIndex, String> {
+    let vectors = r.read_vectors()?;
+    let tombstones = r.read_tombstones()?;
+    Ok(FlatIndex {
+        rows: vectors.rows,
+        vectors,
+        filters: FilterMasks::default(),
+        changed: tombstones.is_some(),
+        tombstones,
+        row_ids: None,
+    })
 }
 
 pub fn build(
@@ -211,5 +259,8 @@ impl AnnIndex for FlatIndex {
     }
     fn compact(&mut self) -> Result<(), String> {
         FlatIndex::compact(self)
+    }
+    fn save(&self, path: &Path, build_params: &Params, seed: u64) -> Result<u64, String> {
+        FlatIndex::save(self, path, build_params, seed)
     }
 }

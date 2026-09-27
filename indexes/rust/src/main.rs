@@ -38,6 +38,9 @@ struct Args {
     update: Option<String>,
     compact: bool,
     compact_mode: String,
+    /// Backup and restore (CONTRACT 15.2): write the index file, or load it instead of a build.
+    save: Option<String>,
+    load: Option<String>,
 }
 
 impl Args {
@@ -81,6 +84,8 @@ fn parse_args(argv: &[String]) -> Result<Args, BenchError> {
         update: None,
         compact: false,
         compact_mode: "rebuild".into(),
+        save: None,
+        load: None,
     };
     let mut it = argv.iter();
     while let Some(flag) = it.next() {
@@ -107,6 +112,8 @@ fn parse_args(argv: &[String]) -> Result<Args, BenchError> {
             "--update" => args.update = Some(value()?),
             "--compact" => args.compact = true,
             "--compact-mode" => args.compact_mode = value()?,
+            "--save" => args.save = Some(value()?),
+            "--load" => args.load = Some(value()?),
             other => return Err(Usage(format!("unknown option: {other}"))),
         }
     }
@@ -138,6 +145,17 @@ fn parse_args(argv: &[String]) -> Result<Args, BenchError> {
         )));
     }
     check_change_args(&args)?;
+    if (args.save.is_some() || args.load.is_some())
+        && !bench::SAVE_INDEXES.contains(&args.index.as_str())
+    {
+        return Err(Usage(format!(
+            "--save and --load need --index flat, ivf or hnsw (CONTRACT 15), not {}",
+            args.index
+        )));
+    }
+    if args.load.is_some() && args.insert_rate > 0.0 {
+        return Err(Usage("--load is not combined with --insert-rate".into()));
+    }
     Ok(args)
 }
 
@@ -273,26 +291,43 @@ fn run(args: &Args) -> Result<(), BenchError> {
     let search_sets = search_sets(&search_defaults, &args.search)?;
 
     let dir = Path::new(&args.data);
-    let vectors = npy::read_f32(&dir.join("vectors.npy"), args.limit).map_err(Runtime)?;
     let queries = npy::read_f32(&dir.join("queries.npy"), None).map_err(Runtime)?;
-    if queries.cols != vectors.cols {
-        return Err(Runtime(format!(
-            "queries have dim {}, vectors have dim {}",
-            queries.cols, vectors.cols
-        )));
-    }
-    let (n, dim) = (vectors.rows, vectors.cols);
-    let build_defaults = bench::build_defaults(&args.index, n).expect("index name checked");
-    let build_params = apply_params(&build_defaults, &build_specs, "build")?;
-
-    // CONTRACT 12.2: with inserts, the build takes the first 90% of the rows.
-    let build_rows = (args.insert_rate > 0.0).then(|| (n * 9 / 10).max(1));
-    let tail = build_rows.map(|b| vectors.data[b * dim..].to_vec());
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(args.threads)
         .build()
         .map_err(|e| Runtime(format!("cannot start thread pool: {e}")))?;
-    let mut index = build_index(args, &pool, vectors, &build_params, build_rows)?;
+    let mut top_extra = serde_json::Map::new();
+    let (mut index, n, dim, build_params, seed, build_rows, tail) = if let Some(path) = &args.load {
+        // CONTRACT 15.2: no build. The header gives n, dim, build_params, seed; a
+        // --build flag that conflicts with it, a wrong index, or a wrong dim exits 2.
+        let header = bench::vro::read_header(Path::new(path)).map_err(Runtime)?;
+        let requested = apply_params(&probe, &build_specs, "build")?;
+        let explicit = explicit_params(&requested, &build_specs);
+        bench::check_vro_header(&header, &args.index, Some(queries.cols), &explicit).map_err(Usage)?;
+        let t = Instant::now();
+        let (index, header) = pool
+            .install(|| bench::load(&args.index, Path::new(path), &explicit, Some(queries.cols), args.threads))
+            .map_err(Runtime)?;
+        top_extra.insert("load_s".into(), t.elapsed().as_secs_f64().into());
+        top_extra.insert("loaded_from".into(), path.clone().into());
+        (index, header.n, header.dim, header.build_params, header.seed, None, None)
+    } else {
+        let vectors = npy::read_f32(&dir.join("vectors.npy"), args.limit).map_err(Runtime)?;
+        if queries.cols != vectors.cols {
+            return Err(Runtime(format!(
+                "queries have dim {}, vectors have dim {}",
+                queries.cols, vectors.cols
+            )));
+        }
+        let (n, dim) = (vectors.rows, vectors.cols);
+        let build_defaults = bench::build_defaults(&args.index, n).expect("index name checked");
+        let build_params = apply_params(&build_defaults, &build_specs, "build")?;
+        // CONTRACT 12.2: with inserts, the build takes the first 90% of the rows.
+        let build_rows = (args.insert_rate > 0.0).then(|| (n * 9 / 10).max(1));
+        let tail = build_rows.map(|b| vectors.data[b * dim..].to_vec());
+        let index = build_index(args, &pool, vectors, &build_params, build_rows)?;
+        (index, n, dim, build_params, args.seed, build_rows, tail)
+    };
     index.set_filter_dir(&args.data);
     let times = index.build_times();
     let build = BuildReport {
@@ -303,9 +338,18 @@ fn run(args: &Args) -> Result<(), BenchError> {
         index_bytes: index.index_bytes(),
     };
 
-    let mut top_extra = index.extra();
+    top_extra.extend(index.extra());
     let mut search_sets = search_sets;
     apply_changes(args, &pool, index.as_mut(), n, &mut top_extra, &mut search_sets)?;
+    if let Some(path) = &args.save {
+        let t = Instant::now();
+        let bytes = index
+            .save(Path::new(path), &build_params, seed)
+            .map_err(Runtime)?;
+        top_extra.insert("save_s".into(), t.elapsed().as_secs_f64().into());
+        top_extra.insert("file_bytes".into(), bytes.into());
+        top_extra.insert("saved_to".into(), path.clone().into());
+    }
     warm_up(index.as_ref(), &queries, args, &search_sets[0])?;
     let searches = if args.load_run() {
         let inserter = build_rows.zip(tail).map(|(first, rows)| Inserter {
@@ -368,7 +412,7 @@ fn run(args: &Args) -> Result<(), BenchError> {
         q: queries.rows,
         k: args.k,
         threads: args.threads,
-        seed: args.seed,
+        seed,
         build_params,
         build,
         searches,
@@ -376,6 +420,21 @@ fn run(args: &Args) -> Result<(), BenchError> {
         extra: top_extra,
     };
     write_json(&args.out, &output)
+}
+
+/// The keys that `--build` flags set, with their parsed values (no defaults).
+fn explicit_params(parsed: &Params, specs: &[&str]) -> Params {
+    let mut out = Params::new();
+    for key in specs
+        .iter()
+        .flat_map(|s| s.split(','))
+        .filter_map(|p| p.split_once('=').map(|(k, _)| k))
+    {
+        if let Some(v) = parsed.0.get(key) {
+            out.insert(key, v.clone());
+        }
+    }
+    out
 }
 
 /// One parameter set per `--search`, or the defaults once if none is given.
