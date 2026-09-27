@@ -29,6 +29,7 @@
 #include "kmeans.hpp"
 #include "npy.hpp"
 #include "pq.hpp"
+#include "vro.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -193,6 +194,8 @@ struct Args {
     std::string upd;           // --update upd10
     bool compact = false;      // --compact
     std::string compact_mode = "rebuild";  // --compact-mode rebuild|repair
+    std::string save;          // --save PATH (CONTRACT 15.2)
+    std::string load;          // --load PATH
     std::vector<std::string> build;
     std::vector<std::string> search;
 };
@@ -239,6 +242,8 @@ Args parse_args(int argc, char** argv) {
         else if (flag == "--delete") a.del = v;
         else if (flag == "--update") a.upd = v;
         else if (flag == "--compact-mode") a.compact_mode = v;
+        else if (flag == "--save") a.save = v;
+        else if (flag == "--load") a.load = v;
         else throw UsageError("unknown option: " + flag);
     }
     if (a.index.empty()) throw UsageError("missing --index");
@@ -263,6 +268,12 @@ Args parse_args(int argc, char** argv) {
     if (a.compact_mode != "rebuild" && a.compact_mode != "repair")
         throw UsageError("--compact-mode must be rebuild or repair, got: " + a.compact_mode);
     if (changes && load) throw UsageError("--delete, --update: not in a load run");
+    // CONTRACT 15.2: save and load for flat, ivf, hnsw; not with inserts.
+    if ((!a.save.empty() || !a.load.empty()) && a.index != "flat" && a.index != "ivf" &&
+        a.index != "hnsw")
+        throw UsageError("--save, --load: only flat, ivf, hnsw, not " + a.index);
+    if ((!a.save.empty() || !a.load.empty()) && a.insert_rate > 0.0)
+        throw UsageError("--save, --load: not with --insert-rate");
     if (load && a.duration == 0.0) a.duration = 20.0;  // CONTRACT 12.1 default
     if (a.threads == 0) a.threads = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
     return a;
@@ -291,6 +302,10 @@ struct AnyIndex {
     virtual void compact(CompactMode) {
         throw UsageError("compact is supported only by flat, ivf, hnsw");
     }
+    // CONTRACT 15.2. Only flat, ivf, hnsw implement this; the others throw.
+    virtual std::uint64_t save(const std::string&, const vrofile::Meta&) const {
+        throw UsageError("save is supported only by flat, ivf, hnsw");
+    }
 };
 
 template <typename Idx>
@@ -302,7 +317,10 @@ constexpr bool kHasChanges = std::is_same_v<Idx, flat::Index> || std::is_same_v<
     void do_update(ns::Index& i, const std::vector<std::int64_t>& ids, const Matrix& rows) {    \
         ns::update_rows(i, ids, rows);                                                        \
     }                                                                                         \
-    void do_compact(ns::Index& i, CompactMode mode) { ns::compact(i, mode); }
+    void do_compact(ns::Index& i, CompactMode mode) { ns::compact(i, mode); }                 \
+    std::uint64_t do_save(const ns::Index& i, const std::string& path, const vrofile::Meta& m) { \
+        return ns::save(i, path, m);                                                          \
+    }
 VRO_CHANGES(flat)
 VRO_CHANGES(ivf)
 VRO_CHANGES(hnsw)
@@ -338,6 +356,10 @@ struct Wrapped : AnyIndex {
         if constexpr (kHasChanges<Idx>) do_compact(idx, mode);
         else AnyIndex::compact(mode);
     }
+    std::uint64_t save(const std::string& path, const vrofile::Meta& m) const override {
+        if constexpr (kHasChanges<Idx>) return do_save(idx, path, m);
+        else return AnyIndex::save(path, m);
+    }
     Idx idx;
 };
 
@@ -358,6 +380,21 @@ std::unique_ptr<AnyIndex> build_index(const std::string& name, Matrix& vectors,
 }
 
 #undef VRO_WRAP
+
+#define VRO_LOAD(ns)                                                                      \
+    if (name == #ns)                                                                      \
+        return std::make_unique<Wrapped<ns::Index, &ns::search, &ns::index_bytes, &ns::extra>>( \
+            ns::load(path, params, ctx));
+
+std::unique_ptr<AnyIndex> load_index(const std::string& name, const std::string& path,
+                                     const Params& params, const BuildContext& ctx) {
+    VRO_LOAD(flat)
+    VRO_LOAD(ivf)
+    VRO_LOAD(hnsw)
+    throw UsageError("--load: not supported for " + name);
+}
+
+#undef VRO_LOAD
 
 // ---------- Machine info and memory (CONTRACT 4) ----------
 
@@ -632,13 +669,43 @@ int run(int argc, char** argv) {
         search_sets.push_back(std::move(p));
     }
     if (search_sets.empty()) search_sets.emplace_back();
-    fill_defaults(spec.build, build_params);
     for (auto& p : search_sets) fill_defaults(spec.search, p);
 
-    Matrix vectors = npy::read_f32(args.data + "/vectors.npy", args.limit);
+    // CONTRACT 15.2: with --load, build_params come from the file's header;
+    // a --build value that differs from the header is a usage error (exit 2).
+    std::unique_ptr<vrofile::Reader> file;
+    json header_params;
+    std::uint64_t seed = args.seed;
+    if (!args.load.empty()) {
+        file = std::make_unique<vrofile::Reader>(args.load);
+        if (file->index() != args.index)
+            throw UsageError("--load: " + args.load + " holds index " + file->index() + ", not " +
+                             args.index);
+        header_params = file->header().at("build_params");
+        try {
+            file->expect(args.index, 0, build_params);  // only the keys given with --build
+        } catch (const vrofile::FormatError& e) {
+            throw UsageError(std::string("--build conflicts with the loaded file: ") + e.what());
+        }
+        build_params = vrofile::params_from_header(header_params);
+        for (const auto& [key, value] : build_params.values) {
+            const ParamSpec* ps = find_spec(spec.build, key);
+            if (!ps) throw UsageError("--load: unknown build parameter in the file: " + key);
+            check_value(*ps, value);
+        }
+        seed = file->seed();
+        if (args.limit != 0 && args.limit != file->n())
+            throw UsageError("--limit " + std::to_string(args.limit) + " differs from the file's n " +
+                             std::to_string(file->n()));
+    }
+    fill_defaults(spec.build, build_params);
+
+    // A load run does not read vectors.npy: the index holds the rows from the file.
+    Matrix vectors;
+    if (!file) vectors = npy::read_f32(args.data + "/vectors.npy", args.limit);
     Matrix queries = npy::read_f32(args.data + "/queries.npy");
-    if (queries.dim != vectors.dim) throw std::runtime_error("queries and vectors differ in dim");
-    std::size_t n = vectors.rows, dim = vectors.dim;
+    std::size_t n = file ? file->n() : vectors.rows, dim = file ? file->dim() : vectors.dim;
+    if (queries.dim != dim) throw std::runtime_error("queries and vectors differ in dim");
     const bool load = args.clients > 1 || args.duration > 0.0;
 
     // CONTRACT 12.2: build on the first 90% of the rows; the inserter adds the
@@ -657,16 +724,30 @@ int run(int argc, char** argv) {
         std::fill(vectors.row(build_rows), vectors.row(0) + n * dim, 0.0f);
         for (std::size_t i = build_rows; i < n; ++i) job->ids.push_back(static_cast<std::int64_t>(i));
     }
-    if (args.index == "ivf" && !build_params.has("train_size")) {
+    if (!file && args.index == "ivf" && !build_params.has("train_size")) {
         auto nlist = static_cast<std::size_t>(build_params.get_int("nlist"));
         build_params.values["train_size"] = std::to_string(default_train_size(n, nlist));
     }
 
-    BuildContext ctx{args.threads, args.seed, args.out, args.data};
+    BuildContext ctx{args.threads, seed, args.out, args.data};
     ctx.build_rows = build_rows;
-    std::cerr << "building " << args.index << " on " << (build_rows ? build_rows : n) << " rows\n";
-    std::unique_ptr<AnyIndex> index = build_index(args.index, vectors, build_params, ctx);
-    BuildTimes times = index->times();
+    ctx.expect_dim = dim;
+    std::unique_ptr<AnyIndex> index;
+    json file_extra = json::object();
+    BuildTimes times;
+    if (file) {
+        std::cerr << "loading " << args.index << " from " << args.load << "\n";
+        file.reset();  // header checked; load() reads the file again
+        auto t0 = std::chrono::steady_clock::now();
+        index = load_index(args.index, args.load, build_params, ctx);
+        file_extra["load_s"] = seconds_since(t0);
+        file_extra["loaded_from"] = args.load;
+        // train_s = add_s = 0 (CONTRACT 15.2): times stays zero.
+    } else {
+        std::cerr << "building " << args.index << " on " << (build_rows ? build_rows : n) << " rows\n";
+        index = build_index(args.index, vectors, build_params, ctx);
+        times = index->times();
+    }
 
     json doc;
     doc["contract_version"] = 1;
@@ -678,8 +759,8 @@ int run(int argc, char** argv) {
     doc["q"] = queries.rows;
     doc["k"] = args.k;
     doc["threads"] = args.threads;
-    doc["seed"] = args.seed;
-    doc["build_params"] = params_to_json(spec.build, build_params);
+    doc["seed"] = seed;
+    doc["build_params"] = args.load.empty() ? params_to_json(spec.build, build_params) : header_params;
     doc["build"] = {{"train_s", times.train_s},
                     {"add_s", times.add_s},
                     {"total_s", times.train_s + times.add_s},
@@ -737,6 +818,17 @@ int run(int argc, char** argv) {
         }
     }
 
+    // CONTRACT 15.2: save after the build and after any change.
+    if (!args.save.empty()) {
+        vrofile::Meta meta;
+        meta.build_params = doc["build_params"];
+        meta.seed = seed;
+        auto t0 = std::chrono::steady_clock::now();
+        const std::uint64_t bytes = index->save(args.save, meta);
+        file_extra["save_s"] = seconds_since(t0);
+        file_extra["file_bytes"] = bytes;
+    }
+
     warm_up(*index, queries, args.k, args.warmup, search_sets.front());
     json searches = json::array();
     for (const auto& p : search_sets) {
@@ -778,6 +870,7 @@ int run(int argc, char** argv) {
     json extra = json::object();
     for (const auto& [key, v] : index->extra()) extra[key] = v;
     for (const auto& [key, v] : change_extra.items()) extra[key] = v;
+    for (const auto& [key, v] : file_extra.items()) extra[key] = v;
     if (load) {
         extra["clients"] = args.clients;
         extra["duration_s"] = args.duration;

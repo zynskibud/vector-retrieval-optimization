@@ -100,3 +100,53 @@ void compact(Index& index, CompactMode /*mode*/) {
 }
 
 }  // namespace vro::flat
+
+namespace vro::flat {
+
+// The file holds all corpus rows under their IDs (CONTRACT 15.1). After a
+// compact, a dropped row gets its tombstone bit and a zero vector; the loaded
+// index (uncompacted, with tombstones) returns the same IDs and scores.
+std::uint64_t save(const Index& index, const std::string& path, const vrofile::Meta& meta) {
+    const Matrix& v = *index.vectors;
+    std::vector<float> full;  // only after a compact
+    Tombstones dead;
+    if (index.compacted) {
+        full.assign(index.n_rows * v.dim, 0.0f);
+        std::vector<std::uint8_t> mask(index.n_rows, 1);
+        for (std::size_t j = 0; j < index.ids.size(); ++j) {
+            const auto r = static_cast<std::size_t>(index.ids[j]);
+            mask[r] = 0;
+            std::copy(index.own.row(j), index.own.row(j) + v.dim, full.data() + r * v.dim);
+        }
+        dead.set(mask);
+    }
+    const Tombstones& t = index.compacted ? dead : index.dead;
+    std::vector<std::uint8_t> bits = vrofile::tombstones_to_bytes(t, index.n_rows);
+    vrofile::Writer w;
+    w.add("vectors", "f32", {index.n_rows, v.dim}, index.compacted ? full.data() : v.data.data());
+    w.add("tombstones", "u8", {bits.size()}, bits.data());
+    vrofile::Meta m = meta;
+    m.index = "flat";
+    m.n = index.n_rows;
+    m.dim = v.dim;
+    return w.write(path, m);
+}
+
+Index load(const std::string& path, const Params& params, const BuildContext& ctx) {
+    vrofile::Reader r(path);
+    r.expect("flat", ctx.expect_dim, params);
+    const std::size_t n = r.n(), dim = r.dim();
+    Index index;
+    index.loaded = std::make_unique<Matrix>();
+    index.loaded->rows = n;
+    index.loaded->dim = dim;
+    index.loaded->data = r.read_f32("vectors", {n, dim});
+    index.vectors = index.loaded.get();
+    index.data_dir = ctx.data_dir;
+    index.n_rows = n;
+    index.dead = vrofile::tombstones_from_bytes(r.read_u8("tombstones", {(n + 7) / 8}), n);
+    index.changed = index.dead.any();
+    return index;
+}
+
+}  // namespace vro::flat

@@ -210,3 +210,72 @@ void compact(Index& index, CompactMode /*mode*/) {
 }
 
 }  // namespace vro::ivf
+
+namespace vro::ivf {
+
+// The lists are written as they are (CONTRACT 15.1). After a compact,
+// list_ids is shorter than N: a dropped row is in no list and gets its
+// tombstone bit. The vectors section keeps the corpus rows.
+std::uint64_t save(const Index& index, const std::string& path, const vrofile::Meta& meta) {
+    const Matrix& v = *index.vectors;
+    const std::size_t n = v.rows;
+    Tombstones dead_full;
+    if (index.list_ids.size() != n) {
+        std::vector<std::uint8_t> mask(n, 1);
+        for (std::int32_t id : index.list_ids) mask[static_cast<std::size_t>(id)] = 0;
+        for (std::size_t i = 0; i < n; ++i)
+            if (index.dead.test(i)) mask[i] = 1;
+        dead_full.set(mask);
+    }
+    const Tombstones& t = index.list_ids.size() != n ? dead_full : index.dead;
+    std::vector<std::uint8_t> bits = vrofile::tombstones_to_bytes(t, n);
+    vrofile::Writer w;
+    w.add("vectors", "f32", {n, v.dim}, v.data.data());
+    w.add("tombstones", "u8", {bits.size()}, bits.data());
+    w.add("centers", "f32", {index.nlist, index.dim}, index.centers.data());
+    w.add("list_ids", "int32", {index.list_ids.size()}, index.list_ids.data());
+    w.add("list_offsets", "int32", {index.offsets.size()}, index.offsets.data());
+    vrofile::Meta m = meta;
+    m.index = "ivf";
+    m.n = n;
+    m.dim = v.dim;
+    return w.write(path, m);
+}
+
+Index load(const std::string& path, const Params& params, const BuildContext& ctx) {
+    vrofile::Reader r(path);
+    r.expect("ivf", ctx.expect_dim, params);
+    const std::size_t n = r.n(), dim = r.dim();
+    const vrofile::Section& cs = r.section("centers");
+    if (cs.shape.size() != 2 || cs.shape[1] != dim) throw vrofile::FormatError(path + ": bad centers shape");
+    const std::size_t nlist = cs.shape[0];
+    if (!r.header().at("build_params").contains("nlist") ||
+        r.header().at("build_params").at("nlist").get<std::size_t>() != nlist)
+        throw vrofile::FormatError(path + ": centers rows differ from build_params.nlist");
+    Index index;
+    index.loaded = std::make_unique<Matrix>();
+    index.loaded->rows = n;
+    index.loaded->dim = dim;
+    index.loaded->data = r.read_f32("vectors", {n, dim});
+    index.vectors = index.loaded.get();
+    index.data_dir = ctx.data_dir;
+    index.nlist = nlist;
+    index.dim = dim;
+    index.centers = r.read_f32("centers", {nlist, dim});
+    // list_ids may be shorter than N (rows dropped by a compaction are in no
+    // list); its length must equal list_offsets[nlist].
+    const vrofile::Section& ls = r.section("list_ids");
+    if (ls.shape.size() != 1 || ls.shape[0] > n) throw vrofile::FormatError(path + ": bad list_ids shape");
+    index.list_ids = r.read_i32("list_ids", {ls.shape[0]});
+    index.offsets = r.read_i32("list_offsets", {nlist + 1});
+    if (index.offsets[0] != 0 || static_cast<std::size_t>(index.offsets[nlist]) != index.list_ids.size())
+        throw vrofile::FormatError(path + ": list_offsets do not cover list_ids");
+    for (std::size_t c = 0; c < nlist; ++c)
+        if (index.offsets[c + 1] < index.offsets[c]) throw vrofile::FormatError(path + ": list_offsets decrease");
+    for (std::int32_t id : index.list_ids)
+        if (id < 0 || static_cast<std::size_t>(id) >= n) throw vrofile::FormatError(path + ": list ID out of range");
+    index.dead = vrofile::tombstones_from_bytes(r.read_u8("tombstones", {(n + 7) / 8}), n);
+    return index;
+}
+
+}  // namespace vro::ivf

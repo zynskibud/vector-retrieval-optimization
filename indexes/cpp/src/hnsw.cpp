@@ -826,3 +826,164 @@ void compact(Index& ix, CompactMode mode) {
 }
 
 }  // namespace vro::hnsw
+
+namespace vro::hnsw {
+
+// File layout (CONTRACT 15.1) versus memory: layer 0 is the same (row ID x
+// 2m slots). Upper layers: memory keeps one slot array per layer, indexed by
+// ord1 (rank among nodes with level >= 1); the file keeps one block of m
+// slots per (row, layer) pair, row-major: row i's blocks are
+// upper_offsets[i] .. upper_offsets[i+1], for layers 1..level(i).
+// Empty slots (at or past the count) are written as -1.
+// After compact (rebuild), node k holds row ids[k]; the file describes all
+// n_orig rows: node IDs map back to row IDs, and a dropped row gets its
+// tombstone bit, a zero vector, level 0, and no edges.
+std::uint64_t save(const Index& ix, const std::string& path, const vrofile::Meta& meta) {
+    const Matrix& v = *ix.vectors;
+    const std::size_t nodes = ix.level.size();
+    if (ix.n_live.load() != nodes)
+        throw std::runtime_error("hnsw: save while rows are not yet inserted is not supported");
+    const bool mapped = !ix.ids.empty();
+    const std::size_t n = mapped ? ix.n_orig : nodes;
+    const std::size_t m = ix.m, m0 = ix.m0;
+    auto row_of = [&](std::int32_t node) { return mapped ? ix.ids[static_cast<std::size_t>(node)] : node; };
+
+    std::vector<std::uint8_t> level(n, 0);
+    for (std::size_t k = 0; k < nodes; ++k) level[static_cast<std::size_t>(row_of(static_cast<std::int32_t>(k)))] = ix.level[k];
+    std::vector<float> vec_full;  // only when mapped
+    Tombstones dead_full;
+    if (mapped) {
+        vec_full.assign(n * v.dim, 0.0f);
+        std::vector<std::uint8_t> mask(n, 1);
+        for (std::size_t k = 0; k < nodes; ++k) {
+            const auto r = static_cast<std::size_t>(ix.ids[k]);
+            std::copy(v.row(k), v.row(k) + v.dim, vec_full.data() + r * v.dim);
+            mask[r] = ix.dead.test(k) ? 1 : 0;
+        }
+        dead_full.set(mask);
+    }
+    std::vector<std::int32_t> l0(n * m0, -1), c0(n, 0);
+    std::vector<std::int32_t> uoff(n + 1, 0);
+    for (std::size_t i = 0; i < n; ++i) uoff[i + 1] = uoff[i] + level[i];
+    const std::size_t L = static_cast<std::size_t>(uoff[n]);
+    std::vector<std::int32_t> us(L * m, -1), uc(L, 0);
+    for (std::size_t k = 0; k < nodes; ++k) {
+        const auto i = static_cast<std::size_t>(row_of(static_cast<std::int32_t>(k)));
+        std::int32_t cnt = 0;
+        const std::atomic<std::int32_t>* nb = ix.neighbors(0, static_cast<std::int32_t>(k), cnt);
+        c0[i] = cnt;
+        for (std::int32_t j = 0; j < cnt; ++j) l0[i * m0 + static_cast<std::size_t>(j)] = row_of(nb[j].load());
+        for (int l = 1; l <= ix.level[k]; ++l) {
+            const std::size_t b = static_cast<std::size_t>(uoff[i]) + static_cast<std::size_t>(l - 1);
+            nb = ix.neighbors(l, static_cast<std::int32_t>(k), cnt);
+            uc[b] = cnt;
+            for (std::int32_t j = 0; j < cnt; ++j) us[b * m + static_cast<std::size_t>(j)] = row_of(nb[j].load());
+        }
+    }
+    const std::int32_t entry = ix.entry.load() >= 0 ? row_of(ix.entry.load()) : -1;
+    std::vector<std::uint8_t> bits = vrofile::tombstones_to_bytes(mapped ? dead_full : ix.dead, n);
+
+    vrofile::Writer w;
+    w.add("vectors", "f32", {n, v.dim}, mapped ? vec_full.data() : v.data.data());
+    w.add("tombstones", "u8", {bits.size()}, bits.data());
+    w.add("levels", "u8", {n}, level.data());
+    w.add("entry", "int32", {1}, &entry);
+    w.add("layer0_slots", "int32", {n, m0}, l0.data());
+    w.add("layer0_counts", "int32", {n}, c0.data());
+    w.add("upper_slots", "int32", {L, m}, us.data());
+    w.add("upper_counts", "int32", {L}, uc.data());
+    w.add("upper_offsets", "int32", {n + 1}, uoff.data());
+    vrofile::Meta mt = meta;
+    mt.index = "hnsw";
+    mt.n = n;
+    mt.dim = v.dim;
+    return w.write(path, mt);
+}
+
+Index load(const std::string& path, const Params& params, const BuildContext& ctx) {
+    vrofile::Reader r(path);
+    r.expect("hnsw", ctx.expect_dim, params);
+    const std::size_t n = r.n(), dim = r.dim();
+    const Params bp = vrofile::params_from_header(r.header().at("build_params"));
+    const long long m_ll = bp.get_int("m"), efc = bp.get_int("ef_construct");
+    if (m_ll < 2 || efc < 1) throw vrofile::FormatError(path + ": bad m or ef_construct");
+    if (n > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()))
+        throw vrofile::FormatError(path + ": too many rows for int32 IDs");
+
+    Index ix;
+    ix.own = std::make_unique<Matrix>();
+    ix.own->rows = n;
+    ix.own->dim = dim;
+    ix.own->data = r.read_f32("vectors", {n, dim});
+    ix.vectors = ix.own.get();
+    ix.data_dir = ctx.data_dir;
+    ix.m = static_cast<std::size_t>(m_ll);
+    ix.m0 = 2 * ix.m;
+    ix.ef_construct = static_cast<std::size_t>(efc);
+    ix.threads = std::max(1, ctx.threads);
+    ix.seed = r.seed();  // compact (rebuild) redraws levels with the build seed
+    ix.n_orig = n;
+    ix.level = r.read_u8("levels", {n});
+    const std::vector<std::int32_t> entry = r.read_i32("entry", {1});
+    const std::vector<std::int32_t> uoff = r.read_i32("upper_offsets", {n + 1});
+    if (uoff[0] != 0) throw vrofile::FormatError(path + ": upper_offsets[0] != 0");
+    for (std::size_t i = 0; i < n; ++i)
+        if (uoff[i + 1] - uoff[i] != ix.level[i])
+            throw vrofile::FormatError(path + ": upper_offsets do not match levels");
+    const std::size_t L = static_cast<std::size_t>(uoff[n]);
+    const std::size_t m = ix.m, m0 = ix.m0;
+    const std::vector<std::int32_t> l0 = r.read_i32("layer0_slots", {n, m0});
+    const std::vector<std::int32_t> c0 = r.read_i32("layer0_counts", {n});
+    const std::vector<std::int32_t> us = r.read_i32("upper_slots", {L, m});
+    const std::vector<std::int32_t> uc = r.read_i32("upper_counts", {L});
+
+    int max_level = 0;
+    ix.ord1.assign(n, -1);
+    for (std::size_t i = 0; i < n; ++i) {
+        max_level = std::max(max_level, static_cast<int>(ix.level[i]));
+        if (ix.level[i] >= 1) ix.ord1[i] = static_cast<std::int32_t>(ix.n_upper++);
+    }
+    ix.links.resize(static_cast<std::size_t>(max_level) + 1);
+    ix.counts.resize(static_cast<std::size_t>(max_level) + 1);
+    ix.links[0].assign(n * m0, -1);
+    ix.counts[0].assign(n, 0);
+    for (int l = 1; l <= max_level; ++l) {
+        ix.links[static_cast<std::size_t>(l)].assign(ix.n_upper * m, -1);
+        ix.counts[static_cast<std::size_t>(l)].assign(ix.n_upper, 0);
+    }
+    auto check_list = [&](std::int32_t cnt, std::size_t cap, const std::int32_t* s, int l) {
+        if (cnt < 0 || static_cast<std::size_t>(cnt) > cap)
+            throw vrofile::FormatError(path + ": neighbor count out of range");
+        for (std::int32_t j = 0; j < cnt; ++j)
+            if (s[j] < 0 || static_cast<std::size_t>(s[j]) >= n || ix.level[static_cast<std::size_t>(s[j])] < l)
+                throw vrofile::FormatError(path + ": neighbor ID out of range");
+    };
+    for (std::size_t i = 0; i < n; ++i) {
+        check_list(c0[i], m0, &l0[i * m0], 0);
+        for (std::int32_t j = 0; j < c0[i]; ++j)
+            ix.links[0][i * m0 + static_cast<std::size_t>(j)].store(l0[i * m0 + static_cast<std::size_t>(j)],
+                                                                     std::memory_order_relaxed);
+        ix.counts[0][i].store(c0[i], std::memory_order_relaxed);
+        for (int l = 1; l <= ix.level[i]; ++l) {
+            const std::size_t b = static_cast<std::size_t>(uoff[i]) + static_cast<std::size_t>(l - 1);
+            const std::size_t o = static_cast<std::size_t>(ix.ord1[i]);
+            check_list(uc[b], m, &us[b * m], l);
+            for (std::int32_t j = 0; j < uc[b]; ++j)
+                ix.links[static_cast<std::size_t>(l)][o * m + static_cast<std::size_t>(j)].store(
+                    us[b * m + static_cast<std::size_t>(j)], std::memory_order_relaxed);
+            ix.counts[static_cast<std::size_t>(l)][o].store(uc[b], std::memory_order_relaxed);
+        }
+    }
+    if (n > 0 && (entry[0] < 0 || static_cast<std::size_t>(entry[0]) >= n))
+        throw vrofile::FormatError(path + ": entry out of range");
+    ix.entry = n > 0 ? entry[0] : -1;
+    ix.top = n > 0 ? static_cast<int>(ix.level[static_cast<std::size_t>(entry[0])]) : -1;
+    ix.n_live = n;
+    ix.locks.reset(new std::mutex[kStripes]);
+    ix.ep_mu = std::make_unique<std::mutex>();
+    ix.dead = vrofile::tombstones_from_bytes(r.read_u8("tombstones", {(n + 7) / 8}), n);
+    std::atomic_thread_fence(std::memory_order_release);
+    return ix;
+}
+
+}  // namespace vro::hnsw

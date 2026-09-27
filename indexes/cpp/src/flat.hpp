@@ -14,15 +14,18 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "common.hpp"
+#include "vro.hpp"
 
 namespace vro::flat {
 
 struct Index {
     Matrix* vectors = nullptr;        // the corpus array is the index
+    std::unique_ptr<Matrix> loaded;   // after load(): the rows from the file (vectors points here)
     std::string data_dir;             // for filter_<name>.npy (CONTRACT 11)
     std::size_t n_rows = 0;           // corpus rows (IDs are 0..n_rows-1)
     Tombstones dead;                  // CONTRACT 13.3
@@ -44,5 +47,13 @@ void delete_rows(Index& index, const std::vector<std::uint8_t>& mask);
 void update_rows(Index& index, const std::vector<std::int64_t>& ids, const Matrix& rows);
 // Drops tombstoned rows. Both modes do the same for flat.
 void compact(Index& index, CompactMode mode);
+
+// CONTRACT 15.1: writes the index to a .vro file. meta supplies build_params
+// and seed; save fills in index, n, and dim. Returns the file size in bytes.
+std::uint64_t save(const Index& index, const std::string& path, const vrofile::Meta& meta);
+// Loads a .vro file. Refuses (vrofile::FormatError) a file whose index, dim
+// (ctx.expect_dim), or build_params (every key of params) differ. The index
+// owns its vectors. No rebuild and no repair.
+Index load(const std::string& path, const Params& params, const BuildContext& ctx);
 
 }  // namespace vro::flat

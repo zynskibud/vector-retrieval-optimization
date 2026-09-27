@@ -54,6 +54,7 @@ struct BuildContext {
     std::string out_path;  // the output JSON path; diskann writes <out_path>.diskann
     std::string data_dir;  // the --data directory; filtered search reads filter_<name>.npy here
     std::size_t build_rows = 0;  // hnsw: build on the first build_rows rows only (0 = all); CONTRACT 12.2
+    std::size_t expect_dim = 0;  // load (CONTRACT 15.1): refuse a file with another dim (0 = any)
 };
 
 // Metadata filter (CONTRACT 11). pass[i] is 1 if row i passes; pass has one

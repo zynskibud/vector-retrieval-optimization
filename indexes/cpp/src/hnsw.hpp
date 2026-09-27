@@ -43,6 +43,7 @@
 #include <vector>
 
 #include "common.hpp"
+#include "vro.hpp"
 
 namespace vro::hnsw {
 
@@ -142,5 +143,13 @@ void compact(Index& index, CompactMode mode);
 std::size_t unreachable_layer0(const Index& index);
 
 std::vector<std::uint8_t> draw_levels(std::size_t n, std::size_t m, std::uint64_t seed);
+
+// CONTRACT 15.1: writes the index to a .vro file. meta supplies build_params
+// and seed; save fills in index, n, and dim. Returns the file size in bytes.
+std::uint64_t save(const Index& index, const std::string& path, const vrofile::Meta& meta);
+// Loads a .vro file. Refuses (vrofile::FormatError) a file whose index, dim
+// (ctx.expect_dim), or build_params (every key of params) differ. The index
+// owns its vectors. No rebuild and no repair.
+Index load(const std::string& path, const Params& params, const BuildContext& ctx);
 
 }  // namespace vro::hnsw
