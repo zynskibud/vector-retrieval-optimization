@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Run one TIMING job under the coordinator's timing lock, detached, with the lid-sleep
-# guard. Every benchmark sweep on this machine starts through this script.
+# Run one or more TIMING jobs under the coordinator's timing lock, detached, with the
+# lid-sleep guard. Every benchmark sweep on this machine starts through this script.
 #
-# Usage: scripts/run.sh [--dry-run] <job>
+# Usage: scripts/run.sh [--dry-run] <job> [<job> ...]
 #        scripts/run.sh --stop
+#
+# Several jobs run back to back under one lock, in the order given; a job that fails is
+# logged and the next one runs. Start only on AC power (preflight warns on battery).
 #
 # Jobs (each is one or more `make` targets, which run inside the container):
 #   dev-sweep     all six indexes, all languages and FAISS, dev set, 3 repeats
@@ -24,10 +27,11 @@
 #   test          make test (light, but it still takes the lock so it never overlaps a sweep)
 #
 # Steps: preflight (stop on FAIL), take the lock with owner
-# "vector-retrieval <job> <ISO time>", start the job detached under
-# `caffeinate -i`, release the lock when the job exits or is killed
+# "vector-retrieval <job>[+<job>...] <ISO time>", start the jobs detached under
+# `caffeinate -i`, release the lock when the last job exits or the run is killed
 # (SIGTERM/SIGINT; a SIGKILL leaves a stale lock that preflight reports and
-# the next run.sh removes). Output goes to results/logs/<job>-<time>.log.
+# the next run.sh removes). Output goes to results/logs/<job>[+N]-<time>.log, with a
+# "[run.sh] job <name> start|end exit=<code>" line around each job.
 #
 # Only start a TIMING job after the coordinator sends "GO <job>".
 
@@ -39,13 +43,14 @@ LOCK_DIR="$AI_ENGINEERING_ROOT/.coord/timing.lock"
 LOG_DIR="$REPO_ROOT/results/logs"
 DRY_RUN=0
 JOB=""
+JOBS=()
 
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=1 ;;
     --stop)    JOB="--stop" ;;
-    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
-    *)         JOB="$arg" ;;
+    -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
+    *)         JOBS+=("$arg") ;;
   esac
 done
 
@@ -63,7 +68,9 @@ if [ "$JOB" = "--stop" ]; then
   exit 0
 fi
 
-case "$JOB" in
+job_cmd() {
+  local CMD
+  case "$1" in
   dev-sweep)
     CMD="make bench ARGS='--data data/processed/dev --languages rust,cpp,go,faiss --indexes flat,ivf,pq,hnsw,ivf_pq,diskann --repeat 3'
 && make bench ARGS='--data data/processed/dev --languages python --indexes flat,ivf,pq,hnsw,ivf_pq --repeat 3'
@@ -91,12 +98,27 @@ case "$JOB" in
     CMD="for db in qdrant pgvector milvus; do make db-up DB=\$db && make backup-db DB=\$db ARGS='--data data/processed/dev'; make db-down DB=\$db; done
 && make report ARGS='--data data/processed/dev'" ;;
   test) CMD="make test" ;;
-  "")   echo "usage: scripts/run.sh [--dry-run] <dev-sweep|full-sweep|db-sweep|load-sweep|changes-sweep|cache-sweep|backup-sweep|test> | --stop" >&2; exit 2 ;;
-  *)    echo "unknown job: $JOB" >&2; exit 2 ;;
-esac
-CMD="$(printf '%s' "$CMD" | tr '\n' ' ')"
+  *)    echo "unknown job: $1" >&2; return 2 ;;
+  esac
+  printf '%s' "$CMD" | tr '\n' ' '
+}
 
-echo "job: $JOB"
+if [ "${#JOBS[@]}" -eq 0 ]; then
+  echo "usage: scripts/run.sh [--dry-run] <dev-sweep|full-sweep|db-sweep|load-sweep|changes-sweep|cache-sweep|backup-sweep|test>... | --stop" >&2
+  exit 2
+fi
+for j in "${JOBS[@]}"; do job_cmd "$j" >/dev/null || exit 2; done
+JOB="$(IFS=+; echo "${JOBS[*]}")"
+NAME="${JOBS[0]}"; [ "${#JOBS[@]}" -gt 1 ] && NAME="${JOBS[0]}+$(( ${#JOBS[@]} - 1 ))"
+
+# One command string: each job in its own subshell, with a start and an end marker, so a
+# failed job does not stop the next one and the log shows every exit code.
+CMD=""
+for j in "${JOBS[@]}"; do
+  CMD="$CMD echo \"[run.sh] job $j start \$(date -u +%FT%TZ)\"; ( $(job_cmd "$j") ); echo \"[run.sh] job $j end \$(date -u +%FT%TZ) exit=\$?\";"
+done
+
+echo "jobs: $JOB"
 echo "command: $CMD"
 echo
 
@@ -132,7 +154,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
 fi
 
 mkdir -p "$LOG_DIR"
-LOG="$LOG_DIR/$JOB-$(date +%Y%m%d-%H%M%S).log"
+LOG="$LOG_DIR/$NAME-$(date +%Y%m%d-%H%M%S).log"
 
 # The TIMING caps (PROTOCOL.md): 6 CPUs and 12 GB for the bench container, 4 CPUs for a
 # database. docker-compose.yml defaults to the day caps (3 CPUs, 6 GB, 3 CPUs) when these
