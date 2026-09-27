@@ -20,6 +20,7 @@ import (
 	"vro/indexes/go/distance"
 	"vro/indexes/go/kmeans"
 	"vro/indexes/go/npy"
+	"vro/indexes/go/tombstone"
 )
 
 // BuildDefaults lists every build parameter with its default.
@@ -51,6 +52,8 @@ type Index struct {
 
 	topk   *distance.TopK // result selector, reused across queries
 	probeK *distance.TopK // center selector, reused across queries
+
+	del *tombstone.Set // Phase 5 tombstones (changes.go); nil = none
 }
 
 // intParam reads an integer parameter. bench passes int64; tests may pass int.
@@ -191,6 +194,9 @@ func Search(ix *Index, query []float32, k int, params map[string]any) ([]int64, 
 			if mask != nil && !mask[row] {
 				continue // fails the filter: not scored (section 11.3)
 			}
+			if ix.del.Has(row) {
+				continue // tombstoned: not scored (section 13.3)
+			}
 			tk.Push(int64(id), distance.Dot(query, ix.vectors[row*d:(row+1)*d]))
 			scanned++
 		}
@@ -202,9 +208,10 @@ func Search(ix *Index, query []float32, k int, params map[string]any) ([]int64, 
 }
 
 // IndexBytes returns the computed memory of the index structure (section 4):
-// centers (nlist*dim*4) + one int32 ID per row + the int32 offsets array.
+// centers (nlist*dim*4) + one int32 ID per row + the int32 offsets array,
+// plus the tombstone bit set after a Delete (section 13.3).
 func IndexBytes(ix *Index) int64 {
-	return int64(ix.nlist)*int64(ix.dim)*4 + int64(len(ix.ids))*4 + int64(len(ix.offsets))*4
+	return int64(ix.nlist)*int64(ix.dim)*4 + int64(len(ix.ids))*4 + int64(len(ix.offsets))*4 + ix.del.Bytes()
 }
 
 // TrainSeconds returns the train time of the build.

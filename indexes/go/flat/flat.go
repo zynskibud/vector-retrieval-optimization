@@ -8,6 +8,7 @@ import (
 
 	"vro/indexes/go/distance"
 	"vro/indexes/go/npy"
+	"vro/indexes/go/tombstone"
 )
 
 // BuildDefaults lists every build parameter with its default. Flat has none.
@@ -29,6 +30,12 @@ type Index struct {
 	dists   int64
 	passed  int64 // rows that passed the filter, summed over searches
 	topk    *distance.TopK
+
+	// Phase 5 (changes.go). del is nil until Delete. ids is nil until
+	// Compact: then row r of vectors holds corpus row ids[r].
+	del     *tombstone.Set
+	ids     []int32
+	changed bool // Delete, Update or Compact ran; IndexBytes counts the vectors
 }
 
 // Build wraps the corpus. vectors is row-major (n, dim).
@@ -48,6 +55,9 @@ func Search(ix *Index, query []float32, k int, params map[string]any) ([]int64, 
 	tk.Reset()
 	d := ix.dim
 	mask := filterMask(params)
+	if ix.del != nil || ix.ids != nil {
+		return ix.searchChanged(query, tk, mask)
+	}
 	if mask == nil {
 		for i := 0; i < ix.n; i++ {
 			tk.Push(int64(i), distance.Dot(query, ix.vectors[i*d:(i+1)*d]))
@@ -70,8 +80,18 @@ func Search(ix *Index, query []float32, k int, params map[string]any) ([]int64, 
 	return tk.Results()
 }
 
-// IndexBytes is 0: the corpus array is the index (section 4).
-func IndexBytes(ix *Index) int64 { return 0 }
+// IndexBytes is 0: the corpus array is the index (section 4). After a Phase 5
+// change it counts the vectors the index serves, the tombstone bit set and
+// the ID map (see changes.go).
+func IndexBytes(ix *Index) int64 {
+	if !ix.changed {
+		return 0
+	}
+	live := int64(ix.n - ix.del.Count())
+	// Live row vectors + one int32 ID per live row (CONTRACT 13.3 counts the
+	// ID map in both change-time values) + the tombstone bit set.
+	return live*int64(ix.dim)*4 + live*4 + ix.del.Bytes()
+}
 
 // TrainSeconds returns the train time of the build.
 func (ix *Index) TrainSeconds() float64 { return ix.trainS }

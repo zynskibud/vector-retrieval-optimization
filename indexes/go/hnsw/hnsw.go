@@ -39,6 +39,7 @@ import (
 	"vro/indexes/go/distance"
 	"vro/indexes/go/npy"
 	"vro/indexes/go/splitmix"
+	"vro/indexes/go/tombstone"
 )
 
 // BuildDefaults lists every build parameter with its default. The values are
@@ -97,6 +98,15 @@ type Index struct {
 	scPool sync.Pool // *scratch, one per concurrent Search
 
 	insUnreach, insAdded, insAddedUnreach int // repair counts of the last Repair call
+
+	// Phase 5 (changes.go). del marks tombstoned nodes: Search expands them
+	// but never returns them. purged marks nodes cut out of the graph by
+	// Compact in repair mode; the repair pass skips them. rowIDs is nil
+	// except after a Compact rebuild: then node j is corpus row rowIDs[j].
+	del, purged                           *tombstone.Set
+	rowIDs                                []int32
+	seed                                  uint64
+	updUnreach, updAdded, updAddedUnreach int // repair counts after Update or Compact repair
 }
 
 // entryTop returns the entry point and the top layer (one atomic load).
@@ -224,6 +234,7 @@ type scratch struct {
 	cand    heap // max-heap: best candidate at root
 	res     heap // min-heap: worst result at root
 	nbuf    []int32
+	skip    int32 // node that greedy and searchLayer never visit (-1 = none); see Update
 	sel     []item
 	pool    []item
 	dists   int64
@@ -234,6 +245,7 @@ type scratch struct {
 func newScratch(n int) *scratch {
 	return &scratch{
 		visited: make([]uint32, n),
+		skip:    -1,
 		cand:    heap{max: true},
 		res:     heap{max: false},
 	}
@@ -297,6 +309,9 @@ func (ix *Index) greedy(q []float32, cur item, l int, s *scratch, locked bool) i
 		changed = false
 		s.nbuf = ix.neighbors(cur.id, l, s.nbuf, locked)
 		for _, e := range s.nbuf {
+			if e == s.skip {
+				continue
+			}
 			sc := distance.Dot(q, ix.vec(e))
 			s.dists++
 			if c := (item{sc, e}); better(c, cur) {
@@ -323,7 +338,7 @@ func (ix *Index) searchLayer(q []float32, ep item, ef, l int, s *scratch, locked
 		s.expand++
 		s.nbuf = ix.neighbors(c.id, l, s.nbuf, locked)
 		for _, e := range s.nbuf {
-			if s.visited[e] == s.gen {
+			if s.visited[e] == s.gen || e == s.skip {
 				continue
 			}
 			s.visited[e] = s.gen
@@ -342,8 +357,9 @@ func (ix *Index) searchLayer(q []float32, ep item, ef, l int, s *scratch, locked
 }
 
 // searchLayerFiltered is searchLayer on layer 0 with a filter mask
-// (CONTRACT.md section 11.3, the hnswlib / FAISS IDSelector behavior). A node
-// enters the result heap only if it passes the mask. Every visited node that
+// (CONTRACT.md section 11.3, the hnswlib / FAISS IDSelector behavior) and the
+// tombstones (section 13.3, hnswlib markDelete). A node enters the result
+// heap only if it passes the mask and is not tombstoned. Every visited node that
 // would have entered the result heap without the filter still enters the
 // candidate heap and is expanded, so the walk crosses failing regions. The
 // stop rule is unchanged: stop when the best candidate is worse than the worst
@@ -354,7 +370,7 @@ func (ix *Index) searchLayerFiltered(q []float32, ep item, ef int, s *scratch, m
 	s.cand.a, s.res.a = s.cand.a[:0], s.res.a[:0]
 	s.visited[ep.id] = s.gen
 	s.cand.push(ep)
-	if mask[ep.id] {
+	if ix.admits(ep.id, mask) {
 		s.res.push(ep)
 		s.passed++
 	}
@@ -375,7 +391,7 @@ func (ix *Index) searchLayerFiltered(q []float32, ep item, ef int, s *scratch, m
 			it := item{sc, e}
 			if len(s.res.a) < ef || better(it, s.res.a[0]) {
 				s.cand.push(it)
-				if mask[e] {
+				if ix.admits(e, mask) {
 					s.passed++
 					s.res.push(it)
 					if len(s.res.a) > ef {
@@ -506,6 +522,11 @@ func (ix *Index) connect(e, i int32, sim float32, l, limit int, s *scratch, lock
 	}
 	sl, c := ix.slots(e, l)
 	n := int(*c)
+	for _, x := range sl[:n] {
+		if x == i {
+			return // already linked: a stale edge to a node that Update re-inserts
+		}
+	}
 	if n < limit {
 		atomic.StoreInt32(&sl[n], i)
 		atomic.StoreInt32(c, int32(n+1))
@@ -583,7 +604,7 @@ func (ix *Index) repair(s *scratch) (unreachBefore, added, addedUnreach int) {
 		return
 	}
 	entry, _ := ix.entryTop()
-	unreachBefore = n - ix.reachable0()
+	unreachBefore = n - ix.reachable0() - ix.purged.Count()
 	ix.protected = make(map[uint64]bool)
 	defer func() { ix.protected = nil }()
 	indeg := make([]int32, n)
@@ -597,7 +618,7 @@ func (ix *Index) repair(s *scratch) (unreachBefore, added, addedUnreach int) {
 			}
 		}
 		for v := int32(0); int(v) < n; v++ {
-			if indeg[v] > 0 || v == entry {
+			if indeg[v] > 0 || v == entry || ix.purged.Has(int(v)) {
 				continue
 			}
 			var u int32
@@ -615,7 +636,7 @@ func (ix *Index) repair(s *scratch) (unreachBefore, added, addedUnreach int) {
 		seen := ix.reach0Set()
 		foundB := false
 		for v := int32(0); int(v) < n; v++ {
-			if seen[v] {
+			if seen[v] || ix.purged.Has(int(v)) {
 				continue
 			}
 			foundB = true
@@ -813,6 +834,7 @@ func BuildCap(vectors []float32, n, capN, dim int, params map[string]any, thread
 	}
 	ix.addS = time.Since(start).Seconds() // includes the repair pass
 	ix.buildThreads = threads
+	ix.seed = seed
 	if capN > n {
 		ix.locks = make([]sync.Mutex, capN) // for Insert
 	}
@@ -887,7 +909,7 @@ func Search(ix *Index, query []float32, k int, params map[string]any) ([]int64, 
 	}
 	mask := filterMask(params)
 	ix.filterRows.Add(ix.passCount(mask))
-	if mask != nil {
+	if mask != nil || ix.del != nil {
 		ix.searchLayerFiltered(query, cur, ef, s, mask)
 	} else {
 		d0 := s.dists
@@ -900,14 +922,16 @@ func Search(ix *Index, query []float32, k int, params map[string]any) ([]int64, 
 	s.pool = res
 	sort.Slice(res, func(a, b int) bool { return better(res[a], res[b]) })
 	for i := 0; i < k && i < len(res); i++ {
-		ids[i], scores[i] = int64(res[i].id), res[i].s
+		ids[i], scores[i] = int64(ix.rowID(res[i].id)), res[i].s
 	}
 	ix.dists.Add(s.dists)
 	return ids, scores
 }
 
 // IndexBytes returns the computed memory of the index structure (section 4):
-// number of edges x 4 bytes over all layers, plus 1 byte per node for its level.
+// number of edges x 4 bytes over all layers, plus 1 byte per node for its level,
+// plus the tombstone bit set (N/8 bytes) and, after a Compact rebuild, the
+// int32 map from node to row ID (section 13.3).
 func IndexBytes(ix *Index) int64 {
 	var edges int64
 	for _, c := range ix.cnt0 {
@@ -916,7 +940,7 @@ func IndexBytes(ix *Index) int64 {
 	for _, c := range ix.cntUpper {
 		edges += int64(c)
 	}
-	return edges*4 + int64(ix.Len())
+	return edges*4 + int64(ix.Len()) + ix.del.Bytes() + int64(len(ix.rowIDs))*4
 }
 
 // TopLayer returns the highest layer of the graph.

@@ -16,7 +16,7 @@ import (
 )
 
 func benchmark(o options, spec indexSpec, vectors []float32, n, dim int, queries []float32, q int,
-	buildParams map[string]any, searchSets []map[string]any) (*result, error) {
+	buildParams map[string]any, searchSets []map[string]any, changes changeData) (*result, error) {
 	diskann.OutPath = o.out
 	flat.DataDir, ivf.DataDir, hnsw.DataDir = o.data, o.data, o.data
 	// With inserts, the build takes the first 90% of the rows (section 12.2).
@@ -49,6 +49,13 @@ func benchmark(o options, spec indexSpec, vectors []float32, n, dim int, queries
 		},
 		Machine: machineInfo(),
 	}
+	var changeExtra map[string]any
+	if o.changeMode() {
+		inst, changeExtra, err = applyChanges(o, inst, changes)
+		if err != nil {
+			return nil, err
+		}
+	}
 	warmup(inst, queries, dim, min(o.warmup, q), o.k, searchSets[0])
 	if !o.loadMode() {
 		for _, sp := range searchSets {
@@ -56,6 +63,9 @@ func benchmark(o options, spec indexSpec, vectors []float32, n, dim int, queries
 			res.Searches = append(res.Searches, timedRun(inst, queries, dim, q, o.k, sp))
 		}
 		res.Extra = inst.idx.Extra()
+		for key, v := range changeExtra {
+			res.Extra[key] = v
+		}
 		return res, nil
 	}
 	var ins *inserter

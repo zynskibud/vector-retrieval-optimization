@@ -35,6 +35,10 @@ type options struct {
 	clients                   int     // section 12: concurrent search goroutines
 	duration                  float64 // seconds of the load loop; 0 = not given
 	insertRate                float64 // rows per second inserted during the loop
+	// Section 13: changes applied after the build.
+	deleteName, updateName string
+	compact                bool
+	compactMode            string
 }
 
 func main() {
@@ -64,6 +68,10 @@ func parseFlags(args []string) (options, error) {
 	fs.IntVar(&o.clients, "clients", 1, "concurrent search goroutines (section 12)")
 	fs.Float64Var(&o.duration, "duration", 0, "seconds of the load loop (0 = one pass; 20 in a load run)")
 	fs.Float64Var(&o.insertRate, "insert-rate", 0, "rows per second inserted during the loop (hnsw)")
+	fs.StringVar(&o.deleteName, "delete", "", "delete set del10 | del30 | del50 (section 13)")
+	fs.StringVar(&o.updateName, "update", "", "update set upd10 (section 13)")
+	fs.BoolVar(&o.compact, "compact", false, "compact after the delete or update")
+	fs.StringVar(&o.compactMode, "compact-mode", "rebuild", "rebuild | repair")
 	if err := fs.Parse(args); err != nil {
 		return o, usageError{err.Error()}
 	}
@@ -81,6 +89,9 @@ func parseFlags(args []string) (options, error) {
 	}
 	if _, ok := loadIndexes[o.index]; !ok && (o.clients > 1 || o.insertRate > 0) {
 		return o, usagef("--clients > 1 and --insert-rate need a concurrent index (hnsw), not %q", o.index)
+	}
+	if err := checkChangeFlags(o); err != nil {
+		return o, err
 	}
 	if o.loadMode() && o.duration == 0 {
 		o.duration = defaultLoadDuration
@@ -135,7 +146,16 @@ func run(args []string) error {
 		}
 	}
 
-	res, err := benchmark(o, spec, vectors, n, dim, queries, q, buildParams, searchSets)
+	// Read the change set before the build, like the filter masks.
+	changes, err := readChanges(o, n, dim)
+	if err != nil {
+		return err
+	}
+	for _, sp := range searchSets {
+		changeSearchParams(o, sp)
+	}
+
+	res, err := benchmark(o, spec, vectors, n, dim, queries, q, buildParams, searchSets, changes)
 	if err != nil {
 		return err
 	}

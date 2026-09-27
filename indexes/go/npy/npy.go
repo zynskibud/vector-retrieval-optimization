@@ -61,6 +61,25 @@ func ReadInt64(path string) (data []int64, rows, cols int, err error) {
 	return data, rows, cols, nil
 }
 
+// ReadInt64Vec reads a 1-D '<i8' array, for example update_<name>_ids.npy
+// (CONTRACT.md section 13.1).
+func ReadInt64Vec(path string) ([]int64, error) {
+	raw, h, off, err := load(path, "<i8", 1)
+	if err != nil {
+		return nil, err
+	}
+	n := h.shape[0]
+	body := raw[off:]
+	if len(body) != n*8 {
+		return nil, fmt.Errorf("npy %s: data is %d bytes, shape needs %d", path, len(body), n*8)
+	}
+	out := make([]int64, n)
+	for i := range out {
+		out[i] = int64(binary.LittleEndian.Uint64(body[i*8:]))
+	}
+	return out, nil
+}
+
 // ReadBool reads a 1-D '|b1' array (NumPy bool: one byte per element, 0 or 1).
 func ReadBool(path string) ([]bool, error) {
 	raw, h, off, err := load(path, "|b1", 1)
