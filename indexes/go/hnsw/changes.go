@@ -212,6 +212,7 @@ func (ix *Index) rebuild() (*Index, error) {
 	}
 	if len(live) < n {
 		nix.rowIDs = live
+		nix.total = n
 	}
 	return nix, nil
 }

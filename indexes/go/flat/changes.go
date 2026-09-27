@@ -78,7 +78,7 @@ func Compact(ix *Index, mode string) (*Index, error) {
 		ids = append(ids, int32(i))
 	}
 	return &Index{vectors: vecs, n: live, dim: d, trainS: ix.trainS, addS: ix.addS,
-		dists: ix.dists, passed: ix.passed, ids: ids, changed: true}, nil
+		dists: ix.dists, passed: ix.passed, ids: ids, changed: true, total: ix.n, seed: ix.seed}, nil
 }
 
 // searchChanged is Search with tombstones or an ID map. mask is indexed by

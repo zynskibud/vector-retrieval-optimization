@@ -24,12 +24,21 @@ func benchmark(o options, spec indexSpec, vectors []float32, n, dim int, queries
 	if o.insertRate > 0 {
 		nBuild = n * 9 / 10
 	}
-	fmt.Fprintf(os.Stderr, "bench: building %s on %d rows\n", o.index, nBuild)
 	var inst instance
 	var err error
-	if bc, ok := loadIndexes[o.index]; ok && o.loadMode() {
-		inst, err = bc(vectors, nBuild, n, dim, buildParams, o.threads, o.seed)
-	} else {
+	var loadS float64
+	switch {
+	case o.loadPath != "":
+		fmt.Fprintf(os.Stderr, "bench: loading %s from %s\n", o.index, o.loadPath)
+		inst, loadS, err = loadIndex(o, dim, buildParams)
+		if inst.rows == nil {
+			inst.rows = func() int { return n }
+		}
+	case loadIndexes[o.index] != nil && o.loadMode():
+		fmt.Fprintf(os.Stderr, "bench: building %s on %d rows\n", o.index, nBuild)
+		inst, err = loadIndexes[o.index](vectors, nBuild, n, dim, buildParams, o.threads, o.seed)
+	default:
+		fmt.Fprintf(os.Stderr, "bench: building %s on %d rows\n", o.index, nBuild)
 		inst, err = spec.build(vectors, n, dim, buildParams, o.threads, o.seed)
 		inst.rows = func() int { return n }
 	}
@@ -56,6 +65,27 @@ func benchmark(o options, spec indexSpec, vectors []float32, n, dim int, queries
 			return nil, err
 		}
 	}
+	fileExtra := map[string]any{}
+	if o.loadPath != "" {
+		// A loaded index has no build: train_s = add_s = 0 (section 15.2).
+		res.Build.TrainS, res.Build.AddS, res.Build.TotalS = 0, 0, 0
+		fileExtra["load_s"] = loadS
+		fileExtra["loaded_from"] = o.loadPath
+	}
+	if o.savePath != "" {
+		se, err := saveIndex(o, inst)
+		if err != nil {
+			return nil, err
+		}
+		for key, v := range se {
+			fileExtra[key] = v
+		}
+	}
+	defer func() {
+		for key, v := range fileExtra {
+			res.Extra[key] = v
+		}
+	}()
 	warmup(inst, queries, dim, min(o.warmup, q), o.k, searchSets[0])
 	if !o.loadMode() {
 		for _, sp := range searchSets {

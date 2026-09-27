@@ -59,3 +59,35 @@ func Apply(s *Set, mask []bool) int {
 	}
 	return added
 }
+
+// Bits returns the set as ceil(n/8) bytes: bit i is row i, least significant
+// bit first within a byte (the .vro "tombstones" section, CONTRACT 15.1). A
+// nil set gives all zero bytes.
+func Bits(s *Set, n int) []byte {
+	out := make([]byte, (n+7)/8)
+	if s == nil {
+		return out
+	}
+	for j := range out {
+		out[j] = byte(s.words[j>>3] >> (8 * uint(j&7)))
+	}
+	if r := n & 7; r != 0 {
+		out[len(out)-1] &= byte(1<<uint(r)) - 1
+	}
+	return out
+}
+
+// FromBits is the inverse of Bits. It returns nil when no bit is set, so an
+// index loaded with no deleted row takes the same search path as a fresh one.
+func FromBits(b []byte, n int) *Set {
+	s := New(n)
+	for i := 0; i < n; i++ {
+		if b[i>>3]&(1<<uint(i&7)) != 0 {
+			s.Add(i)
+		}
+	}
+	if s.count == 0 {
+		return nil
+	}
+	return s
+}

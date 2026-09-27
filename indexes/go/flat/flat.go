@@ -36,12 +36,15 @@ type Index struct {
 	del     *tombstone.Set
 	ids     []int32
 	changed bool // Delete, Update or Compact ran; IndexBytes counts the vectors
+	total   int  // corpus rows before Compact (the N of a saved file); 0 = n
+
+	seed uint64 // the build seed, written to the .vro header (vro.go)
 }
 
 // Build wraps the corpus. vectors is row-major (n, dim).
 func Build(vectors []float32, n, dim int, params map[string]any, threads int, seed uint64) (*Index, error) {
 	start := time.Now()
-	ix := &Index{vectors: vectors, n: n, dim: dim}
+	ix := &Index{vectors: vectors, n: n, dim: dim, seed: seed}
 	ix.addS = time.Since(start).Seconds()
 	return ix, nil
 }

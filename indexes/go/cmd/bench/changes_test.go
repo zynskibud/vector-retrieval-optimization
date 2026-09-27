@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -78,5 +79,72 @@ func TestChangeFlagsUsage(t *testing.T) {
 	}
 	if _, err := parseFlags(append(base, "--index", "ivf", "--delete", "del50", "--compact")); err != nil {
 		t.Errorf("valid flags rejected: %v", err)
+	}
+}
+
+// benchJSON runs bench as a subprocess and returns the output document.
+func benchJSON(t *testing.T, args ...string) (map[string]any, [][]int64) {
+	t.Helper()
+	out := filepath.Join(t.TempDir(), "out.json")
+	data := filepath.Join(repoRoot(), "data", "processed", "dev")
+	cmd := exec.Command(os.Args[0], append([]string{"--data", data, "--out", out, "--warmup", "10"}, args...)...)
+	cmd.Env = append(os.Environ(), "BENCH_SUBPROCESS=1")
+	if b, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("bench %v failed: %v\n%s", args, err, b)
+	}
+	raw, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	var ids struct {
+		Searches []struct {
+			IDs [][]int64 `json:"ids"`
+		} `json:"searches"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	json.Unmarshal(raw, &ids)
+	return doc, ids.Searches[0].IDs
+}
+
+// TestSaveLoadBench runs a build with --save, then a separate process with
+// --load, for flat, ivf and hnsw on 20,000 rows: the IDs are identical
+// (CONTRACT.md section 15.4). A conflicting --build value exits 2.
+func TestSaveLoadBench(t *testing.T) {
+	dir := t.TempDir()
+	for _, c := range []struct{ index, build string }{{"flat", ""}, {"ivf", "nlist=256"}, {"hnsw", ""}} {
+		path := filepath.Join(dir, c.index+".vro")
+		args := []string{"--index", c.index, "--limit", "20000", "--save", path}
+		if c.build != "" {
+			args = append(args, "--build", c.build)
+		}
+		wdoc, wids := benchJSON(t, args...)
+		ldoc, lids := benchJSON(t, "--index", c.index, "--load", path)
+		if !reflect.DeepEqual(wids, lids) {
+			t.Errorf("%s: ids differ between the write run and the load run", c.index)
+		}
+		we, le := wdoc["extra"].(map[string]any), ldoc["extra"].(map[string]any)
+		lb := ldoc["build"].(map[string]any)
+		if lb["train_s"] != 0.0 || lb["add_s"] != 0.0 || le["loaded_from"] != path || le["load_s"] == nil {
+			t.Errorf("%s: load run build %v extra %v", c.index, lb, le)
+		}
+		if we["save_s"] == nil || we["file_bytes"] == nil {
+			t.Errorf("%s: write run extra %v", c.index, we)
+		}
+		if !reflect.DeepEqual(wdoc["build_params"], ldoc["build_params"]) || ldoc["n"] != 20000.0 {
+			t.Errorf("%s: build_params %v vs %v, n %v", c.index, wdoc["build_params"], ldoc["build_params"], ldoc["n"])
+		}
+		t.Logf("%s: save_s=%v file_bytes=%v load_s=%v", c.index, we["save_s"], we["file_bytes"], le["load_s"])
+	}
+	// A --build value that conflicts with the header exits 2.
+	cmd := exec.Command(os.Args[0], "--index", "ivf", "--data", filepath.Join(repoRoot(), "data", "processed", "dev"),
+		"--out", filepath.Join(dir, "x.json"), "--load", filepath.Join(dir, "ivf.vro"), "--build", "nlist=512")
+	cmd.Env = append(os.Environ(), "BENCH_SUBPROCESS=1")
+	err := cmd.Run()
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || ee.ExitCode() != 2 {
+		t.Errorf("conflicting --build: err %v, want exit 2", err)
 	}
 }

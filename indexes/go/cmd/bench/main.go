@@ -39,6 +39,8 @@ type options struct {
 	deleteName, updateName string
 	compact                bool
 	compactMode            string
+	// Section 15: the .vro index file.
+	savePath, loadPath string
 }
 
 func main() {
@@ -72,6 +74,8 @@ func parseFlags(args []string) (options, error) {
 	fs.StringVar(&o.updateName, "update", "", "update set upd10 (section 13)")
 	fs.BoolVar(&o.compact, "compact", false, "compact after the delete or update")
 	fs.StringVar(&o.compactMode, "compact-mode", "rebuild", "rebuild | repair")
+	fs.StringVar(&o.savePath, "save", "", "write the index to this .vro file after the build and any change (section 15)")
+	fs.StringVar(&o.loadPath, "load", "", "read the index from this .vro file instead of the build (section 15)")
 	if err := fs.Parse(args); err != nil {
 		return o, usageError{err.Error()}
 	}
@@ -93,6 +97,9 @@ func parseFlags(args []string) (options, error) {
 	if err := checkChangeFlags(o); err != nil {
 		return o, err
 	}
+	if err := checkSaveFlags(o); err != nil {
+		return o, err
+	}
 	if o.loadMode() && o.duration == 0 {
 		o.duration = defaultLoadDuration
 	}
@@ -108,8 +115,16 @@ func run(args []string) error {
 	if !ok {
 		return usagef("unknown index %q", o.index)
 	}
-	buildParams, err := resolveParams(spec.buildDefaults, o.builds, "build")
-	if err != nil {
+	var buildParams map[string]any
+	var vectors []float32
+	var n, dim int
+	if o.loadPath != "" {
+		h, p, err := fileParams(o, spec.buildDefaults)
+		if err != nil {
+			return err
+		}
+		buildParams, n, dim = p, h.N, h.Dim
+	} else if buildParams, err = resolveParams(spec.buildDefaults, o.builds, "build"); err != nil {
 		return err
 	}
 	searchSets, err := searchParamSets(spec.searchDefaults, o.searches)
@@ -117,13 +132,15 @@ func run(args []string) error {
 		return err
 	}
 
-	vectors, n, dim, err := npy.ReadFloat32(filepath.Join(o.data, "vectors.npy"))
-	if err != nil {
-		return err
-	}
-	if o.limit > 0 && o.limit < n {
-		n = o.limit
-		vectors = vectors[:n*dim]
+	if o.loadPath == "" {
+		vectors, n, dim, err = npy.ReadFloat32(filepath.Join(o.data, "vectors.npy"))
+		if err != nil {
+			return err
+		}
+		if o.limit > 0 && o.limit < n {
+			n = o.limit
+			vectors = vectors[:n*dim]
+		}
 	}
 	queries, q, qdim, err := npy.ReadFloat32(filepath.Join(o.data, "queries.npy"))
 	if err != nil {
@@ -132,7 +149,9 @@ func run(args []string) error {
 	if qdim != dim {
 		return fmt.Errorf("queries have dim %d, corpus has dim %d", qdim, dim)
 	}
-	fillDerived(o.index, buildParams, n)
+	if o.loadPath == "" {
+		fillDerived(o.index, buildParams, n)
+	}
 	// Read every filter mask before the build (section 11), so a missing or
 	// short mask file fails fast (exit 1) and Search never reads a file.
 	for _, sp := range searchSets {

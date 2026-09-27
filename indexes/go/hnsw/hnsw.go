@@ -105,6 +105,7 @@ type Index struct {
 	// except after a Compact rebuild: then node j is corpus row rowIDs[j].
 	del, purged                           *tombstone.Set
 	rowIDs                                []int32
+	total                                 int // corpus rows before a Compact rebuild (the N of a saved file)
 	seed                                  uint64
 	updUnreach, updAdded, updAddedUnreach int // repair counts after Update or Compact repair
 }

@@ -54,6 +54,10 @@ type Index struct {
 	probeK *distance.TopK // center selector, reused across queries
 
 	del *tombstone.Set // Phase 5 tombstones (changes.go); nil = none
+
+	// Build parameters and seed, written to the .vro header (vro.go).
+	trainSize, iters int
+	seed             uint64
 }
 
 // intParam reads an integer parameter. bench passes int64; tests may pass int.
@@ -104,7 +108,7 @@ func Build(vectors []float32, n, dim int, params map[string]any, threads int, se
 	if threads < 1 {
 		threads = 1
 	}
-	ix := &Index{vectors: vectors, n: n, dim: dim, nlist: nlist}
+	ix := &Index{vectors: vectors, n: n, dim: dim, nlist: nlist, trainSize: trainSize, iters: iters, seed: seed}
 
 	// Train: k-means on the first trainSize rows (section 6.2).
 	start := time.Now()
