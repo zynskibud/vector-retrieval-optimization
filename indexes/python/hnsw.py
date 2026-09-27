@@ -61,6 +61,36 @@ Concurrency (CONTRACT 12)
 - After inserts, `repair(index)` copies the arrays back to lists, runs the repair pass on
   all published rows, and freezes again. Call it with no searches running.
 
+Updates and deletes (CONTRACT 13.3)
+-----------------------------------
+- delete(index, mask): a tombstone bool array in index["deleted"]. Search uses the filtered
+  search-layer with allow = not deleted (and the filter, if any): a tombstoned node is still
+  scored, enters the candidate heap, and is expanded, but never enters the result heap
+  (hnswlib markDelete). Greedy descent on the upper layers ignores tombstones.
+- update(index, ids, vectors): on a copy of the corpus array (made on the first update), the
+  batch runs in two steps. Step 1: overwrite the vectors, drop every updated node's out-edges on
+  every layer, and remove the updated nodes from all other lists (one scan over all lists).
+  Step 2: re-insert the updated nodes in row order with their existing level (the insert
+  procedure of the build). Then the repair pass. This is the per-node "delete + insert" of the
+  contract, done as one batch of deletes followed by one batch of inserts, so the list scan
+  runs once and not K times. If the entry point is updated, the re-inserts start from a
+  temporary entry point (the live node with the highest level, ties to the lowest row) until
+  the entry point itself is re-inserted; the entry point and all levels stay unchanged. In
+  that case, layers above the temporary entry point's level keep no edges (only updated nodes
+  live there), which greedy descent passes through.
+- compact(index, "rebuild"): build a new graph from the live rows (vectors copied in row
+  order) with the same m, ef_construct, and seed; levels are redrawn for the live rows in row
+  order. index["id_map"] maps node IDs to row IDs; search returns row IDs.
+- compact(index, "repair"): in place. For each live node whose list on a layer holds a deleted
+  node, the new candidates are its live neighbors plus the live neighbors of each deleted
+  neighbor (the deleted node's list on that layer); the heuristic (Algorithm 4) selects up to
+  the cap (2m on layer 0, m above). Then the deleted nodes' own lists are cleared. If the entry
+  point was deleted, the new entry point is the live node with the highest level (ties to the
+  lowest row). Then the repair pass (steps A and B) over live nodes only. The deleted nodes keep
+  their slots but have no edges and no in-edges, so no search reaches them; the tombstone
+  array is dropped. index_bytes is unchanged apart from the dropped bit set.
+- index_bytes adds the tombstone bit set (N/8) and, after a rebuild, the int64 ID map.
+
 Similarity is the dot product; a higher score is better. `distance_computations` counts every
 dot product in one search, including each row of a vectorized batch.
 """
@@ -72,7 +102,7 @@ import time
 
 import numpy as np
 
-from . import filters, splitmix
+from . import changes, filters, splitmix
 
 BUILD_PARAMS: dict = {"m": 16, "ef_construct": 100}
 SEARCH_PARAMS: dict = {"ef": 64, "filter": "none"}
@@ -444,7 +474,7 @@ class _Graph:
             adj[u] = self.select(list(zip(sc, cs)), cap, keep=protected[u])
         return True
 
-    def _unreachable0(self, entry):
+    def _unreachable0(self, entry, dead=None):
         n = self.n
         seen = bytearray(n)
         seen[entry] = 1
@@ -456,10 +486,13 @@ class _Graph:
                 if not seen[e]:
                     seen[e] = 1
                     stack.append(e)
-        return [i for i in range(n) if not seen[i]]
+        if dead is None:
+            return [i for i in range(n) if not seen[i]]
+        return [i for i in range(n) if not seen[i] and not dead[i]]
 
-    def repair(self, entry, top, ef_c):
-        """CONTRACT 6.6 repair pass. Returns (added_in_step_a, added_in_step_b)."""
+    def repair(self, entry, top, ef_c, dead=None):
+        """CONTRACT 6.6 repair pass. Returns (added_in_step_a, added_in_step_b).
+        dead: optional bool (n,); these nodes are skipped (compact repair mode)."""
         v, adj, cap = self.v, self.adj[0], 2 * self.m
         protected: dict[int, set] = {}
         added_a = added_b = 0
@@ -469,7 +502,7 @@ class _Graph:
             # Step A: nodes with zero layer-0 in-degree, in row order, entry point skipped.
             deg = self.in_degree0()
             for x in np.flatnonzero(deg == 0).tolist():
-                if x == entry:
+                if x == entry or (dead is not None and dead[x]):
                     continue
                 if adj[x]:
                     cands = adj[x]
@@ -482,7 +515,7 @@ class _Graph:
                     u = near[0]
                 added_a += self._add_protected(u, x, protected)
             # Step B: nodes not reached by a directed BFS from the entry point.
-            unreached = self._unreachable0(entry)
+            unreached = self._unreachable0(entry, dead)
             for x in unreached:
                 near = self._nearest_from_entry(x, entry, top, ef_c)
                 if not near:
@@ -492,6 +525,65 @@ class _Graph:
             if not unreached:
                 break
         return added_a, added_b
+
+
+def _pick_entry(levels: np.ndarray, live: np.ndarray) -> tuple[int, int]:
+    """The live node with the highest level, ties to the lowest row."""
+    cand = np.flatnonzero(live)
+    lv = levels[cand]
+    best = int(cand[np.flatnonzero(lv == lv.max())[0]])
+    return best, int(levels[best])
+
+
+def _update_nodes(g: _Graph, ids: list, ep: int, top: int, ef_c: int) -> None:
+    """Thawed graph: step 1 and step 2 of update (module docstring)."""
+    pend = set(ids)
+    for adj in g.adj:
+        for node, nb in enumerate(adj):
+            if nb is None:
+                continue
+            if node in pend:
+                adj[node] = []
+            elif any(e in pend for e in nb):
+                adj[node] = [e for e in nb if e not in pend]
+    if ep in pend:
+        live = np.ones(g.n, dtype=bool)
+        live[list(pend)] = False
+        start, s_top = _pick_entry(g.levels[: g.n], live)
+    else:
+        start, s_top = ep, top
+    for i in sorted(pend):
+        g.insert(i, start, s_top, ef_c)
+        if i == ep:
+            start, s_top = ep, top
+
+
+def _refill(g: _Graph, dead: np.ndarray) -> None:
+    """Thawed graph: repair-mode compaction of the lists (module docstring)."""
+    v = g.v
+    for layer, adj in enumerate(g.adj):
+        cap = 2 * g.m if layer == 0 else g.m
+        for x, nb in enumerate(adj):
+            if nb is None or dead[x] or not any(dead[e] for e in nb):
+                continue
+            cands = [e for e in nb if not dead[e]]
+            seen = set(cands)
+            seen.add(x)
+            for d in nb:
+                if dead[d]:
+                    for e in adj[d]:
+                        if not dead[e] and e not in seen:
+                            seen.add(e)
+                            cands.append(e)
+            if cands:
+                s = (v[cands] @ v[x]).tolist()
+                adj[x] = g.select(list(zip(s, cands)), cap)
+            else:
+                adj[x] = []
+    for adj in g.adj:
+        for x in np.flatnonzero(dead).tolist():
+            if adj[x] is not None:
+                adj[x] = []
 
 
 def build(vectors: np.ndarray, params: dict, threads: int, seed: int, n_build: int | None = None) -> dict:
@@ -522,6 +614,8 @@ def build(vectors: np.ndarray, params: dict, threads: int, seed: int, n_build: i
         "ef_construct": ef_c,
         "global_lock": threading.Lock(),
         "m": m,
+        "seed": seed,
+        "n_orig": len(vectors),
         "train_s": 0.0,
         "add_s": add_s,
         "extra": {
@@ -550,8 +644,8 @@ def search(index: dict, query: np.ndarray, k: int, params: dict) -> tuple[np.nda
     g.dist = 1
     for layer in range(top, 0, -1):
         ep, ep_s = g.greedy(query, ep, ep_s, layer)
-    # The upper-layer descent above ignores the filter; only layer 0 applies it.
-    mask = filters.mask(DATA_DIR, params.get("filter", "none"), len(g.v))
+    # The upper-layer descent above ignores the filter and tombstones; only layer 0 applies them.
+    mask = _allow(index, str(params.get("filter", "none")))
     if mask is None:
         w = g.search_layer(query, [(ep_s, ep)], ef, 0)
         index["search_extra"] = {"filter_rows": len(g.v), "visited": g.expanded}
@@ -561,9 +655,31 @@ def search(index: dict, query: np.ndarray, k: int, params: dict) -> tuple[np.nda
     w.sort(key=lambda t: (-t[0], t[1]))
     w = w[:k]
     out_ids[: len(w)] = [i for _, i in w]
+    id_map = index.get("id_map")
+    if id_map is not None and len(w):
+        out_ids[: len(w)] = id_map[out_ids[: len(w)]]
     out_scores[: len(w)] = [s for s, _ in w]
     index["distance_computations"] = g.dist
     return out_ids, out_scores
+
+
+def _allow(index: dict, name: str):
+    """bool (n,) of nodes allowed into the result heap, or None (all). Cached per filter."""
+    dead = index.get("deleted")
+    id_map = index.get("id_map")
+    if name == "none" and dead is None:
+        return None
+    cache = index.setdefault("allow", {})
+    if name not in cache:
+        n = len(index["graph"].v)
+        allow = np.ones(n, dtype=bool)
+        if name != "none":
+            fm = filters.mask(DATA_DIR, name, index.get("n_orig", n))
+            allow &= fm if id_map is None else fm[id_map]
+        if dead is not None:
+            allow &= ~dead
+        cache[name] = allow
+    return cache[name]
 
 
 def index_bytes(index: dict) -> int:
@@ -571,7 +687,92 @@ def index_bytes(index: dict) -> int:
     n = len(g.v)
     total_up = int(g.levels.sum())
     slots = n * 2 * g.m + total_up * g.m
-    return 4 * slots + 4 * (n + total_up) + 4 * n + 4 * n
+    total = 4 * slots + 4 * (n + total_up) + 4 * n + 4 * n
+    if index.get("deleted") is not None:
+        total += changes.tombstone_bytes(len(index["deleted"]))
+    if index.get("id_map") is not None:
+        total += int(index["id_map"].nbytes)
+    return total
+
+
+def clone(index: dict) -> dict:
+    """Deep copy of a frozen index (graph arrays, vectors, tombstones). For tests."""
+    g = index["graph"]
+    h = _Graph.__new__(_Graph)
+    h.v, h.n, h.m, h.levels = g.v.copy(), g.n, g.m, g.levels.copy()
+    for a in ("nbr0", "cnt0", "up_off", "up", "up_cnt"):
+        setattr(h, a, getattr(g, a).copy())
+    h.adj, h.frozen = None, True
+    h._tls = threading.local()
+    h.locks = [threading.Lock() for _ in range(N_STRIPES)]
+    out = {k: v for k, v in index.items() if k not in ("graph", "allow", "global_lock")}
+    for k in ("deleted", "id_map"):
+        if out.get(k) is not None:
+            out[k] = out[k].copy()
+    out["graph"], out["global_lock"], out["extra"] = h, threading.Lock(), dict(index.get("extra", {}))
+    return out
+
+
+def delete(index: dict, mask: np.ndarray) -> dict:
+    """Tombstone the rows in mask (bool, one per node)."""
+    index["deleted"] = np.asarray(mask, dtype=bool).copy()
+    index.pop("allow", None)
+    return index
+
+
+def update(index: dict, ids, vectors) -> dict:
+    """Replace the vectors of nodes `ids` (module docstring). No searches may run."""
+    g = index["graph"]
+    if index.get("id_map") is not None:
+        raise ValueError("hnsw.update: index is compacted; update before compaction")
+    ids = [int(i) for i in ids]
+    if not index.get("owned"):
+        g.v = g.v.copy()
+        index["owned"] = True
+    g.v[ids] = vectors
+    g.thaw()
+    ep, top = index["ept"]
+    _update_nodes(g, ids, ep, top, index["ef_construct"])
+    added = g.repair(ep, top, index["ef_construct"])
+    g.freeze()
+    index["extra"]["update_repair_added"] = int(added[0])
+    index["extra"]["update_repair_added_unreachable"] = int(added[1])
+    index.pop("allow", None)
+    return index
+
+
+def compact(index: dict, mode: str = "rebuild") -> dict:
+    """mode "rebuild" returns a new index; mode "repair" changes this one (module docstring)."""
+    g = index["graph"]
+    dead = index.get("deleted")
+    if mode == "rebuild":
+        live = np.arange(g.n, dtype=np.int64) if dead is None else np.flatnonzero(~dead[: g.n]).astype(np.int64)
+        new = build(np.ascontiguousarray(g.v[live]), {"m": index["m"], "ef_construct": index["ef_construct"]},
+                    1, index["seed"])
+        old_map = index.get("id_map")
+        new["id_map"] = live if old_map is None else old_map[live]
+        new["n_orig"] = index.get("n_orig", len(g.v))
+        new["owned"] = True
+        return new
+    if mode != "repair":
+        raise ValueError(f"unknown compact mode {mode!r}")
+    if dead is None:
+        return index
+    dead = dead[: g.n]
+    g.thaw()
+    _refill(g, dead)
+    ep, top = index["ept"]
+    if dead[ep]:
+        ep, top = _pick_entry(g.levels[: g.n], ~dead)
+    added = g.repair(ep, top, index["ef_construct"], dead=dead)
+    g.freeze()
+    index["ept"] = (ep, top)
+    index["entry"], index["top"] = ep, top
+    index["extra"]["compact_repair_added"] = int(added[0])
+    index["extra"]["compact_repair_added_unreachable"] = int(added[1])
+    index.pop("deleted", None)
+    index.pop("allow", None)
+    return index
 
 
 def insert(index: dict, ids, vectors=None) -> None:

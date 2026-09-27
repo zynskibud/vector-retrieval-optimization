@@ -7,13 +7,23 @@ bench fills it in before build (6.2).
 
 Layout (CSR): list_ids is one contiguous int64 array of vector IDs, grouped by list.
 The IDs of list c are list_ids[offsets[c] : offsets[c + 1]], in ascending ID order.
+
+Phase 5 (CONTRACT 13.3):
+- delete(index, mask): tombstone bool array; search drops tombstoned IDs from the probed lists
+  before scoring, so distance_computations counts only scored rows (as for a filter).
+- update(index, ids, vectors): overwrite the vectors (in a copy of the corpus array made on the
+  first update), assign each updated ID to its new best center, and rebuild the CSR arrays with
+  one stable sort by (list, ID), so each list keeps ascending IDs.
+- compact(index, mode): drop tombstoned IDs from list_ids and recompute offsets; the tombstone
+  array is dropped. The corpus array is not touched (lists hold row IDs). Both modes are the same.
+- index_bytes adds the tombstone bit set (N/8) while tombstones exist.
 """
 
 import time
 
 import numpy as np
 
-from . import distance, filters, kmeans
+from . import changes, distance, filters, kmeans
 
 BUILD_PARAMS: dict = {"nlist": 1024, "train_size": None, "iters": 20}
 SEARCH_PARAMS: dict = {"nprobe": 8, "filter": "none"}
@@ -69,11 +79,64 @@ def search(index: dict, query: np.ndarray, k: int, params: dict) -> tuple[np.nda
     ids = np.concatenate([list_ids[offsets[c] : offsets[c + 1]] for c in probe])
     mask = filters.mask(DATA_DIR, params.get("filter", "none"), len(index["vectors"]))
     if mask is not None:
-        ids = ids[mask[ids]]  # skip rows that fail the filter; only passing rows are scored
+        ids = ids[mask[ids]]
+    dead = index.get("deleted")
+    if dead is not None:
+        ids = ids[~dead[ids]]  # skip tombstoned rows  # skip rows that fail the filter; only passing rows are scored
     index["distance_computations"] = nlist + len(ids)
     index["search_extra"] = {"filter_rows": len(index["vectors"]) if mask is None else int(filters.count(mask))}
     return distance.top_k(distance.scores(query, index["vectors"][ids]), k, ids)
 
 
 def index_bytes(index: dict) -> int:
-    return int(index["centers"].nbytes + index["list_ids"].nbytes)
+    total = int(index["centers"].nbytes + index["list_ids"].nbytes)
+    if index.get("deleted") is not None:
+        total += changes.tombstone_bytes(len(index["deleted"]))
+    return total
+
+
+def _set_lists(index: dict, ids: np.ndarray, labels: np.ndarray) -> None:
+    """Rebuild the CSR arrays from (ID, list) pairs; IDs ascend inside each list."""
+    order = np.lexsort((ids, labels))
+    index["list_ids"] = np.ascontiguousarray(ids[order]).astype(np.int64)
+    counts = np.bincount(labels, minlength=index["nlist"])
+    offsets = np.zeros(index["nlist"] + 1, dtype=np.int64)
+    np.cumsum(counts, out=offsets[1:])
+    index["offsets"] = offsets
+
+
+def _labels(index: dict) -> np.ndarray:
+    counts = np.diff(index["offsets"])
+    return np.repeat(np.arange(index["nlist"], dtype=np.int64), counts)
+
+
+def delete(index: dict, mask: np.ndarray) -> dict:
+    index["deleted"] = np.asarray(mask, dtype=bool).copy()
+    return index
+
+
+def update(index: dict, ids: np.ndarray, vectors: np.ndarray) -> dict:
+    ids = np.asarray(ids, dtype=np.int64)
+    if not index.get("owned"):
+        index["vectors"] = index["vectors"].copy()
+        index["owned"] = True
+    index["vectors"][ids] = vectors
+    new = np.argmax(np.asarray(vectors) @ index["centers"].T, axis=1).astype(np.int64)
+    list_ids = index["list_ids"]
+    labels = _labels(index)
+    by_id = np.full(len(index["vectors"]), -1, dtype=np.int64)
+    by_id[list_ids] = labels
+    present = by_id[ids] >= 0  # an ID dropped by compaction stays out
+    by_id[ids[present]] = new[present]
+    _set_lists(index, list_ids, by_id[list_ids])
+    return index
+
+
+def compact(index: dict, mode: str = "rebuild") -> dict:
+    dead = index.pop("deleted", None)
+    if dead is not None:
+        list_ids = index["list_ids"]
+        labels = _labels(index)
+        keep = ~dead[list_ids]
+        _set_lists(index, list_ids[keep], labels[keep])
+    return index
