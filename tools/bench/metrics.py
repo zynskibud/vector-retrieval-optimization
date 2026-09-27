@@ -109,7 +109,10 @@ def summarize(doc: dict, ground_truth, k: int = 10, delete_masks: dict | None = 
     rows = []
     for run in doc["searches"]:
         filt = filter_of(run)
-        _, recall = recall_at_k(run["ids"], truth_for(ground_truth, truth_key(run)), k)
+        if doc["language"] == "cache":
+            recall = cache_recall(run, truth_for(ground_truth, "none"), k)
+        else:
+            _, recall = recall_at_k(run["ids"], truth_for(ground_truth, truth_key(run)), k)
         lat = latency_stats(run["latency_ms"])
         rows.append({
             "language": doc["language"], "index": doc["index"], "n": doc["n"],
@@ -124,8 +127,35 @@ def summarize(doc: dict, ground_truth, k: int = 10, delete_masks: dict | None = 
             # Phase 4 (CONTRACT section 12): load runs have extra.clients; recall is from worker 0's first pass.
             **load_fields(run),
             **change_fields(doc, run, delete_masks),
+            **cache_fields(doc, run),
         })
     return rows
+
+
+CACHE_EXTRA = ("hit_rate", "embed_p50_ms", "search_p50_ms", "e2e_p50_ms", "e2e_p99_ms", "entries", "cache_bytes",
+               "evictions", "hit_rate_after_invalidate", "recall_on_queries")
+
+
+def cache_recall(run: dict, ground_truth, k: int) -> float:
+    """Recall@k of a cache run (CONTRACT section 14.3): row i of ids is request i; only the rows
+    whose extra.request_pool_ids[i] < Q are query texts, scored against ground_truth[pool_id]."""
+    pool = np.asarray(run["extra"]["request_pool_ids"], dtype=np.int64)
+    rows = np.flatnonzero(pool < len(ground_truth))
+    if rows.size == 0:
+        return float("nan")
+    ids = np.asarray(run["ids"], dtype=np.int64)[rows]
+    return recall_at_k(ids, np.asarray(ground_truth)[pool[rows]], k)[1]
+
+
+def cache_fields(doc: dict, run: dict) -> dict:
+    """Phase 6 columns of one search run; NaN / "" when the run is not a cache run."""
+    nan = float("nan")
+    if doc["language"] != "cache":
+        return {"backend": "", "capacity": nan, "workload": "", "invalidate_at": nan, **{c: nan for c in CACHE_EXTRA}}
+    sp, ex = run["search_params"], run["extra"]
+    val = lambda v: nan if v is None else v
+    return {"backend": sp["backend"], "capacity": sp["capacity"], "workload": sp["workload"],
+            "invalidate_at": sp.get("invalidate_at", nan), **{c: val(ex.get(c)) for c in CACHE_EXTRA}}
 
 
 def change_fields(doc: dict, run: dict, delete_masks: dict | None) -> dict:

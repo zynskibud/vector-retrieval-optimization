@@ -3,7 +3,7 @@
 RUN   := docker compose run --rm bench
 SETUP := docker compose run --rm setup
 
-.PHONY: image setup build test bench report shell clean-raw db-up db-down dbbench db-test bench-db load load-db changes changes-db
+.PHONY: image setup build test bench report shell clean-raw db-up db-down dbbench db-test bench-db load load-db changes changes-db cache cache-up cache-down cache-test
 
 image:
 	docker compose build
@@ -70,3 +70,15 @@ changes:
 	$(RUN) uv run --frozen python -m tools.bench.runner --changes $(ARGS)
 changes-db:
 	docker compose --profile db run --rm dbbench uv run --frozen python -m tools.bench.runner --changes $(ARGS)
+
+## Phase 6 embedding cache (CONTRACT section 14): Redis under the cache profile, the sweep inside
+## dbbench (on the Redis network). e.g. make cache-up; make cache ARGS="--data data/processed/dev"; make cache-down
+cache-up:
+	docker compose --profile cache up -d redis
+cache-down:
+	docker compose --profile cache down
+cache:
+	docker compose --profile db run --rm dbbench uv run --frozen python -m tools.bench.runner --cache $(ARGS)
+## the cache tests, Redis included (after make cache-up)
+cache-test:
+	docker compose --profile db run --rm dbbench uv run --frozen pytest tools/cache/tests -q

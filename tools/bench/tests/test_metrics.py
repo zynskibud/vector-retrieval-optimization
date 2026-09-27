@@ -176,3 +176,13 @@ def test_plot_delete_and_change_cases(tmp_path):
         df[col] = 0
     df["index"] = "hnsw"
     assert "del30" in change_table(df)
+
+
+def test_cache_recall_uses_pool_ids():
+    from tools.bench.tests.test_schema import make_cache_doc
+
+    doc = make_cache_doc()  # ids rows [0, 1], [2, 3], [4, -1]; pool ids 0, 7, 1
+    gt = np.array([[0, 1], [4, 9]])  # 2 queries: pool 0 and 1; pool 7 is a corpus text
+    row = summarize(doc, gt, k=2)[0]
+    assert row["recall@2"] == pytest.approx((1.0 + 0.5) / 2)
+    assert row["backend"] == "lru" and row["hit_rate"] == 0.25

@@ -14,6 +14,12 @@ Decisions that need the human, the default the session took, and its effect. New
 - **Default taken (CONTRACT section 15):** one little-endian `.vro` file format with a JSON header and a section table, shared by the four languages (a Rust file loads in Go, C++, Python), for flat, ivf, hnsw; a loaded index needs no rebuild and returns identical IDs. Databases: Qdrant snapshots, pg_dump / pg_restore (which rebuilds the HNSW index, measured), Milvus cold backup of its data volume because milvus-backup needs object storage that the local-storage setup does not have. Five Opus 5.5 agents.
 - **Effect:** the cross-language load is a strong check that the four implementations hold the same graph; the pgvector restore time includes an index rebuild, which the report marks.
 
+## 2026-09-26: Phase 6 implementation defaults (Redis capacity, thread count, workload files)
+
+- **Question:** four points where CONTRACT section 14 leaves a choice.
+- **Default taken:** (1) `--capacity` is a label for the Redis backend. Redis has no entry limit; its limit is `maxmemory` 512 MB, and the 5,000-text pool (7.7 MB) always fits. So the three Redis runs at 500, 2,000, 5,000 measure the same cache three times and show run-to-run variance instead. (2) The embedding model runs on 1 torch thread (`--embed-threads 1`), the one-thread search rule of CONTRACT section 4. A miss costs about 80 ms per text at 1 thread; with 6 threads it would cost less. (3) The workload Parquet files go to `results/raw/<data>/workloads/`, not the data directory, because the repository is read-only in the container. (4) `cache_bytes` for Redis is the server's `used_memory` (keys and allocator overhead included); for lru it is entries × 1,536 bytes. The agent's 20,000-request runs under a host load of 17 to 29 are not kept; the cache-sweep job reruns everything at 50,000 requests under the timing lock.
+- **Effect:** the Redis column of `hnsw-cache.png` is flat against capacity. The miss cost in the table is a 1-thread number. If you want a real Redis capacity sweep, the bench must set `maxmemory` per run.
+
 ## 2026-09-26: Phase 6 design taken without human review
 
 - **Question:** how to measure an embedding cache.

@@ -108,3 +108,28 @@ def test_phase():
     assert validate(doc) == []
     doc["searches"][0]["search_params"]["phase"] = "during"
     assert "phase" in validate(doc)[0]
+
+
+def make_cache_doc() -> dict:
+    doc = make_doc()
+    doc["language"], doc["index"] = "cache", "hnsw"
+    run = doc["searches"][0]
+    run["search_params"] = {"backend": "lru", "capacity": 2, "workload": "zipf", "model_version": "v1"}
+    run["latency_ms"] = [0.1, 0.2, 0.3, 0.4]
+    run["distance_computations"] = None
+    run["extra"] = {"requests": 4, "hit_rate": 0.25, "embed_p50_ms": 5.0, "search_p50_ms": 0.1, "e2e_p50_ms": 1.0,
+                    "e2e_p99_ms": 6.0, "entries": 2, "cache_bytes": 3072, "evictions": 1, "request_pool_ids": [0, 7, 1]}
+    return doc
+
+
+def test_cache_doc():
+    assert validate(make_cache_doc()) == []
+    doc = make_cache_doc()
+    doc["searches"][0]["latency_ms"].pop()
+    assert validate(doc) == ["searches[0].latency_ms: 3 values, but extra.requests = 4"]
+    doc = make_cache_doc()
+    del doc["searches"][0]["extra"]["hit_rate"]
+    assert validate(doc) == ["searches[0].extra: missing key 'hit_rate'"]
+    doc = make_cache_doc()
+    doc["searches"][0]["search_params"]["invalidate_at"] = 2
+    assert validate(doc) == ["searches[0].extra: missing key 'hit_rate_after_invalidate' (search_params has invalidate_at)"]

@@ -8,7 +8,7 @@ import json
 import sys
 from pathlib import Path
 
-LANGUAGES = {"python", "go", "cpp", "rust", "faiss", "qdrant", "pgvector", "milvus"}  # faiss = the reference (tools/bench/faiss_ref.py)
+LANGUAGES = {"python", "go", "cpp", "rust", "faiss", "qdrant", "pgvector", "milvus", "cache"}  # faiss = the reference (tools/bench/faiss_ref.py); cache = Phase 6 (tools/cache/bench.py)
 INDEXES = {"flat", "ivf", "pq", "ivf_pq", "hnsw", "diskann"}
 TOP_KEYS = {
     "contract_version": int, "language": str, "index": str, "data_dir": str, "n": int, "dim": int,
@@ -21,6 +21,11 @@ MACHINE_KEYS = {"os": str, "arch": str, "cpu": str, "cores": int}
 # A load run (CONTRACT section 12.1) has extra.clients; it then needs these keys in extra.
 LOAD_KEYS = {"errors": int, "cpu_pct": float, "clients": int, "duration_s": float, "queries_done": int}
 PHASES = {"after_inserts"}  # search_params.phase (CONTRACT section 12.2)
+# A cache run (language "cache", CONTRACT section 14.3) needs these keys in search_params and extra.
+# Its latency_ms has one value per request (extra.requests), not q.
+CACHE_PARAMS = {"backend": str, "capacity": int, "workload": str, "model_version": str}
+CACHE_KEYS = {"requests": int, "hit_rate": float, "embed_p50_ms": float, "search_p50_ms": float, "e2e_p50_ms": float,
+              "e2e_p99_ms": float, "entries": int, "cache_bytes": int, "evictions": int, "request_pool_ids": list}
 
 
 def _is(value, typ) -> bool:
@@ -99,6 +104,15 @@ def validate(doc) -> list[str]:
                                 lambda v: v is None or _is(v, float), "float or null")
         extra = run.get("extra") if isinstance(run.get("extra"), dict) else {}
         is_load = "clients" in extra
+        is_cache = doc.get("language") == "cache"
+        if is_cache:
+            errors += _check_keys(extra, CACHE_KEYS, f"{where}.extra")
+            if isinstance(run.get("search_params"), dict):
+                errors += _check_keys(run["search_params"], CACHE_PARAMS, f"{where}.search_params")
+            if isinstance(extra.get("request_pool_ids"), list) and len(extra["request_pool_ids"]) != q:
+                errors.append(f"{where}.extra.request_pool_ids: expected {q} values, got {len(extra['request_pool_ids'])}")
+            if "invalidate_at" in (run.get("search_params") or {}) and "hit_rate_after_invalidate" not in extra:
+                errors.append(f"{where}.extra: missing key 'hit_rate_after_invalidate' (search_params has invalidate_at)")
         if is_load:
             errors += _check_keys(extra, LOAD_KEYS, f"{where}.extra")
             if _is(extra.get("clients"), int) and extra["clients"] < 1:
@@ -114,6 +128,11 @@ def validate(doc) -> list[str]:
                     errors.append(f"{where}.latency_ms: a load run needs at least one value")
                 elif _is(extra.get("queries_done"), int) and len(lat) != extra["queries_done"]:
                     errors.append(f"{where}.latency_ms: {len(lat)} values, but extra.queries_done = {extra['queries_done']}")
+                elif not all(_is(v, float) and v >= 0 for v in lat):
+                    errors.append(f"{where}.latency_ms: every value must be a number >= 0")
+            elif is_cache:
+                if _is(extra.get("requests"), int) and len(lat) != extra["requests"]:
+                    errors.append(f"{where}.latency_ms: {len(lat)} values, but extra.requests = {extra['requests']}")
                 elif not all(_is(v, float) and v >= 0 for v in lat):
                     errors.append(f"{where}.latency_ms: every value must be a number >= 0")
             elif len(lat) != q:

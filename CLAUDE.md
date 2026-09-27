@@ -124,7 +124,12 @@ make dbbench ARGS="--db qdrant --index hnsw --data data/processed/dev --out resu
 make load ARGS="--data data/processed/dev --languages rust,cpp,go,python"     # Phase 4: hnsw load runs, clients 1..64 (timing: lock)
 make load-db ARGS="--data data/processed/dev --languages qdrant"               # Phase 4: databases, dbbench container
 docker compose --profile db run --rm dbbench uv run --frozen python -m tools.load.bench --db qdrant --index hnsw --data data/processed/dev --out results/raw/dev/x.json --clients 8 --duration 20
-scripts/run.sh dev-sweep | db-sweep | load-sweep                               # timing jobs, only after the coordinator's GO
+make cache-up && make cache-test; make cache-down                             # Phase 6: Redis (profile cache), cache tests in dbbench
+docker compose run --rm bench uv run --frozen pytest tools/cache/tests -q     # Phase 6 tests without Redis (Redis tests skip)
+docker compose run --rm bench uv run --frozen python -m tools.cache.workload --data data/processed/dev   # zipf + uniform -> results/raw/dev/workloads/
+docker compose --profile db run --rm dbbench uv run --frozen python -m tools.cache.bench --data data/processed/dev --workload zipf --backend lru --capacity 2000 --out results/raw/dev/cache-lru-c2000-zipf.json
+make cache-up && make cache ARGS="--data data/processed/dev"; make cache-down  # Phase 6 sweep (timing: lock) -> cache-<backend>-c<cap>-<workload>[-inv].json
+scripts/run.sh dev-sweep | db-sweep | load-sweep | changes-sweep | cache-sweep  # timing jobs, only after the coordinator's GO
 ```
 
 Rules:

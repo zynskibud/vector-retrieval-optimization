@@ -6,7 +6,10 @@ the filter's selectivity, one line per system, at the default search setting; an
 with load runs (extra.clients, CONTRACT section 12) <index>-load.png: QPS and p99 against clients;
 and for each index with delete runs (search_params.deleted, CONTRACT section 13) <index>-delete.png:
 recall@10 and p50 against the deleted fraction (0 = the unchanged runs), solid before and dashed
-after compaction, plus a "Updates, deletes, compaction" table in results.md.
+after compaction, plus a "Updates, deletes, compaction" table in results.md; and for cache runs
+(language "cache", CONTRACT section 14) hnsw-cache.png: hit rate and end-to-end p50 against
+capacity for lru and redis on the zipf workload, with the none backend as a horizontal line,
+plus an "Embedding cache" table in results.md.
 
 Run: uv run python -m tools.bench.report --data data/processed/dev
 """
@@ -69,6 +72,7 @@ def load_rows(raw: Path, gt, filters: dict | None = None, delete_masks: dict | N
             r["is_load"] = not pd.isna(r["clients"])
             r["load_line"] = r["language"] + (" +inserts" if r["insert_rate"] else "")
             r["is_change"] = bool(r["deleted"] or r["updated"])
+            r["is_cache"] = r["language"] == "cache"
             r["deleted_fraction"] = DELETE_FRACTION.get(r["deleted"], 0.0 if not r["updated"] else np.nan)
             rows.append(r)
     return pd.DataFrame(rows)
@@ -190,6 +194,50 @@ def plot_delete(df: pd.DataFrame, index: str, title: str, out: Path) -> bool:
     return True
 
 
+CACHE_COLS = ["backend", "capacity", "workload", "invalidate_at", "hit_rate", "hit_rate_after_invalidate", "embed_p50_ms",
+              "search_p50_ms", "e2e_p50_ms", "e2e_p99_ms", "entries", "cache_bytes", "evictions", "recall@10",
+              "recall_on_queries", "file"]
+
+
+def cache_table(df: pd.DataFrame) -> str:
+    g = df[df["is_cache"]].sort_values(["workload", "backend", "capacity", "invalidate_at"])
+    return md_table(g[CACHE_COLS]) if not g.empty else ""
+
+
+def plot_cache(df: pd.DataFrame, title: str, out: Path) -> bool:
+    """Hit rate (left y) and e2e p50 (right y) against capacity, lru and redis on zipf without
+    invalidation; the none backend's e2e p50 as a horizontal line. False when there is no cache run."""
+    g = df[df["is_cache"] & (df["workload"] == "zipf") & df["invalidate_at"].isna()]
+    if g.empty:
+        return False
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax2 = ax.twinx()
+    colors = {"lru": "C0", "redis": "C1"}
+    for backend in ("lru", "redis"):
+        h = g[g["backend"] == backend].groupby("capacity", as_index=False)[["hit_rate", "e2e_p50_ms"]].median().sort_values("capacity")
+        if h.empty:
+            continue
+        ax.plot(h["capacity"], h["hit_rate"], "-", marker="o", color=colors[backend], label=f"{backend} hit rate")
+        ax2.plot(h["capacity"], h["e2e_p50_ms"], "--", marker="s", color=colors[backend], label=f"{backend} e2e p50")
+    none = g[g["backend"] == "none"]
+    if not none.empty:
+        ax2.axhline(float(none["e2e_p50_ms"].median()), color="gray", linestyle=":", label="none e2e p50")
+    ax.set_xscale("log")
+    ax.set_xlabel("capacity (entries; redis: label only, the limit is maxmemory 512 MB)")
+    ax.set_ylabel("hit rate (solid)")
+    ax2.set_ylabel("end-to-end p50 (ms, dashed)")
+    ax.set_ylim(0, 1)
+    ax.grid(True, alpha=0.3)
+    lines = ax.get_legend_handles_labels()
+    lines2 = ax2.get_legend_handles_labels()
+    ax.legend(lines[0] + lines2[0], lines[1] + lines2[1], fontsize=8, loc="center right")
+    ax.set_title(f"hnsw with an embedding cache, zipf workload: {title}")
+    fig.tight_layout()
+    fig.savefig(out, dpi=120)
+    plt.close(fig)
+    return True
+
+
 CHANGE_COLS = ["index", "language", "deleted", "updated", "compacted", "recall@10", "deleted_returned", "p50_ms",
                "delete_s", "update_s", "compact_s", "index_bytes", "index_bytes_after", "disk_bytes", "disk_bytes_after", "file"]
 
@@ -220,13 +268,20 @@ def main() -> None:
     for index, g in df.groupby("index"):
         md += [f"## {index}", "", md_table(g[cols[1:]]), ""]
         # The latency-recall plot keeps the unfiltered runs only, as before Phase 3.
-        static = g[~g["is_load"] & (g["phase"] == "") & ~g["is_change"]]
+        static = g[~g["is_load"] & (g["phase"] == "") & ~g["is_change"] & ~g["is_cache"]]
         if not static.empty:
             plot(static[static["filter"] == "none"], index, f"{name}, n = {g['n'].iloc[0]:,}",
                  out / f"{index}.png")
         plot_filter(static, index, f"{name}, n = {g['n'].iloc[0]:,}", out / f"{index}-filter.png")
         plot_load(g, index, f"{name}, n = {g['n'].iloc[0]:,}", out / f"{index}-load.png")
         plot_delete(g, index, f"{name}, n = {g['n'].iloc[0]:,}", out / f"{index}-delete.png")
+    plot_cache(df, f"{name}, n = {df['n'].iloc[0]:,}", out / "hnsw-cache.png")
+    ctable = cache_table(df)
+    if ctable:
+        md += ["## Embedding cache (CONTRACT section 14)", "",
+               "FAISS HNSW (m=16, ef_construct=100, ef=64) behind the embedding model. Times in ms; embed_p50 over misses only; "
+               "e2e = cache lookup + embed on a miss + search. recall@10 is over the first 1,000 requests whose text is a query.",
+               "", ctable, ""]
     table = change_table(df)
     if table:
         md += ["## Updates, deletes, compaction (CONTRACT section 13)", "",

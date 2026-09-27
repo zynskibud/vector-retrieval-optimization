@@ -18,6 +18,13 @@ search setting, repeat 1. Languages run flat, ivf, hnsw; databases every support
 Outputs: results/raw/<data-name>/chg-<system>-<index>-<change>[-compact].json
   make changes    ARGS="--data data/processed/dev --languages rust,cpp,go,python"
   make changes-db ARGS="--data data/processed/dev --languages qdrant"   (after make db-up DB=qdrant)
+
+Cache mode (Phase 6, CONTRACT section 14.3): --cache runs tools.cache.bench for backend none
+(once), lru and redis at capacity 500, 2000, 5000 on the zipf workload, one uniform run per
+backend (capacity 2000), and one lru run with --invalidate-at 25000. Repeat 1. Runs inside
+dbbench so Redis is reachable; --backends none,lru skips Redis.
+Outputs: results/raw/<data-name>/cache-<backend>-c<capacity>-<workload>[-inv].json
+  make cache ARGS="--data data/processed/dev"   (after make cache-up)
 """
 
 import argparse
@@ -35,6 +42,7 @@ from pathlib import Path
 from tools.bench.schema import validate
 
 PROGRAMS = {
+    "cache": ["uv", "run", "python", "-m", "tools.cache.bench"],  # Phase 6: only through --cache
     "python": ["uv", "run", "python", "-m", "indexes.python.bench"],
     "go": ["indexes/go/bin/bench"],
     "cpp": ["indexes/cpp/build/bench"],
@@ -47,7 +55,7 @@ PROGRAMS = {
 }
 PYTHON_MODULES = {"python": Path("indexes/python/bench.py"), "faiss": Path("tools/bench/faiss_ref.py"),
                   "qdrant": Path("tools/db/qdrant.py"), "pgvector": Path("tools/db/pgvector.py"),
-                  "milvus": Path("tools/db/milvus.py")}
+                  "milvus": Path("tools/db/milvus.py"), "cache": Path("tools/cache/bench.py")}
 # (language, index) pairs that do not exist; the runner skips them.
 UNSUPPORTED = {("faiss", "diskann"), ("qdrant", "ivf"), ("qdrant", "ivf_pq"), ("qdrant", "diskann"),
                ("pgvector", "pq"), ("pgvector", "ivf_pq"), ("pgvector", "diskann"), ("milvus", "pq")}
@@ -144,6 +152,34 @@ def change_cases(languages: list[str], indexes: list[str], data: Path) -> list[d
                 if os.environ.get("VRO_THREADS") and lang in CHANGE_LANGUAGES:
                     cmd += ["--threads", os.environ["VRO_THREADS"]]
                 out.append({"language": lang, "index": name, "out": path, "cmd": cmd})
+    return out
+
+
+# Phase 6 cache mode.
+CACHE_PROGRAM = PROGRAMS["cache"]
+CACHE_BACKENDS = ("none", "lru", "redis")
+CACHE_CAPACITIES = [500, 2000, 5000]
+CACHE_UNIFORM_CAPACITY = 2000
+CACHE_INVALIDATE = {"backend": "lru", "capacity": 2000, "at": 25000}
+
+
+def cache_cases(backends: list[str], data: Path, requests: int) -> list[dict]:
+    """(backend, capacity, workload, invalidate_at) runs of CONTRACT section 14.3."""
+    runs = []
+    for b in backends:
+        caps = [0] if b == "none" else CACHE_CAPACITIES
+        runs += [(b, c, "zipf", None) for c in caps]
+        runs.append((b, 0 if b == "none" else CACHE_UNIFORM_CAPACITY, "uniform", None))
+    if CACHE_INVALIDATE["backend"] in backends and CACHE_INVALIDATE["at"] < requests:
+        runs.append((CACHE_INVALIDATE["backend"], CACHE_INVALIDATE["capacity"], "zipf", CACHE_INVALIDATE["at"]))
+    out = []
+    for b, c, w, inv in runs:
+        path = Path("results/raw") / data.name / f"cache-{b}-c{c}-{w}{'-inv' if inv is not None else ''}.json"
+        cmd = CACHE_PROGRAM + ["--data", str(data), "--out", str(path), "--workload", w, "--backend", b,
+                               "--capacity", str(c), "--requests", str(requests)]
+        if inv is not None:
+            cmd += ["--invalidate-at", str(inv)]
+        out.append({"language": "cache", "index": "hnsw", "out": path, "cmd": cmd})
     return out
 
 
@@ -258,13 +294,26 @@ def main() -> None:
     ap.add_argument("--repeat", type=int, default=3, help="runs per case; the median-p50 run is kept")
     ap.add_argument("--load", action="store_true", help="Phase 4: clients sweep plus one insert run (repeat 1)")
     ap.add_argument("--changes", action="store_true", help="Phase 5: deletes (with and without compaction) and updates (repeat 1)")
+    ap.add_argument("--cache", action="store_true", help="Phase 6: embedding cache sweep (repeat 1; run in dbbench for redis)")
+    ap.add_argument("--backends", default=",".join(CACHE_BACKENDS), help="cache mode: backends to run")
+    ap.add_argument("--requests", type=int, default=50000, help="cache mode: requests per workload")
     ap.add_argument("--duration", type=float, default=20.0, help="load mode: seconds per run")
     ap.add_argument("--max-load", type=float, default=2.0, help="wait (up to 3 min) while the 1-minute load average is above this")
     args = ap.parse_args()
     languages, indexes = args.languages.split(","), (args.indexes or ",".join(SWEEPS)).split(",")
+    if args.cache:
+        languages, indexes = ["cache"], ["hnsw"]
+    elif "cache" in languages:
+        sys.exit("language cache runs only with --cache")
     for bad in [l for l in languages if l not in PROGRAMS] + [i for i in indexes if i not in SWEEPS]:
         sys.exit(f"unknown language or index: {bad}")
-    if args.load:
+    if args.cache:
+        backends = args.backends.split(",")
+        bad = [b for b in backends if b not in CACHE_BACKENDS]
+        if bad:
+            sys.exit(f"unknown cache backend {bad}; known: {list(CACHE_BACKENDS)}")
+        todo, repeat = cache_cases(backends, args.data, args.requests), 1
+    elif args.load:
         bad = [l for l in languages if l not in LOAD_LANGUAGES and l not in LOAD_PROGRAMS]
         if bad:
             sys.exit(f"load mode has no {bad}; known: {list(LOAD_LANGUAGES) + list(LOAD_PROGRAMS)}")
