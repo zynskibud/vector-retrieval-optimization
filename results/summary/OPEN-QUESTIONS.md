@@ -8,6 +8,12 @@ Decisions that need the human, the default the session took, and its effect. New
 - **Default taken:** unchanged. Lowering the container to 4 CPUs would also change the benchmark builds, which use `VRO_THREADS=6`; a separate test-only limit needs a second compose service.
 - **Effect:** a test run can take 6 cores for minutes while a GPU job runs. If that hurts the other projects, add a `bench-4` service with `cpus: 4` for tests.
 
+## 2026-09-26: Phase 7 design taken without human review
+
+- **Question:** the backup format for the hand-built indexes and the method per database.
+- **Default taken (CONTRACT section 15):** one little-endian `.vro` file format with a JSON header and a section table, shared by the four languages (a Rust file loads in Go, C++, Python), for flat, ivf, hnsw; a loaded index needs no rebuild and returns identical IDs. Databases: Qdrant snapshots, pg_dump / pg_restore (which rebuilds the HNSW index, measured), Milvus cold backup of its data volume because milvus-backup needs object storage that the local-storage setup does not have. Five Opus 5.5 agents.
+- **Effect:** the cross-language load is a strong check that the four implementations hold the same graph; the pgvector restore time includes an index rebuild, which the report marks.
+
 ## 2026-09-26: Phase 6 design taken without human review
 
 - **Question:** how to measure an embedding cache.

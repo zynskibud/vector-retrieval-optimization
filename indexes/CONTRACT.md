@@ -517,3 +517,50 @@ The runner sweeps `backend` over none, lru, redis and `capacity` over 500, 2,000
 `hnsw-cache.png`: hit rate (y) and end-to-end p50 (y2) against capacity (x) for lru and redis on the zipf workload, with the `none` backend as a horizontal line. A table with hit rate, embed p50, search p50, e2e p50/p99, cache bytes.
 
 Tests: the model check of 14.1; the key normalization (case and whitespace collapse hit, a different model version misses); lru evicts the least recently used entry at capacity; redis round-trips a vector bit-exactly; a 2,000-request zipf replay with lru capacity 500 has a hit rate above the uniform workload's; after `--invalidate-at`, the next 100 requests are all misses.
+
+## 15. Backup and restore (Phase 7)
+
+Phase 7 saves an index to a file, throws the index away, loads the file back, and proves that the same queries return the same IDs. It measures save time, file size, load time, and whether a load needs a rebuild. It applies to `flat`, `ivf`, `hnsw` in the four languages (one shared file format, so a file written by one language loads in every other) and to the three databases with their native tools.
+
+### 15.1 The index file format (hand-built indexes)
+
+One file, little-endian, `.vro`:
+
+```
+magic      8 bytes   "VROIDX01"
+header_len uint32
+header     JSON, header_len bytes, ASCII: {"index": "hnsw", "n": N, "dim": 384, "build_params": {...},
+           "seed": 42, "contract_version": 1, "language": "rust", "sections": [{"name": "vectors", "dtype": "f32", "shape": [N, 384], "offset": ..., "bytes": ...}, ...]}
+padding    to the next multiple of 64 bytes
+sections   raw arrays in the order listed, each starting at its offset (a multiple of 64 from the file start)
+```
+
+Sections per index (all int32 unless stated; `shape` in the header):
+
+| Index | Sections |
+|---|---|
+| all | `vectors` (f32, N × dim), `tombstones` (u8 bit set, ceil(N/8); all zero when nothing is deleted) |
+| ivf | `centers` (f32, nlist × dim), `list_ids` (int32, N), `list_offsets` (int32, nlist + 1) |
+| hnsw | `levels` (u8, N), `entry` (int32, [1]: entry point), `layer0_slots` (int32, N × 2m), `layer0_counts` (int32, N), `upper_slots` (int32, L × m, where L = number of node-layer pairs above layer 0), `upper_counts` (int32, L), `upper_offsets` (int32, N + 1: node i's upper blocks are `upper_slots[m·upper_offsets[i] .. m·upper_offsets[i+1]]`, one block per layer 1..level(i)) |
+
+An index loaded from a file is complete: no rebuild, no repair. A search on the loaded index returns the same IDs and scores as on the index that wrote the file. A language that keeps a different in-memory layout converts on save and load. A language must refuse a file whose `index`, `dim`, or `build_params` do not match what it expects, and must read the section table rather than assume offsets.
+
+### 15.2 Command line and output
+
+- `--save PATH`: after the build (and after any Phase 5 change), write the file; `extra.save_s`, `extra.file_bytes`.
+- `--load PATH`: skip the build and load the file instead; `build.train_s = 0`, `build.add_s = 0`, `extra.load_s`, `extra.loaded_from`, and `build_params` from the file's header. The searches then run as usual.
+- The runner's backup mode runs, per (language, index): a build with `--save` and the searches, then a **separate process** with `--load` and the same searches, and a third process where the file was written by another language (`rust` writes, the others load, so every language loads a Rust file and Rust loads a Go file). The report checks that `ids` are identical between the write run and every load run (`extra.restore_identical = true`) and shows save_s, file_bytes, load_s.
+
+### 15.3 Databases (tools/db and tools/backup)
+
+`backup(path) -> dict` and `restore(path) -> dict` on each client, plus `drop()`:
+
+- **Qdrant:** `create_snapshot` on the collection, download it to `path` (the snapshot API over the internal network), `delete_collection`, `recover_snapshot` (upload), wait for green. Report the snapshot size and whether `indexed_vectors_count` is restored without a rebuild.
+- **pgvector:** `pg_dump -Fc` of the database into `path` (run inside the pgvector container through `docker compose exec`, or `pg_dump` from the dbbench container if the client binaries are installed; say which), `DROP TABLE`, `pg_restore`. Note that `pg_restore` rebuilds the HNSW index from scratch (the index is not in the dump), so `restore_s` includes an index build and `rebuild_needed = true`.
+- **Milvus:** with local storage and embedded etcd, `milvus-backup` cannot reach object storage. Use a cold backup: stop the milvus container, `tar` the `milvus-data` volume into `path`, start it; restore = stop, wipe the volume, untar, start, wait healthy. Report `cold = true`. If a warm method works in this version, use it and say so.
+
+`tools/backup/bench.py --db NAME --index NAME --data DIR --out FILE`: load and build, run the 1,000 queries (search run 1), back up, drop, restore, run the queries again (search run 2 with `search_params.phase = "after_restore"`), and report `extra.backup_s`, `backup_bytes`, `restore_s`, `rebuild_needed`, `rows_before`, `rows_after`, `restore_identical` (IDs of run 1 == run 2, and rows equal).
+
+### 15.4 Tests
+
+Each language: save and load round trip on 20,000 rows for flat, ivf, hnsw gives identical IDs and scores for all 1,000 queries at the default setting and after `--delete del30`; the header parses; a wrong `dim` is refused; a file written by the language's own bench loads in a subprocess run with `--load`. A cross-language test in `tools/backup/tests`: Rust writes, each other language loads, IDs identical (run inside the container with the built binaries). Each database: round trip on 20,000 rows with `restore_identical` true and `rows_after == rows_before`.
