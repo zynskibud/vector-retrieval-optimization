@@ -474,7 +474,7 @@ The search runs carry `search_params.deleted = <name>`, `search_params.updated =
 
 ### 13.4 Databases (tools/db)
 
-`delete(ids)`, `update(ids, vectors, meta_rows)`, `compact()`, plus `stats()` with `disk_bytes` before and after. Qdrant: delete points, upsert, and `update_collection` with the optimizer's `vacuum_min_vector_number` lowered plus a wait for green (Qdrant compacts on its own; report the segment count and disk before and after). pgvector: `DELETE`, `UPDATE`, then `VACUUM (ANALYZE) items` and `REINDEX INDEX` as the compaction (report `pg_relation_size` before and after; note that pgvector's HNSW keeps deleted tuples in the graph until `REINDEX`). Milvus: `delete(filter="id in [...]")`, `upsert`, `compact()` with a wait, `get_collection_stats` before and after.
+`delete(ids)`, `update(ids, vectors, meta_rows)`, `compact()`, plus `stats()` with `disk_bytes` before and after. Qdrant: delete points, upsert, and `update_collection` with the optimizer's `vacuum_min_vector_number` lowered plus a wait for green (Qdrant compacts on its own; report the segment count and disk before and after). pgvector: `DELETE`, `UPDATE`, then `VACUUM (ANALYZE) items` and `REINDEX INDEX` as the compaction (report `pg_relation_size` before and after; in pgvector 0.8.6 `VACUUM` already removes dead tuples from the HNSW graph and repairs their neighbors, and `REINDEX` is what shrinks the index file). Milvus: `delete(filter="id in [...]")`, `upsert`, `compact()` with a wait, `get_collection_stats` before and after.
 
 ### 13.5 Report and tests
 
