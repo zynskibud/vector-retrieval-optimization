@@ -3,7 +3,10 @@
 Writes results/summary/<data-name>/: results.csv, results.md, <index>.png, and for each index
 with filtered runs (CONTRACT section 11) <index>-filter.png: recall@10 and p50 latency against
 the filter's selectivity, one line per system, at the default search setting; and for each index
-with load runs (extra.clients, CONTRACT section 12) <index>-load.png: QPS and p99 against clients.
+with load runs (extra.clients, CONTRACT section 12) <index>-load.png: QPS and p99 against clients;
+and for each index with delete runs (search_params.deleted, CONTRACT section 13) <index>-delete.png:
+recall@10 and p50 against the deleted fraction (0 = the unchanged runs), solid before and dashed
+after compaction, plus a "Updates, deletes, compaction" table in results.md.
 
 Run: uv run python -m tools.bench.report --data data/processed/dev
 """
@@ -19,7 +22,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from tools.bench.metrics import load_filters, load_truths, summarize
+from tools.bench.metrics import DELETE_FRACTION, load_delete_masks, load_filters, load_truths, summarize
 
 # The default search setting per index (CONTRACT section 6); the filter plots use only these runs.
 DEFAULT_SEARCH = {"flat": {}, "ivf": {"nprobe": 8}, "hnsw": {"ef": 64}}
@@ -40,13 +43,14 @@ def fmt_params(p: dict) -> str:
     return ",".join(f"{k}={v}" for k, v in p.items())
 
 
-def load_rows(raw: Path, gt, filters: dict | None = None) -> pd.DataFrame:
-    """gt: one truth array or {filter name: array} (metrics.load_truths). filters: filters.json."""
+def load_rows(raw: Path, gt, filters: dict | None = None, delete_masks: dict | None = None) -> pd.DataFrame:
+    """gt: one truth array or {name: array} (metrics.load_truths). filters: filters.json.
+    delete_masks: metrics.load_delete_masks, for deleted_returned."""
     filters = filters or {}
     rows = []
     for path in sorted(raw.glob("*.json")):
         doc = json.loads(path.read_text())
-        for r in summarize(doc, gt):
+        for r in summarize(doc, gt, delete_masks=delete_masks):
             r["selectivity"] = 1.0 if r["filter"] == "none" else filters.get(r["filter"], {}).get("selectivity", np.nan)
             both = {**r["build_params"], **r["search_params"]}
             r["filter_line"] = r["language"] + "".join(
@@ -64,6 +68,8 @@ def load_rows(raw: Path, gt, filters: dict | None = None) -> pd.DataFrame:
             r["file"] = path.name
             r["is_load"] = not pd.isna(r["clients"])
             r["load_line"] = r["language"] + (" +inserts" if r["insert_rate"] else "")
+            r["is_change"] = bool(r["deleted"] or r["updated"])
+            r["deleted_fraction"] = DELETE_FRACTION.get(r["deleted"], 0.0 if not r["updated"] else np.nan)
             rows.append(r)
     return pd.DataFrame(rows)
 
@@ -148,18 +154,65 @@ def plot_load(df: pd.DataFrame, index: str, title: str, out: Path) -> bool:
     return True
 
 
+def plot_delete(df: pd.DataFrame, index: str, title: str, out: Path) -> bool:
+    """Recall@10 and p50 against the deleted fraction (0, 0.1, 0.3, 0.5) at the default search
+    setting, one color per system; solid = tombstones (compacted=0), dashed = after compaction.
+    The point at 0 is the median of the system's unchanged runs. Returns False when the index
+    has no delete run."""
+    g = df[df["is_default"] & (df["filter"] == "none") & ~df["is_load"] & (df["phase"] == "") & (df["updated"] == "")]
+    dels = g[g["deleted"] != ""]
+    if dels.empty:
+        return False
+    fig, (ax_r, ax_l) = plt.subplots(1, 2, figsize=(13, 5))
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    for n, (line, h) in enumerate(g[g["filter_line"].isin(dels["filter_line"].unique())].groupby("filter_line")):
+        base0 = h[h["deleted"] == ""]
+        for comp, style in ((0, "-"), (1, "--")):
+            part = pd.concat([base0, h[(h["deleted"] != "") & (h["compacted"] == comp)]])
+            if (part["deleted"] != "").sum() == 0:
+                continue
+            m = part.groupby("deleted_fraction", as_index=False)[["recall@10", "p50_ms"]].median().sort_values("deleted_fraction")
+            label = f"{line} {'compacted' if comp else 'tombstones'}"
+            ax_r.plot(m["deleted_fraction"], m["recall@10"], style, marker="o", color=colors[n % len(colors)], label=label)
+            ax_l.plot(m["deleted_fraction"], m["p50_ms"], style, marker="o", color=colors[n % len(colors)], label=label)
+    for ax, ylab in ((ax_r, "recall@10 (against the remaining-rows truth)"), (ax_l, "p50 latency (ms, log scale)")):
+        ax.set_xticks([0, 0.1, 0.3, 0.5])
+        ax.set_xlabel("deleted fraction of rows")
+        ax.set_ylabel(ylab)
+        ax.grid(True, alpha=0.3)
+    ax_l.set_yscale("log")
+    ax_r.legend(fontsize=7)
+    default = fmt_params(DEFAULT_SEARCH.get(index, {})) or "exact"
+    fig.suptitle(f"{index} after deletes: {title}  (search {default}; solid = tombstones, dashed = compacted)")
+    fig.tight_layout()
+    fig.savefig(out, dpi=120)
+    plt.close(fig)
+    return True
+
+
+CHANGE_COLS = ["index", "language", "deleted", "updated", "compacted", "recall@10", "deleted_returned", "p50_ms",
+               "delete_s", "update_s", "compact_s", "index_bytes", "index_bytes_after", "disk_bytes", "disk_bytes_after", "file"]
+
+
+def change_table(df: pd.DataFrame) -> str:
+    """One row per change run at the default search setting: cost of the change and of the compaction."""
+    g = df[df["is_change"] & df["is_default"]].sort_values(["index", "language", "deleted", "updated", "compacted"])
+    return md_table(g[CHANGE_COLS]) if not g.empty else ""
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", type=Path, default=Path("data/processed/dev"))
     args = ap.parse_args()
     name = args.data.name
     raw, out = Path("results/raw") / name, Path("results/summary") / name
-    df = load_rows(raw, load_truths(args.data), load_filters(args.data))
+    df = load_rows(raw, load_truths(args.data), load_filters(args.data), load_delete_masks(args.data))
     if df.empty:
         raise SystemExit(f"no JSON files in {raw}")
     out.mkdir(parents=True, exist_ok=True)
     cols = ["index", "language", "build_params", "search_params", "filter", "selectivity", "recall@10", "p50_ms", "p50_spread", "p90_ms",
-            "p99_ms", "qps", "clients", "insert_rate", "phase", "cpu_pct", "errors", "build_s", "peak_rss_mb", "index_bytes", "distance_computations"]
+            "p99_ms", "qps", "clients", "insert_rate", "phase", "cpu_pct", "errors", "build_s", "peak_rss_mb", "index_bytes", "distance_computations",
+            "deleted", "updated", "compacted", "compact_s", "disk_bytes", "disk_bytes_after", "deleted_returned"]
     df = df.sort_values(["index", "recall@10", "p50_ms"], ascending=[True, False, True])
     df[cols + ["n", "file"]].to_csv(out / "results.csv", index=False)
 
@@ -167,12 +220,19 @@ def main() -> None:
     for index, g in df.groupby("index"):
         md += [f"## {index}", "", md_table(g[cols[1:]]), ""]
         # The latency-recall plot keeps the unfiltered runs only, as before Phase 3.
-        static = g[~g["is_load"] & (g["phase"] == "")]
+        static = g[~g["is_load"] & (g["phase"] == "") & ~g["is_change"]]
         if not static.empty:
             plot(static[static["filter"] == "none"], index, f"{name}, n = {g['n'].iloc[0]:,}",
                  out / f"{index}.png")
         plot_filter(static, index, f"{name}, n = {g['n'].iloc[0]:,}", out / f"{index}-filter.png")
         plot_load(g, index, f"{name}, n = {g['n'].iloc[0]:,}", out / f"{index}-load.png")
+        plot_delete(g, index, f"{name}, n = {g['n'].iloc[0]:,}", out / f"{index}-delete.png")
+    table = change_table(df)
+    if table:
+        md += ["## Updates, deletes, compaction (CONTRACT section 13)", "",
+               "Default search setting. delete_s / update_s / compact_s in seconds; *_after = when the searches "
+               "started (after compaction if compacted = 1). Bytes are what each system reports (tools/db/README.md).",
+               "", table, ""]
     (out / "results.md").write_text("\n".join(md))
     for f in sorted(out.iterdir()):
         print(f)

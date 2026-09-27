@@ -11,6 +11,13 @@ Languages run hnsw only; databases run all their supported indexes through tools
 Outputs: results/raw/<data-name>/load-<system>-<index>-c<C>[-ins<R>].json
   uv run python -m tools.bench.runner --load --data data/processed/dev --languages rust,cpp,go,python
   uv run python -m tools.bench.runner --load --data data/processed/dev --languages qdrant   (in dbbench)
+
+Changes mode (Phase 5, CONTRACT section 13): --changes runs, per (system, index), --delete del10,
+del30, del50 (each without and with --compact) and --update upd10, at the default build and
+search setting, repeat 1. Languages run flat, ivf, hnsw; databases every supported index.
+Outputs: results/raw/<data-name>/chg-<system>-<index>-<change>[-compact].json
+  make changes    ARGS="--data data/processed/dev --languages rust,cpp,go,python"
+  make changes-db ARGS="--data data/processed/dev --languages qdrant"   (after make db-up DB=qdrant)
 """
 
 import argparse
@@ -114,6 +121,27 @@ def load_cases(languages: list[str], indexes: list[str], data: Path, duration: f
                 if rate:
                     cmd += ["--insert-rate", str(rate)]
                 if os.environ.get("VRO_THREADS") and lang not in LOAD_PROGRAMS:
+                    cmd += ["--threads", os.environ["VRO_THREADS"]]
+                out.append({"language": lang, "index": name, "out": path, "cmd": cmd})
+    return out
+
+
+# Phase 5 changes mode.
+CHANGE_LANGUAGES = ("python", "go", "cpp", "rust")
+CHANGE_INDEXES = ["flat", "ivf", "hnsw"]
+CHANGE_RUNS = [(["--delete", d] + (["--compact"] if c else []), f"{d}{'-compact' if c else ''}")
+               for d in ("del10", "del30", "del50") for c in (False, True)] + [(["--update", "upd10"], "upd10")]
+
+
+def change_cases(languages: list[str], indexes: list[str], data: Path) -> list[dict]:
+    """One case per (system, index, change); default build and search setting (no --build / --search)."""
+    out = []
+    for lang in languages:
+        for name in [i for i in LOAD_INDEXES.get(lang, CHANGE_INDEXES) if i in indexes]:
+            for flags, tag in CHANGE_RUNS:
+                path = Path("results/raw") / data.name / f"chg-{lang}-{name}-{tag}.json"
+                cmd = PROGRAMS[lang] + ["--index", name, "--data", str(data), "--out", str(path), *flags]
+                if os.environ.get("VRO_THREADS") and lang in CHANGE_LANGUAGES:
                     cmd += ["--threads", os.environ["VRO_THREADS"]]
                 out.append({"language": lang, "index": name, "out": path, "cmd": cmd})
     return out
@@ -229,6 +257,7 @@ def main() -> None:
     ap.add_argument("--timeout", type=float, default=None)
     ap.add_argument("--repeat", type=int, default=3, help="runs per case; the median-p50 run is kept")
     ap.add_argument("--load", action="store_true", help="Phase 4: clients sweep plus one insert run (repeat 1)")
+    ap.add_argument("--changes", action="store_true", help="Phase 5: deletes (with and without compaction) and updates (repeat 1)")
     ap.add_argument("--duration", type=float, default=20.0, help="load mode: seconds per run")
     ap.add_argument("--max-load", type=float, default=2.0, help="wait (up to 3 min) while the 1-minute load average is above this")
     args = ap.parse_args()
@@ -240,6 +269,11 @@ def main() -> None:
         if bad:
             sys.exit(f"load mode has no {bad}; known: {list(LOAD_LANGUAGES) + list(LOAD_PROGRAMS)}")
         todo, repeat = load_cases(languages, indexes, args.data, args.duration), 1
+    elif args.changes:
+        bad = [l for l in languages if l not in CHANGE_LANGUAGES and l not in LOAD_PROGRAMS]
+        if bad:
+            sys.exit(f"changes mode has no {bad}; known: {list(CHANGE_LANGUAGES) + list(LOAD_PROGRAMS)}")
+        todo, repeat = change_cases(languages, indexes, args.data), 1
     else:
         todo, repeat = cases(languages, indexes, args.data), args.repeat
 

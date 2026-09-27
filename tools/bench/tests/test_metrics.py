@@ -107,3 +107,72 @@ def test_summarize_load_fields(tmp_path):
     assert plot_load(df, "hnsw", "t", tmp_path / "hnsw-load.png")
     assert (tmp_path / "hnsw-load.png").stat().st_size > 0
     assert not plot_load(df.assign(is_load=False), "hnsw", "t", tmp_path / "x.png")
+
+
+def _change_doc(**marks):
+    doc = make_doc()
+    run = doc["searches"][0]
+    doc["searches"] = [{**run, "search_params": {**run["search_params"], **marks}}]
+    return doc
+
+
+def test_summarize_picks_truth_by_change():
+    """Phase 5 (CONTRACT section 13.2): deleted / updated select ground_truth_<name>."""
+    ids = np.array(make_doc()["searches"][0]["ids"])[:, :2]
+    exact = np.where(ids < 0, 99, ids)  # the run's own answers: recall 5/6 (one -1)
+    truths = {"none": GT, "del30": exact, "upd10": exact}
+    row = summarize(_change_doc(deleted="del30", compacted=0), truths, k=2)[0]
+    assert row["recall@2"] == pytest.approx(5 / 6) and row["deleted"] == "del30" and row["compacted"] == 0
+    row = summarize(_change_doc(updated="upd10", compacted=1), truths, k=2)[0]
+    assert row["recall@2"] == pytest.approx(5 / 6) and row["updated"] == "upd10" and row["compacted"] == 1
+    assert summarize(make_doc(), truths, k=2)[0]["recall@2"] == pytest.approx(0.5)  # unchanged run: ground_truth.npy
+    with pytest.raises(ValueError):
+        summarize(_change_doc(deleted="del50"), truths, k=2)  # no truth for del50
+    with pytest.raises(ValueError):
+        summarize(_change_doc(deleted="del30", filter="top10"), truths, k=2)  # no truth for the combination
+
+
+def test_deleted_returned():
+    from tools.bench.metrics import deleted_returned
+
+    mask = np.zeros(10, dtype=bool)
+    mask[[0, 7]] = True
+    assert deleted_returned([[0, 1, -1], [7, 7, 3]], mask) == 3  # -1 never counts
+    doc = _change_doc(deleted="del30", compacted=0)
+    doc["extra"] = {"delete_s": 1.5, "compact_s": 2.0, "disk_bytes": 100, "disk_bytes_after": 60}
+    ids = np.array(doc["searches"][0]["ids"])
+    row = summarize(doc, {"del30": GT}, k=2, delete_masks={"del30": mask})[0]
+    assert row["deleted_returned"] == deleted_returned(ids, mask)
+    assert row["delete_s"] == 1.5 and row["compact_s"] == 2.0 and row["disk_bytes_after"] == 60
+    assert np.isnan(summarize(doc, {"del30": GT}, k=2)[0]["deleted_returned"])  # no mask given
+    assert np.isnan(summarize(make_doc(), GT, k=2)[0]["compacted"])
+
+
+def test_plot_delete_and_change_cases(tmp_path):
+    import pandas as pd
+
+    from tools.bench.report import change_table, plot_delete
+    from tools.bench.runner import change_cases
+
+    rows = []
+    for frac, name in ((0.0, ""), (0.1, "del10"), (0.3, "del30"), (0.5, "del50")):
+        for comp in ((0, 1) if name else (float("nan"),)):
+            rows.append({"is_default": True, "filter": "none", "is_load": False, "phase": "", "updated": "",
+                         "deleted": name, "compacted": comp, "filter_line": "rust", "deleted_fraction": frac,
+                         "recall@10": 0.95 - frac / 10, "p50_ms": 1.0 + frac, "is_change": bool(name)})
+    df = pd.DataFrame(rows)
+    assert plot_delete(df, "hnsw", "t", tmp_path / "hnsw-delete.png")
+    assert (tmp_path / "hnsw-delete.png").stat().st_size > 0
+    assert not plot_delete(df[df["deleted"] == ""], "hnsw", "t", tmp_path / "x.png")
+    cases = change_cases(["rust", "qdrant"], ["flat", "ivf", "pq", "hnsw"], Path("data/processed/dev"))
+    names = sorted(c["out"].name for c in cases)
+    assert len(cases) == 3 * 7 + 3 * 7  # rust: flat, ivf, hnsw; qdrant: flat, pq, hnsw; 7 changes each
+    assert "chg-rust-hnsw-del30-compact.json" in names and "chg-qdrant-pq-upd10.json" in names
+    assert "chg-rust-pq-del10.json" not in names
+    cmd = next(c["cmd"] for c in cases if c["out"].name == "chg-rust-ivf-del50-compact.json")
+    assert cmd[-3:] == ["--delete", "del50", "--compact"] or cmd[-5:-2] == ["--delete", "del50", "--compact"]
+    for col in ("index_bytes", "index_bytes_after", "disk_bytes", "disk_bytes_after", "delete_s", "update_s",
+                "compact_s", "deleted_returned", "language", "file"):
+        df[col] = 0
+    df["index"] = "hnsw"
+    assert "del30" in change_table(df)

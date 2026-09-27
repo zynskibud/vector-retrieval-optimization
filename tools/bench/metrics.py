@@ -35,18 +35,49 @@ def filter_of(run: dict) -> str:
     return str(run["search_params"].get("filter", "none"))
 
 
-def load_truths(data_dir) -> dict:
-    """{filter name: ground-truth array} for every truth file in data_dir.
+CHANGE_SETS = ("del10", "del30", "del50", "upd10")  # CONTRACT section 13.1
+DELETE_FRACTION = {"del10": 0.1, "del30": 0.3, "del50": 0.5}
 
-    "none" is ground_truth.npy; each name in filters.json is ground_truth_<name>.npy.
+
+def truth_key(run: dict) -> str:
+    """The truth a search run is scored against: its search_params.deleted or .updated
+    (CONTRACT section 13.2), else its filter (section 11.2)."""
+    sp = run["search_params"]
+    change = sp.get("deleted") or sp.get("updated")
+    if change:
+        if filter_of(run) != "none":
+            raise ValueError(f"run combines {change} with filter={filter_of(run)}; no truth exists for that")
+        return str(change)
+    return filter_of(run)
+
+
+def load_truths(data_dir) -> dict:
+    """{name: ground-truth array} for every truth file in data_dir.
+
+    "none" is ground_truth.npy; each name in filters.json and each change set
+    (del10, del30, del50, upd10) is ground_truth_<name>.npy.
     """
     data_dir = Path(data_dir)
     truths = {"none": np.load(data_dir / "ground_truth.npy")}
-    for name in load_filters(data_dir):
+    for name in [*load_filters(data_dir), *CHANGE_SETS]:
         path = data_dir / f"ground_truth_{name}.npy"
         if path.exists():
             truths[name] = np.load(path)
     return truths
+
+
+def load_delete_masks(data_dir) -> dict:
+    """{del10|del30|del50: bool array (N,)} for the delete sets present in data_dir."""
+    data_dir = Path(data_dir)
+    return {name: np.load(data_dir / f"delete_{name}.npy") for name in DELETE_FRACTION
+            if (data_dir / f"delete_{name}.npy").exists()}
+
+
+def deleted_returned(ids, mask) -> int:
+    """Returned IDs (not -1) that the delete mask marks deleted, summed over all queries."""
+    ids = np.asarray(ids, dtype=np.int64)
+    ids = ids[(ids >= 0) & (ids < len(mask))]
+    return int(np.asarray(mask, dtype=bool)[ids].sum())
 
 
 def load_filters(data_dir) -> dict:
@@ -66,17 +97,19 @@ def truth_for(ground_truth, filter_name: str):
     return ground_truth[filter_name]
 
 
-def summarize(doc: dict, ground_truth, k: int = 10) -> list[dict]:
+def summarize(doc: dict, ground_truth, k: int = 10, delete_masks: dict | None = None) -> list[dict]:
     """One row per search setting in doc. k is the recall cutoff (at most doc['k']).
 
-    ground_truth is one array (used for unfiltered runs) or {filter name: array}; each run is
-    scored against the truth of its search_params["filter"] (CONTRACT section 11.2).
+    ground_truth is one array (used for unfiltered runs) or {name: array}; each run is scored
+    against the truth of its search_params["deleted"] / ["updated"] (CONTRACT section 13.2) or
+    else its ["filter"] (section 11.2). delete_masks ({del30: bool array}, load_delete_masks)
+    gives deleted_returned for runs with search_params.deleted; without it the count is NaN.
     """
     k = min(k, doc["k"])
     rows = []
     for run in doc["searches"]:
         filt = filter_of(run)
-        _, recall = recall_at_k(run["ids"], truth_for(ground_truth, filt), k)
+        _, recall = recall_at_k(run["ids"], truth_for(ground_truth, truth_key(run)), k)
         lat = latency_stats(run["latency_ms"])
         rows.append({
             "language": doc["language"], "index": doc["index"], "n": doc["n"],
@@ -90,8 +123,27 @@ def summarize(doc: dict, ground_truth, k: int = 10) -> list[dict]:
             "p50_spread": _spread(doc.get("extra", {}).get("runner", {}).get("p50_ms_runs")),
             # Phase 4 (CONTRACT section 12): load runs have extra.clients; recall is from worker 0's first pass.
             **load_fields(run),
+            **change_fields(doc, run, delete_masks),
         })
     return rows
+
+
+def change_fields(doc: dict, run: dict, delete_masks: dict | None) -> dict:
+    """Phase 5 columns of one search run (CONTRACT section 13.2); "" / NaN when absent."""
+    sp, ex = run["search_params"], doc.get("extra", {})
+    nan = float("nan")
+    deleted = str(sp.get("deleted", "") or "")
+    returned = nan
+    if deleted and delete_masks and deleted in delete_masks:
+        returned = deleted_returned(run["ids"], delete_masks[deleted])
+    num = lambda key: ex[key] if isinstance(ex.get(key), (int, float)) and not isinstance(ex.get(key), bool) else nan
+    return {
+        "deleted": deleted, "updated": str(sp.get("updated", "") or ""),
+        "compacted": int(sp["compacted"]) if "compacted" in sp else nan,
+        "delete_s": num("delete_s"), "update_s": num("update_s"), "compact_s": num("compact_s"),
+        "index_bytes_after": num("index_bytes_after"), "disk_bytes": num("disk_bytes"),
+        "disk_bytes_after": num("disk_bytes_after"), "deleted_returned": returned,
+    }
 
 
 def load_fields(run: dict) -> dict:
