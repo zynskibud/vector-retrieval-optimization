@@ -82,22 +82,22 @@ job_cmd() {
 && make bench ARGS='--data data/processed --languages python --indexes flat,ivf,pq,ivf_pq --repeat 3'
 && make report ARGS='--data data/processed'" ;;
   db-sweep)
-    CMD="for db in qdrant pgvector milvus; do make db-up DB=\$db && make bench-db ARGS=\"--data data/processed/dev --languages \$db --indexes flat,ivf,pq,ivf_pq,hnsw,diskann --repeat 3\"; make db-down DB=\$db; done
-&& make report ARGS='--data data/processed/dev'" ;;
+    CMD="FAILED_DBS=; for db in qdrant pgvector milvus; do if make db-up DB=\$db && make bench-db ARGS=\"--data data/processed/dev --languages \$db --indexes flat,ivf,pq,ivf_pq,hnsw,diskann --repeat 3\"; then :; else FAILED_DBS=\"\$FAILED_DBS \$db\"; echo \"[run.sh] database \$db failed\"; fi; make db-down DB=\$db; done
+; make report ARGS='--data data/processed/dev'; [ -z \"\$FAILED_DBS\" ] || { echo \"[run.sh] failed databases:\$FAILED_DBS\"; false; }" ;;
   load-sweep)
-    CMD="make load ARGS='--data data/processed/dev --languages rust,cpp,go,python'
-&& for db in qdrant pgvector milvus; do make db-up DB=\$db && make load-db ARGS=\"--data data/processed/dev --languages \$db\"; make db-down DB=\$db; done
-&& make report ARGS='--data data/processed/dev'" ;;
+    CMD="FAILED_DBS=; make load ARGS='--data data/processed/dev --languages rust,cpp,go,python' || { FAILED_DBS=\" languages\"; echo \"[run.sh] language runs failed\"; }
+; for db in qdrant pgvector milvus; do if make db-up DB=\$db && make load-db ARGS=\"--data data/processed/dev --languages \$db\"; then :; else FAILED_DBS=\"\$FAILED_DBS \$db\"; echo \"[run.sh] database \$db failed\"; fi; make db-down DB=\$db; done
+; make report ARGS='--data data/processed/dev'; [ -z \"\$FAILED_DBS\" ] || { echo \"[run.sh] failed databases:\$FAILED_DBS\"; false; }" ;;
   changes-sweep)
-    CMD="make changes ARGS='--data data/processed/dev --languages rust,cpp,go,python'
-&& for db in qdrant pgvector milvus; do make db-up DB=\$db && make changes-db ARGS=\"--data data/processed/dev --languages \$db\"; make db-down DB=\$db; done
-&& make report ARGS='--data data/processed/dev'" ;;
+    CMD="FAILED_DBS=; make changes ARGS='--data data/processed/dev --languages rust,cpp,go,python' || { FAILED_DBS=\" languages\"; echo \"[run.sh] language runs failed\"; }
+; for db in qdrant pgvector milvus; do if make db-up DB=\$db && make changes-db ARGS=\"--data data/processed/dev --languages \$db\"; then :; else FAILED_DBS=\"\$FAILED_DBS \$db\"; echo \"[run.sh] database \$db failed\"; fi; make db-down DB=\$db; done
+; make report ARGS='--data data/processed/dev'; [ -z \"\$FAILED_DBS\" ] || { echo \"[run.sh] failed databases:\$FAILED_DBS\"; false; }" ;;
   cache-sweep)
     CMD="make cache-up && make cache ARGS='--data data/processed/dev'; make cache-down
 && make report ARGS='--data data/processed/dev'" ;;
   backup-sweep)
-    CMD="for db in qdrant pgvector milvus; do make db-up DB=\$db && make backup-db DB=\$db ARGS='--data data/processed/dev'; make db-down DB=\$db; done
-&& make report ARGS='--data data/processed/dev'" ;;
+    CMD="FAILED_DBS=; for db in qdrant pgvector milvus; do if make db-up DB=\$db && make backup-db DB=\$db ARGS='--data data/processed/dev'; then :; else FAILED_DBS=\"\$FAILED_DBS \$db\"; echo \"[run.sh] database \$db failed\"; fi; make db-down DB=\$db; done
+; make report ARGS='--data data/processed/dev'; [ -z \"\$FAILED_DBS\" ] || { echo \"[run.sh] failed databases:\$FAILED_DBS\"; false; }" ;;
   test) CMD="make test" ;;
   *)    echo "unknown job: $1" >&2; return 2 ;;
   esac
