@@ -3,14 +3,18 @@
 RUN   := docker compose run --rm bench
 SETUP := docker compose run --rm setup
 
-.PHONY: image setup build test bench report shell clean-raw db-up db-down dbbench db-test bench-db load load-db changes changes-db cache cache-up cache-down cache-test backup-db backup-test vro-test
+.PHONY: image deps setup build test bench report shell clean-raw db-up db-down dbbench db-test bench-db load load-db changes changes-db cache cache-up cache-down cache-test backup-db backup-test vro-test
 
 image:
 	docker compose build
 
 ## one-time: image, Python deps (network), then all four language builds (no network)
+## deps: fill the venv volume from uv.lock (network). Run after every uv.lock change.
+deps:
+	$(SETUP) uv sync --frozen --all-groups
+
 setup: image
-	$(SETUP) sh -c 'uv sync --frozen && cd indexes/rust && cargo fetch'
+	$(SETUP) sh -c 'uv sync --frozen --all-groups && cd indexes/rust && cargo fetch'
 	$(MAKE) build
 
 build:

@@ -111,6 +111,7 @@ No toolchain runs on the host. Every build, test, benchmark, and report runs ins
 ```bash
 make setup                      # one time: image, deps (with network), builds (without)
 make build                      # rebuild Go, C++, Rust after code changes
+make deps                       # after every uv.lock change: install it into the venv volume (setup, with network); jobs never install (UV_NO_SYNC=1)
 make test                       # all suites; or run one, e.g.:
 docker compose run --rm bench uv run --frozen pytest indexes/python/tests/test_ivf.py -q
 docker compose run --rm bench sh -c 'cd indexes/rust && cargo test --release --test hnsw'

@@ -15,6 +15,7 @@ dependencies = [
     "psycopg[binary]>=3.3",
     "pymilvus>=3.0",
     "sentence-transformers>=3",
+    "torch>=2.8",  # listed so [tool.uv.sources] can point Linux at the CPU wheels
     "redis>=5",
 ]
 
@@ -22,3 +23,13 @@ dependencies = [
 dev = [
     "pytest>=9.1.1",
 ]
+
+# CPU-only torch on Linux (the container): the embedding cache (Phase 6) runs the model on CPU,
+# and the default Linux aarch64 torch wheel pulls about 3 GB of CUDA packages.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

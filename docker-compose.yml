@@ -30,6 +30,7 @@ x-bench: &bench
     - go-mod:/root/go
     - hf-cache:/root/.cache/huggingface   # Phase 6: the embedding model, downloaded once by setup
   environment:
+    UV_NO_SYNC: "1"     # jobs never install: the venv volume is filled by `make setup` (setup overrides this)
     TMPDIR: /scratch    # disk-backed (ext4 on the VM disk): DiskANN test files need real O_DIRECT reads, not tmpfs
     VRO_THREADS: "${VRO_CPUS:-3}"    # build threads for the benches; the same number as `cpus` below
   tmpfs:
@@ -57,6 +58,10 @@ services:
   setup:
     <<: *bench
     profiles: [tools]
+    environment:
+      TMPDIR: /scratch
+      VRO_THREADS: "${VRO_CPUS:-3}"
+      UV_NO_SYNC: "0"   # setup is the one service that installs packages (it has network)
 
   # Phase 2: the same bench image on the internal database network. No external
   # access (the network is internal). Runs tools.db.bench against one database.

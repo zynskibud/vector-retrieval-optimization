@@ -116,8 +116,9 @@ NAME="${JOBS[0]}"; [ "${#JOBS[@]}" -gt 1 ] && NAME="${JOBS[0]}+$(( ${#JOBS[@]} -
 # failed job does not stop the next one and the log shows every exit code.
 CMD=""
 for j in "${JOBS[@]}"; do
-  CMD="$CMD echo \"[run.sh] job $j start \$(date -u +%FT%TZ)\"; ( $(job_cmd "$j") ); echo \"[run.sh] job $j end \$(date -u +%FT%TZ) exit=\$?\";"
+  CMD="$CMD echo \"[run.sh] job $j start \$(date -u +%FT%TZ)\"; ( set -o pipefail; $(job_cmd "$j") ); rc=\$?; [ \$rc -ne 0 ] && QUEUE_RC=1; echo \"[run.sh] job $j end \$(date -u +%FT%TZ) exit=\$rc\";"
 done
+CMD="QUEUE_RC=0; $CMD echo \"[run.sh] queue \$( [ \$QUEUE_RC -eq 0 ] && echo ok || echo FAILED )\"; exit \$QUEUE_RC"
 
 echo "jobs: $JOB"
 echo "command: $CMD"
@@ -178,7 +179,7 @@ nohup caffeinate -i bash -c '
     echo "[run.sh] $(date -u +%FT%TZ) waiting: GPU lock held by $(cat "$4"/gpu.lock/owner "$4"/heavy.lock/owner 2>/dev/null | tr "\n" " ")"
     sleep 300
   done
-  eval "$3"
+  ( eval "$3" )
   echo "[run.sh] end $(date -u +%FT%TZ) exit=$?"
 ' "$LOCK_DIR" "$REPO_ROOT" "$JOB" "$CMD" "$AI_ENGINEERING_ROOT/.coord" >"$LOG" 2>&1 &
 echo $! > "$LOCK_DIR/pid"
